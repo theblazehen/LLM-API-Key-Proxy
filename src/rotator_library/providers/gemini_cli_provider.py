@@ -1382,6 +1382,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 prompt_tokens = usage.get("promptTokenCount", 0)
                 thoughts_tokens = usage.get("thoughtsTokenCount", 0)
                 candidate_tokens = usage.get("candidatesTokenCount", 0)
+                cached_tokens = usage.get("cachedContentTokenCount", 0)
 
                 openai_chunk["usage"] = {
                     "prompt_tokens": prompt_tokens
@@ -1389,6 +1390,12 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     "completion_tokens": candidate_tokens,
                     "total_tokens": usage.get("totalTokenCount", 0),
                 }
+
+                # Add cached tokens details (OpenAI prompt_tokens_details format)
+                if cached_tokens > 0:
+                    openai_chunk["usage"]["prompt_tokens_details"] = {
+                        "cached_tokens": cached_tokens
+                    }
 
                 # Add reasoning tokens details if present (OpenAI o1 format)
                 if thoughts_tokens > 0:

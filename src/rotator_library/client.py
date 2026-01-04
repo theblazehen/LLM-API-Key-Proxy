@@ -768,6 +768,8 @@ class RotatingClient:
                     litellm.InternalServerError,
                     APIConnectionError,
                     httpx.HTTPStatusError,
+                    httpx.ReadTimeout,
+                    httpx.TimeoutException,
                 ) as e:
                     # This is a critical, typed error from litellm or httpx that signals a key failure.
                     # We do not try to parse it here. We wrap it and raise it immediately
@@ -1609,6 +1611,9 @@ class RotatingClient:
         # Create a mutable copy of the keys and shuffle it.
         credentials_for_provider = list(self.all_credentials[provider])
         random.shuffle(credentials_for_provider)
+        print(
+            f"[CREDS] Initial credentials for {provider}: {len(credentials_for_provider)}"
+        )
 
         # Filter out credentials that are unavailable (queued for re-auth)
         provider_plugin = self._get_provider_instance(provider)
@@ -1618,6 +1623,9 @@ class RotatingClient:
                 for cred in credentials_for_provider
                 if provider_plugin.is_credential_available(cred)
             ]
+            print(
+                f"[CREDS] After availability filter: {len(available_creds)} available"
+            )
             if available_creds:
                 credentials_for_provider = available_creds
             # If all credentials are unavailable, keep the original list
@@ -1718,10 +1726,22 @@ class RotatingClient:
         error_accumulator.provider = provider
 
         try:
-            while (
-                len(tried_creds) < len(credentials_for_provider)
-                and time.time() < deadline
-            ):
+            while time.time() < deadline:
+                # [RETRY LOGIC] If we've tried all credentials, reset to try again until timeout
+                if (
+                    len(tried_creds) >= len(credentials_for_provider)
+                    and credentials_for_provider
+                ):
+                    print(
+                        f"[ROTATION] All {len(tried_creds)} credentials tried. Resetting cycle to retry until timeout..."
+                    )
+                    tried_creds.clear()
+                    await asyncio.sleep(1.0)  # Prevent tight loop
+
+                print(
+                    f"[ROTATION] Loop iteration: tried={len(tried_creds)}/{len(credentials_for_provider)}, "
+                    f"time_remaining={deadline - time.time():.1f}s"
+                )
                 current_cred = None
                 key_acquired = False
                 try:
@@ -1744,10 +1764,14 @@ class RotatingClient:
                         c for c in credentials_for_provider if c not in tried_creds
                     ]
                     if not creds_to_try:
-                        lib_logger.warning(
-                            f"All credentials for provider {provider} have been tried. No more credentials to rotate to."
-                        )
-                        break
+                        if not credentials_for_provider:
+                            lib_logger.warning(
+                                f"No credentials available for provider {provider}."
+                            )
+                            break
+                        # We have creds but tried them all - should have been reset by loop top.
+                        # Continue to trigger reset.
+                        continue
 
                     lib_logger.info(
                         f"Acquiring credential for model {model}. Tried credentials: {len(tried_creds)}/{len(credentials_for_provider)}"
@@ -1909,6 +1933,9 @@ class RotatingClient:
                                 )
                                 lib_logger.warning(
                                     f"Cred {mask_credential(current_cred)} {classified_error.error_type} (HTTP {classified_error.status_code}). Rotating."
+                                )
+                                lib_logger.debug(
+                                    f"[ROTATION] Breaking inner loop to rotate credential"
                                 )
                                 break
 
@@ -2206,7 +2233,10 @@ class RotatingClient:
                                     return
                                 else:
                                     lib_logger.warning(
-                                        f"Cred {mask_credential(current_cred)} quota error ({consecutive_quota_failures}/3). Rotating."
+                                        f"Cred {mask_credential(current_cred)} {classified_error.error_type} (HTTP {classified_error.status_code}). Rotating."
+                                    )
+                                    print(
+                                        f"[ROTATION] Breaking inner loop to rotate credential"
                                     )
                                     break
 

@@ -604,16 +604,18 @@ class GoogleOAuthBase:
         # Check if token is TRULY expired (not just threshold-expired)
         creds = self._credentials_cache.get(path)
         if creds and self._is_token_truly_expired(creds):
-            # Token is actually expired - should not be used
+            # Token is technically expired, but we force it to TRUE to allow the rotation loop
+            # to attempt it. If it fails with 401, it will trigger rotation/refresh anyway.
+            # This prevents "All creds exhausted" when some keys are just stale but refreshable.
+
             # Queue for refresh if not already queued
             if path not in self._queued_credentials:
-                # lib_logger.debug(
-                #     f"Credential '{Path(path).name}' is truly expired, queueing for refresh"
-                # )
                 asyncio.create_task(
                     self._queue_refresh(path, force=True, needs_reauth=False)
                 )
-            return False
+            return True
+
+        return True
 
         return True
 

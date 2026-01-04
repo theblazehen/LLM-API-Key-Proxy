@@ -777,6 +777,7 @@ class UsageManager:
                 "success_count": 0,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
+                "cached_tokens": 0,
                 "approx_cost": 0.0,
             },
         )
@@ -784,6 +785,7 @@ class UsageManager:
         global_model["success_count"] += model_data.get("success_count", 0)
         global_model["prompt_tokens"] += model_data.get("prompt_tokens", 0)
         global_model["completion_tokens"] += model_data.get("completion_tokens", 0)
+        global_model["cached_tokens"] += model_data.get("cached_tokens", 0)
         global_model["approx_cost"] += model_data.get("approx_cost", 0.0)
 
     def _reset_model_data(self, model_data: Dict[str, Any]) -> None:
@@ -793,6 +795,7 @@ class UsageManager:
         model_data["success_count"] = 0
         model_data["prompt_tokens"] = 0
         model_data["completion_tokens"] = 0
+        model_data["cached_tokens"] = 0
         model_data["approx_cost"] = 0.0
 
     async def _check_window_reset(
@@ -937,12 +940,16 @@ class UsageManager:
                     "success_count": 0,
                     "prompt_tokens": 0,
                     "completion_tokens": 0,
+                    "cached_tokens": 0,
                     "approx_cost": 0.0,
                 },
             )
             global_model_stats["success_count"] += stats.get("success_count", 0)
             global_model_stats["prompt_tokens"] += stats.get("prompt_tokens", 0)
             global_model_stats["completion_tokens"] += stats.get("completion_tokens", 0)
+            global_model_stats["cached_tokens"] = global_model_stats.get(
+                "cached_tokens", 0
+            ) + stats.get("cached_tokens", 0)
             global_model_stats["approx_cost"] += stats.get("approx_cost", 0.0)
 
     def _preserve_unexpired_cooldowns(
@@ -1100,10 +1107,20 @@ class UsageManager:
                     for key in available_keys:
                         key_data = self._usage_data.get(key, {})
 
-                        # Skip keys on cooldown
-                        if (key_data.get("key_cooldown_until") or 0) > now or (
-                            key_data.get("model_cooldowns", {}).get(model) or 0
-                        ) > now:
+                        # Check if cooldowns are disabled for this provider
+                        provider_name = (
+                            model.split("/")[0].upper() if "/" in model else ""
+                        )
+                        cooldowns_disabled = os.getenv(
+                            f"DISABLE_COOLDOWN_{provider_name}", "false"
+                        ).lower() in ("true", "1", "yes")
+
+                        # Skip keys on cooldown (unless disabled)
+                        if not cooldowns_disabled and (
+                            (key_data.get("key_cooldown_until") or 0) > now
+                            or (key_data.get("model_cooldowns", {}).get(model) or 0)
+                            > now
+                        ):
                             continue
 
                         # Get priority for this key (default to 999 if not specified)
@@ -1264,9 +1281,19 @@ class UsageManager:
                     for key in available_keys:
                         key_data = self._usage_data.get(key, {})
 
-                        if (key_data.get("key_cooldown_until") or 0) > now or (
-                            key_data.get("model_cooldowns", {}).get(model) or 0
-                        ) > now:
+                        # Check if cooldowns are disabled for this provider
+                        provider_name = (
+                            model.split("/")[0].upper() if "/" in model else ""
+                        )
+                        cooldowns_disabled = os.getenv(
+                            f"DISABLE_COOLDOWN_{provider_name}", "false"
+                        ).lower() in ("true", "1", "yes")
+
+                        if not cooldowns_disabled and (
+                            (key_data.get("key_cooldown_until") or 0) > now
+                            or (key_data.get("model_cooldowns", {}).get(model) or 0)
+                            > now
+                        ):
                             continue
 
                         # Prioritize keys based on their current usage to ensure load balancing.
@@ -1466,6 +1493,7 @@ class UsageManager:
                         "success_count": 0,
                         "prompt_tokens": 0,
                         "completion_tokens": 0,
+                        "cached_tokens": 0,
                         "approx_cost": 0.0,
                     },
                 )
@@ -1512,6 +1540,7 @@ class UsageManager:
                         "success_count": 0,
                         "prompt_tokens": 0,
                         "completion_tokens": 0,
+                        "cached_tokens": 0,
                         "approx_cost": 0.0,
                     },
                 )
@@ -1536,8 +1565,32 @@ class UsageManager:
                 usage_data_ref["completion_tokens"] += getattr(
                     usage, "completion_tokens", 0
                 )
+
+                # Extract cached tokens from various sources:
+                # 1. prompt_tokens_details.cached_tokens (OpenAI/Anthropic style)
+                # 2. _cache_read_input_tokens (LiteLLM internal)
+                # 3. Direct cached_tokens attribute
+                cached_tokens = 0
+                if (
+                    hasattr(usage, "prompt_tokens_details")
+                    and usage.prompt_tokens_details
+                ):
+                    cached_tokens = (
+                        getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+                    )
+                elif hasattr(usage, "_cache_read_input_tokens"):
+                    cached_tokens = getattr(usage, "_cache_read_input_tokens", 0) or 0
+                elif hasattr(usage, "cached_tokens"):
+                    cached_tokens = getattr(usage, "cached_tokens", 0) or 0
+
+                usage_data_ref["cached_tokens"] = (
+                    usage_data_ref.get("cached_tokens", 0) + cached_tokens
+                )
+
                 lib_logger.info(
-                    f"Recorded usage from response object for key {mask_credential(key)}"
+                    f"Recorded usage for key {mask_credential(key)}: "
+                    f"prompt={usage.prompt_tokens}, cached={cached_tokens}, "
+                    f"completion={getattr(usage, 'completion_tokens', 0)}"
                 )
                 try:
                     provider_name = model.split("/")[0]

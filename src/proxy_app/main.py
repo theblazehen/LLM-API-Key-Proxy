@@ -113,35 +113,8 @@ with _console.status("[dim]Loading core dependencies...", spinner="dots"):
     # --- Early Log Level Configuration ---
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 
-print("  → Loading LiteLLM library...")
-with _console.status("[dim]Loading LiteLLM library...", spinner="dots"):
-    import litellm
 
-# Phase 4: Application imports with granular loading messages
-print("  → Initializing proxy core...")
-with _console.status("[dim]Initializing proxy core...", spinner="dots"):
-    from rotator_library import RotatingClient
-    from rotator_library.credential_manager import CredentialManager
-    from rotator_library.background_refresher import BackgroundRefresher
-    from rotator_library.model_info_service import init_model_info_service
-    from proxy_app.request_logger import log_request_to_console
-    from proxy_app.batch_manager import EmbeddingBatcher
-    from proxy_app.detailed_logger import DetailedLogger
-
-print("  → Discovering provider plugins...")
-# Provider lazy loading happens during import, so time it here
-_provider_start = time.time()
-with _console.status("[dim]Discovering provider plugins...", spinner="dots"):
-    from rotator_library import (
-        PROVIDER_PLUGINS,
-    )  # This triggers lazy load via __getattr__
-_provider_time = time.time() - _provider_start
-
-# Get count after import (without timing to avoid double-counting)
-_plugin_count = len(PROVIDER_PLUGINS)
-
-
-# --- Pydantic Models ---
+# Pydantic models
 class EmbeddingRequest(BaseModel):
     model: str
     input: Union[str, List[str]]
@@ -150,191 +123,25 @@ class EmbeddingRequest(BaseModel):
     user: Optional[str] = None
 
 
-class ModelCard(BaseModel):
-    """Basic model card for minimal response."""
+print("  → Loading LiteLLM library...")
+with _console.status("[dim]Loading LiteLLM library...", spinner="dots"):
+    import litellm
 
-    id: str
-    object: str = "model"
-    created: int = Field(default_factory=lambda: int(time.time()))
-    owned_by: str = "Mirro-Proxy"
+# Phase 4: Application imports with granular loading messages
+print("  → Initializing proxy core...")
+with _console.status("[dim]Initializing proxy core...", spinner="dots"):
+    from rotator_library import RotatingClient, PROVIDER_PLUGINS
+    from rotator_library.credential_manager import CredentialManager
+    from rotator_library.background_refresher import BackgroundRefresher
+    from rotator_library.model_info_service import init_model_info_service
+    from rotator_library.utils.paths import get_data_file
+from proxy_app.request_logger import log_request_to_console, CSVLogger
+from proxy_app.detailed_logger import DetailedLogger
+from proxy_app.batch_manager import EmbeddingBatcher
 
+# Initialize CSV Logger (always active for analytics)
+csv_logger = CSVLogger()
 
-class ModelCapabilities(BaseModel):
-    """Model capability flags."""
-
-    tool_choice: bool = False
-    function_calling: bool = False
-    reasoning: bool = False
-    vision: bool = False
-    system_messages: bool = True
-    prompt_caching: bool = False
-    assistant_prefill: bool = False
-
-
-class EnrichedModelCard(BaseModel):
-    """Extended model card with pricing and capabilities."""
-
-    id: str
-    object: str = "model"
-    created: int = Field(default_factory=lambda: int(time.time()))
-    owned_by: str = "unknown"
-    # Pricing (optional - may not be available for all models)
-    input_cost_per_token: Optional[float] = None
-    output_cost_per_token: Optional[float] = None
-    cache_read_input_token_cost: Optional[float] = None
-    cache_creation_input_token_cost: Optional[float] = None
-    # Limits (optional)
-    max_input_tokens: Optional[int] = None
-    max_output_tokens: Optional[int] = None
-    context_window: Optional[int] = None
-    # Capabilities
-    mode: str = "chat"
-    supported_modalities: List[str] = Field(default_factory=lambda: ["text"])
-    supported_output_modalities: List[str] = Field(default_factory=lambda: ["text"])
-    capabilities: Optional[ModelCapabilities] = None
-    # Debug info (optional)
-    _sources: Optional[List[str]] = None
-    _match_type: Optional[str] = None
-
-    class Config:
-        extra = "allow"  # Allow extra fields from the service
-
-
-class ModelList(BaseModel):
-    """List of models response."""
-
-    object: str = "list"
-    data: List[ModelCard]
-
-
-class EnrichedModelList(BaseModel):
-    """List of enriched models with pricing and capabilities."""
-
-    object: str = "list"
-    data: List[EnrichedModelCard]
-
-
-# Calculate total loading time
-_elapsed = time.time() - _start_time
-print(
-    f"✓ Server ready in {_elapsed:.2f}s ({_plugin_count} providers discovered in {_provider_time:.2f}s)"
-)
-
-# Clear screen and reprint header for clean startup view
-# This pushes loading messages up (still in scroll history) but shows a clean final screen
-import os as _os_module
-
-_os_module.system("cls" if _os_module.name == "nt" else "clear")
-
-# Reprint header
-print("━" * 70)
-print(f"Starting proxy on {args.host}:{args.port}")
-print(f"Proxy API Key: {key_display}")
-print(f"GitHub: https://github.com/Mirrowel/LLM-API-Key-Proxy")
-print("━" * 70)
-print(
-    f"✓ Server ready in {_elapsed:.2f}s ({_plugin_count} providers discovered in {_provider_time:.2f}s)"
-)
-
-
-# Note: Debug logging will be added after logging configuration below
-
-# --- Logging Configuration ---
-# Import path utilities here (after loading screen) to avoid triggering heavy imports early
-from rotator_library.utils.paths import get_logs_dir, get_data_file
-
-LOG_DIR = get_logs_dir(_root_dir)
-
-# Configure a console handler with color (INFO and above only, no DEBUG)
-console_handler = colorlog.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
-formatter = colorlog.ColoredFormatter(
-    "%(log_color)s%(message)s",
-    log_colors={
-        "DEBUG": "cyan",
-        "INFO": "green",
-        "WARNING": "yellow",
-        "ERROR": "red",
-        "CRITICAL": "red,bg_white",
-    },
-)
-console_handler.setFormatter(formatter)
-
-# Configure a file handler for INFO-level logs and higher
-info_file_handler = logging.FileHandler(LOG_DIR / "proxy.log", encoding="utf-8")
-info_file_handler.setLevel(logging.INFO)
-info_file_handler.setFormatter(
-    logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-)
-
-# Configure a dedicated file handler for all DEBUG-level logs
-debug_file_handler = logging.FileHandler(LOG_DIR / "proxy_debug.log", encoding="utf-8")
-debug_file_handler.setLevel(logging.DEBUG)
-debug_file_handler.setFormatter(
-    logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-)
-
-
-# Create a filter to ensure the debug handler ONLY gets DEBUG messages from the rotator_library
-class RotatorDebugFilter(logging.Filter):
-    def filter(self, record):
-        return record.levelno == logging.DEBUG and record.name.startswith(
-            "rotator_library"
-        )
-
-
-debug_file_handler.addFilter(RotatorDebugFilter())
-
-# Configure a console handler with color
-console_handler = colorlog.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
-formatter = colorlog.ColoredFormatter(
-    "%(log_color)s%(message)s",
-    log_colors={
-        "DEBUG": "cyan",
-        "INFO": "green",
-        "WARNING": "yellow",
-        "ERROR": "red",
-        "CRITICAL": "red,bg_white",
-    },
-)
-console_handler.setFormatter(formatter)
-
-
-# Add a filter to prevent any LiteLLM logs from cluttering the console
-class NoLiteLLMLogFilter(logging.Filter):
-    def filter(self, record):
-        return not record.name.startswith("LiteLLM")
-
-
-console_handler.addFilter(NoLiteLLMLogFilter())
-
-# Get the root logger and set it to DEBUG to capture all messages
-root_logger = logging.getLogger()
-root_logger.setLevel(logging.DEBUG)
-
-# Add all handlers to the root logger
-root_logger.addHandler(info_file_handler)
-root_logger.addHandler(console_handler)
-root_logger.addHandler(debug_file_handler)
-
-# Silence other noisy loggers by setting their level higher than root
-logging.getLogger("uvicorn").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
-# Isolate LiteLLM's logger to prevent it from reaching the console.
-# We will capture its logs via the logger_fn callback in the client instead.
-litellm_logger = logging.getLogger("LiteLLM")
-litellm_logger.handlers = []
-litellm_logger.propagate = False
-
-# Now that logging is configured, log the module load time to debug file only
-logging.debug(f"Modules loaded in {_elapsed:.2f}s")
-
-# Load environment variables from .env file
-load_dotenv(_root_dir / ".env")
-
-# --- Configuration ---
 USE_EMBEDDING_BATCHER = False
 ENABLE_REQUEST_LOGGING = args.enable_request_logging
 if ENABLE_REQUEST_LOGGING:
@@ -560,10 +367,17 @@ async def lifespan(app: FastAPI):
         logging.info("OAuth credential processing complete.")
         oauth_credentials = final_oauth_credentials
 
+    print(f"[PROXY] Loaded OAuth credentials:")
+    for provider, creds in oauth_credentials.items():
+        print(f"  {provider}: {len(creds)} credential(s)")
+
     # [NEW] Load provider-specific params
     litellm_provider_params = {
         "gemini_cli": {"project_id": os.getenv("GEMINI_CLI_PROJECT_ID")}
     }
+
+    global_timeout = int(os.getenv("GLOBAL_TIMEOUT", "180"))
+    print(f"[PROXY] Using GLOBAL_TIMEOUT: {global_timeout} seconds")
 
     # The client now uses the root logger configuration
     client = RotatingClient(
@@ -575,6 +389,7 @@ async def lifespan(app: FastAPI):
         whitelist_models=whitelist_models,
         enable_request_logging=ENABLE_REQUEST_LOGGING,
         max_concurrent_requests_per_key=max_concurrent_requests_per_key,
+        global_timeout=global_timeout,
     )
 
     # Log loaded credentials summary (compact, always visible for deployment verification)
@@ -670,6 +485,7 @@ async def streaming_response_wrapper(
     request_data: dict,
     response_stream: AsyncGenerator[str, None],
     logger: Optional[DetailedLogger] = None,
+    start_time: float = 0.0,
 ) -> AsyncGenerator[str, None]:
     """
     Wraps a streaming response to log the full response after completion
@@ -750,50 +566,26 @@ async def streaming_response_wrapper(
                                         "name": "",
                                         "arguments": "",
                                     }
-                                if tc_chunk.get("id"):
-                                    aggregated_tool_calls[index]["id"] = tc_chunk["id"]
-                                if "function" in tc_chunk:
-                                    if "name" in tc_chunk["function"]:
-                                        if tc_chunk["function"]["name"] is not None:
-                                            aggregated_tool_calls[index]["function"][
-                                                "name"
-                                            ] += tc_chunk["function"]["name"]
-                                    if "arguments" in tc_chunk["function"]:
-                                        if (
-                                            tc_chunk["function"]["arguments"]
-                                            is not None
-                                        ):
-                                            aggregated_tool_calls[index]["function"][
-                                                "arguments"
-                                            ] += tc_chunk["function"]["arguments"]
 
-                        elif key == "function_call":
-                            if "function_call" not in final_message:
-                                final_message["function_call"] = {
-                                    "name": "",
-                                    "arguments": "",
-                                }
-                            if "name" in value:
-                                if value["name"] is not None:
-                                    final_message["function_call"]["name"] += value[
+                                func_chunk = tc_chunk.get("function", {})
+                                if "name" in func_chunk and func_chunk["name"]:
+                                    aggregated_tool_calls[index]["function"][
                                         "name"
-                                    ]
-                            if "arguments" in value:
-                                if value["arguments"] is not None:
-                                    final_message["function_call"]["arguments"] += (
-                                        value["arguments"]
-                                    )
+                                    ] += func_chunk["name"]
+                                if (
+                                    "arguments" in func_chunk
+                                    and func_chunk["arguments"]
+                                ):
+                                    aggregated_tool_calls[index]["function"][
+                                        "arguments"
+                                    ] += func_chunk["arguments"]
 
-                        else:  # Generic key handling for other data like 'reasoning'
-                            # FIX: Role should always replace, never concatenate
-                            if key == "role":
-                                final_message[key] = value
-                            elif key not in final_message:
-                                final_message[key] = value
-                            elif isinstance(final_message.get(key), str):
-                                final_message[key] += value
-                            else:
-                                final_message[key] = value
+                        elif key not in final_message:
+                            final_message[key] = value
+                        elif isinstance(final_message.get(key), str):
+                            final_message[key] += value
+                        else:
+                            final_message[key] = value
 
                     if "finish_reason" in choice and choice["finish_reason"]:
                         finish_reason = choice["finish_reason"]
@@ -829,10 +621,22 @@ async def streaming_response_wrapper(
                 "usage": usage_data,
             }
 
+            # Log to CSV
+            if usage_data:
+                duration = time.time() - start_time if start_time else 0
+                csv_logger.log_completion(
+                    model=full_response.get(
+                        "model", request_data.get("model", "unknown")
+                    ),
+                    usage=usage_data,
+                    duration=duration,
+                    request_id=full_response.get("id", ""),
+                )
+
         if logger:
             logger.log_final_response(
                 status_code=200,
-                headers=None,  # Headers are not available at this stage
+                headers=None,
                 body=full_response,
             )
 
@@ -847,6 +651,7 @@ async def chat_completions(
     OpenAI-compatible endpoint powered by the RotatingClient.
     Handles both streaming and non-streaming responses and logs them.
     """
+    start_time = time.time()
     logger = DetailedLogger() if ENABLE_REQUEST_LOGGING else None
     try:
         # Read and parse the request body only once at the beginning.
@@ -914,12 +719,47 @@ async def chat_completions(
             response_generator = client.acompletion(request=request, **request_data)
             return StreamingResponse(
                 streaming_response_wrapper(
-                    request, request_data, response_generator, logger
+                    request, request_data, response_generator, logger, start_time
                 ),
                 media_type="text/event-stream",
             )
         else:
             response = await client.acompletion(request=request, **request_data)
+
+            # Log to CSV for non-streaming
+            if hasattr(response, "usage") and response.usage:
+                # Convert Usage object to dict
+                usage_dict = (
+                    response.usage.model_dump()
+                    if hasattr(response.usage, "model_dump")
+                    else response.usage.__dict__
+                )
+                duration = time.time() - start_time
+
+                # Check for cached tokens in prompt_tokens_details or other locations
+                # This normalization logic mirrors what's in UsageManager and CSVLogger
+                if (
+                    hasattr(response.usage, "prompt_tokens_details")
+                    and response.usage.prompt_tokens_details
+                ):
+                    # If it's an object
+                    if hasattr(response.usage.prompt_tokens_details, "cached_tokens"):
+                        usage_dict["cached_tokens"] = (
+                            response.usage.prompt_tokens_details.cached_tokens
+                        )
+                    # If it's a dict
+                    elif isinstance(response.usage.prompt_tokens_details, dict):
+                        usage_dict["cached_tokens"] = (
+                            response.usage.prompt_tokens_details.get("cached_tokens", 0)
+                        )
+
+                csv_logger.log_completion(
+                    model=response.model or request_data.get("model", "unknown"),
+                    usage=usage_dict,
+                    duration=duration,
+                    request_id=response.id if hasattr(response, "id") else "",
+                )
+
             if logger:
                 # Assuming response has status_code and headers attributes
                 # This might need adjustment based on the actual response object

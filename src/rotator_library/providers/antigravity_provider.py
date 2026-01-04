@@ -2992,12 +2992,17 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         prompt = metadata.get("promptTokenCount", 0)
         thoughts = metadata.get("thoughtsTokenCount", 0)
         completion = metadata.get("candidatesTokenCount", 0)
+        cached = metadata.get("cachedContentTokenCount", 0)
 
         usage = {
             "prompt_tokens": prompt + thoughts,
             "completion_tokens": completion,
             "total_tokens": metadata.get("totalTokenCount", 0),
         }
+
+        # Add cached tokens details (OpenAI prompt_tokens_details format)
+        if cached > 0:
+            usage["prompt_tokens_details"] = {"cached_tokens": cached}
 
         if thoughts > 0:
             usage["completion_tokens_details"] = {"reasoning_tokens": thoughts}
@@ -3056,6 +3061,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
+                "User-Agent": "antigravity/1.11.9 windows/amd64",
+                "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+                "Client-Metadata": '{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}',
             }
             payload = {
                 "project": _generate_project_id(),
@@ -3238,6 +3246,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             "Content-Type": "application/json",
             "Host": host,
             "User-Agent": "antigravity/1.11.9 windows/amd64",
+            "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+            "Client-Metadata": '{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}',
             "Accept": "text/event-stream" if stream else "application/json",
         }
 
@@ -3594,6 +3604,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
+                "User-Agent": "antigravity/1.11.9 windows/amd64",
+                "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+                "Client-Metadata": '{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}',
             }
 
             response = await client.post(
