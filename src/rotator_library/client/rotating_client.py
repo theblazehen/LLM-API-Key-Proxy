@@ -317,7 +317,8 @@ class RotatingClient:
         Returns:
             Response object or async generator for streaming
         """
-        model = kwargs.get("model", "")
+        requested_model = kwargs.get("model", "")
+        model = self._model_resolver.resolve_request_model(requested_model)
         provider = model.split("/")[0] if "/" in model else ""
 
         if not provider or provider not in self.all_credentials:
@@ -367,8 +368,11 @@ class RotatingClient:
         """
         Execute an embedding request with retry logic.
         """
-        model = kwargs.get("model", "")
+        requested_model = kwargs.get("model", "")
+        model = self._model_resolver.resolve_request_model(requested_model)
         provider = model.split("/")[0] if "/" in model else ""
+
+        kwargs["model"] = model
 
         if not provider or provider not in self.all_credentials:
             raise ValueError(
@@ -486,6 +490,10 @@ class RotatingClient:
                 all_models[provider] = []
             else:
                 all_models[provider] = result
+
+        alias_models = self._model_resolver.get_alias_models()
+        if alias_models:
+            all_models["alias"] = alias_models
 
         if grouped:
             return all_models

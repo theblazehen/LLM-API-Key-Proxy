@@ -16,6 +16,12 @@ from typing import Any, Dict, List, Optional
 
 lib_logger = logging.getLogger("rotator_library")
 
+MODEL_ALIAS_MAP: Dict[str, str] = {
+    "alias/opus": "copilot/claude-opus-4.6",
+    "alias/high": "copilot/claude-opus-4.6",
+    "alias/xhigh": "copilot/gpt-5.2-codex",
+}
+
 
 class ModelResolver:
     """
@@ -83,6 +89,8 @@ class ModelResolver:
         Returns:
             Full model string with ID (e.g., "iflow/deepseek-v3.2")
         """
+        model = self.resolve_request_model(model)
+        provider = model.split("/")[0] if "/" in model else provider
         model_name = model.split("/")[-1] if "/" in model else model
 
         # Check provider plugin first
@@ -99,6 +107,14 @@ class ModelResolver:
                 return f"{provider}/{resolved}"
 
         return model
+
+    def resolve_request_model(self, model: str) -> str:
+        """Resolve top-level request aliases to canonical provider/model IDs."""
+        return MODEL_ALIAS_MAP.get(model, model)
+
+    def get_alias_models(self) -> List[str]:
+        """Return user-facing alias model IDs exposed by the API."""
+        return sorted(MODEL_ALIAS_MAP.keys())
 
     def is_model_allowed(self, model: str, provider: str) -> bool:
         """
