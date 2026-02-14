@@ -21,7 +21,6 @@ MODEL_ALIAS_MAP: Dict[str, str] = {
     "alias/high": "copilot/claude-opus-4.6",
     "alias/normal": "copilot/claude-sonnet-4.5",
     "alias/cheapest": "copilot/gpt-5-mini",
-    "alias/xhigh": "copilot/gpt-5.2-codex",
 }
 
 
