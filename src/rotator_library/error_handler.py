@@ -630,6 +630,27 @@ def _extract_quota_details(json_text: str) -> Tuple[Optional[str], Optional[str]
     return None, None
 
 
+def _safe_httpx_response_text(response: Any) -> str:
+    """Safely read httpx response text without surfacing stream-read errors."""
+    try:
+        text = response.text
+        if isinstance(text, str):
+            return text
+    except Exception:
+        pass
+
+    try:
+        content = getattr(response, "content", b"")
+        if isinstance(content, bytes):
+            return content.decode("utf-8", errors="replace")
+        if isinstance(content, str):
+            return content
+    except Exception:
+        pass
+
+    return ""
+
+
 def get_retry_after(error: Exception) -> Optional[int]:
     """
     Extracts the 'retry-after' duration in seconds from an exception message.
@@ -646,7 +667,7 @@ def get_retry_after(error: Exception) -> Optional[int]:
         # First, try to parse the response body JSON (contains retryDelay/quotaResetDelay)
         # This is where Antigravity puts the retry information
         try:
-            response_text = error.response.text
+            response_text = _safe_httpx_response_text(error.response)
             if response_text:
                 result = _extract_retry_from_json_body(response_text)
                 if result is not None:
@@ -766,9 +787,9 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             if provider_class and hasattr(provider_class, "parse_quota_error"):
                 # Get error body if available
                 error_body = None
-                if hasattr(e, "response") and hasattr(e.response, "text"):
+                if hasattr(e, "response"):
                     try:
-                        error_body = e.response.text
+                        error_body = _safe_httpx_response_text(e.response)
                     except Exception:
                         pass
                 elif hasattr(e, "body"):
@@ -820,7 +841,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
 
         # Try to get error body for better classification
         try:
-            error_body = e.response.text.lower() if hasattr(e.response, "text") else ""
+            error_body = _safe_httpx_response_text(e.response).lower()
         except Exception:
             error_body = ""
 
@@ -845,9 +866,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                 # Extract quota details from the original (non-lowercased) response
                 quota_value, quota_id = None, None
                 try:
-                    original_body = (
-                        e.response.text if hasattr(e.response, "text") else ""
-                    )
+                    original_body = _safe_httpx_response_text(e.response)
                     quota_value, quota_id = _extract_quota_details(original_body)
                 except Exception:
                     pass
@@ -911,9 +930,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                         capacity_exhausted = True
                     else:
                         # Try to get from response if not in lowercased body
-                        original_body = (
-                            e.response.text if hasattr(e.response, "text") else ""
-                        )
+                        original_body = _safe_httpx_response_text(e.response)
                         if "MODEL_CAPACITY_EXHAUSTED" in original_body:
                             capacity_exhausted = True
 
