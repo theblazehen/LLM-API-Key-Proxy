@@ -314,50 +314,72 @@ class RotatingClient:
         """
         Dispatcher for completion requests.
 
+        Supports fallback chains: if a model alias maps to multiple providers,
+        each is tried in order until one succeeds.
+
         Returns:
             Response object or async generator for streaming
         """
         requested_model = kwargs.get("model", "")
-        model = self._model_resolver.resolve_request_model(requested_model)
-        provider = model.split("/")[0] if "/" in model else ""
+        model_chain = self._model_resolver.resolve_model_chain(requested_model)
 
-        if not provider or provider not in self.all_credentials:
+        # Filter to candidates we actually have credentials for
+        candidates = []
+        for candidate in model_chain:
+            prov = candidate.split("/")[0] if "/" in candidate else ""
+            if prov and prov in self.all_credentials:
+                candidates.append(candidate)
+
+        if not candidates:
             raise ValueError(
-                f"Invalid model format or no credentials for provider: {model}"
+                f"Invalid model format or no credentials for provider: {model_chain[0]}"
             )
 
         # Extract internal logging parameters (not passed to API)
         parent_log_dir = kwargs.pop("_parent_log_dir", None)
 
-        # Resolve model ID
-        resolved_model = self._model_resolver.resolve_model_id(model, provider)
-        kwargs["model"] = resolved_model
+        for i, model in enumerate(candidates):
+            provider = model.split("/")[0]
+            is_last = i == len(candidates) - 1
 
-        # Create transaction logger if enabled
-        transaction_logger = None
-        if self.enable_request_logging:
-            transaction_logger = TransactionLogger(
-                provider=provider,
+            # Resolve model ID
+            resolved_model = self._model_resolver.resolve_model_id(model, provider)
+            attempt_kwargs = {**kwargs, "model": resolved_model}
+
+            # Create transaction logger if enabled
+            transaction_logger = None
+            if self.enable_request_logging:
+                transaction_logger = TransactionLogger(
+                    provider=provider,
+                    model=resolved_model,
+                    enabled=True,
+                    parent_dir=parent_log_dir,
+                )
+                transaction_logger.log_request(attempt_kwargs)
+
+            # Build request context
+            context = RequestContext(
                 model=resolved_model,
-                enabled=True,
-                parent_dir=parent_log_dir,
+                provider=provider,
+                kwargs=attempt_kwargs,
+                streaming=attempt_kwargs.get("stream", False),
+                credentials=self.all_credentials.get(provider, []),
+                deadline=time.time() + self.global_timeout,
+                request=request,
+                pre_request_callback=pre_request_callback,
+                transaction_logger=transaction_logger,
             )
-            transaction_logger.log_request(kwargs)
 
-        # Build request context
-        context = RequestContext(
-            model=resolved_model,
-            provider=provider,
-            kwargs=kwargs,
-            streaming=kwargs.get("stream", False),
-            credentials=self.all_credentials.get(provider, []),
-            deadline=time.time() + self.global_timeout,
-            request=request,
-            pre_request_callback=pre_request_callback,
-            transaction_logger=transaction_logger,
-        )
-
-        return await self._executor.execute(context)
+            try:
+                return await self._executor.execute(context)
+            except (NoAvailableKeysError, ValueError) as exc:
+                if not is_last:
+                    lib_logger.info(
+                        f"Provider {provider} exhausted for {resolved_model}, "
+                        f"falling back to next provider in chain"
+                    )
+                    continue
+                raise
 
     def aembedding(
         self,

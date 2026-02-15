@@ -16,12 +16,12 @@ from typing import Any, Dict, List, Optional
 
 lib_logger = logging.getLogger("rotator_library")
 
-MODEL_ALIAS_MAP: Dict[str, str] = {
-    "alias/opus": "anthropic/claude-opus-4-6",
-    "alias/high": "anthropic/claude-opus-4-6",
-    "alias/normal": "anthropic/claude-sonnet-4-5-20250929",
-    "alias/sonnet": "anthropic/claude-sonnet-4-5-20250929",
-    "alias/cheapest": "copilot/gpt-5-mini",
+MODEL_ALIAS_MAP: Dict[str, List[str]] = {
+    "alias/opus": ["anthropic/claude-opus-4-6"],
+    "alias/high": ["anthropic/claude-opus-4-6"],
+    "alias/normal": ["anthropic/claude-sonnet-4-5-20250929"],
+    "alias/sonnet": ["anthropic/claude-sonnet-4-5-20250929"],
+    "alias/cheapest": ["copilot/gpt-5-mini"],
 }
 
 
@@ -111,8 +111,20 @@ class ModelResolver:
         return model
 
     def resolve_request_model(self, model: str) -> str:
-        """Resolve top-level request aliases to canonical provider/model IDs."""
-        return MODEL_ALIAS_MAP.get(model, model)
+        """Resolve top-level request aliases to canonical provider/model IDs.
+
+        Returns the first (primary) target for the alias, or the model unchanged.
+        """
+        chain = MODEL_ALIAS_MAP.get(model)
+        return chain[0] if chain else model
+
+    def resolve_model_chain(self, model: str) -> List[str]:
+        """Resolve a model alias to its full fallback chain.
+
+        Returns a list of provider/model targets to try in order.
+        For non-alias models, returns a single-element list.
+        """
+        return MODEL_ALIAS_MAP.get(model, [model])
 
     def get_alias_models(self) -> List[str]:
         """Return user-facing alias model IDs exposed by the API."""
