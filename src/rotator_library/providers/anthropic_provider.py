@@ -178,18 +178,20 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                     # the original Anthropic response)
                     cached = self._retrieve_thinking_blocks(reasoning)
                     if cached:
+                        lib_logger.info(f"Thinking signature cache HIT – restored {len(cached)} block(s)")
                         blocks.extend(cached)
                     else:
                         # Fallback: inline signature from client (custom clients)
                         thinking_sig = msg.get("thinking_signature")
                         if thinking_sig and len(thinking_sig) >= 100:
+                            lib_logger.debug("Using inline thinking signature from client")
                             blocks.append({
                                 "type": "thinking",
                                 "thinking": reasoning,
                                 "signature": thinking_sig,
                             })
-                        # else: no signature → drop thinking block,
-                        # model generates fresh thinking (cache miss on prefix)
+                        else:
+                            lib_logger.warning("Thinking signature cache MISS – dropping thinking block")
 
                 if isinstance(content, str) and content.strip():
                     blocks.append({"type": "text", "text": content})
@@ -583,6 +585,7 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                 full_thinking = "".join(b["thinking"] for b in thinking_blocks)
                 cache_key = hashlib.sha256(full_thinking.encode()).hexdigest()
                 _get_thinking_cache().store(cache_key, json.dumps(thinking_blocks))
+                lib_logger.info(f"Thinking signature cache STORE – {len(thinking_blocks)} block(s), key={cache_key[:12]}...")
 
             return
 
