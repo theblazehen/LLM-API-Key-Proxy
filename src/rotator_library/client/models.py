@@ -17,9 +17,10 @@ from typing import Any, Dict, List, Optional
 lib_logger = logging.getLogger("rotator_library")
 
 MODEL_ALIAS_MAP: Dict[str, str] = {
-    "alias/opus": "copilot/claude-opus-4.6",
-    "alias/high": "copilot/claude-opus-4.6",
-    "alias/normal": "copilot/claude-sonnet-4.5",
+    "alias/opus": "anthropic/claude-opus-4-6",
+    "alias/high": "anthropic/claude-opus-4-6",
+    "alias/normal": "anthropic/claude-sonnet-4-5-20250929",
+    "alias/sonnet": "anthropic/claude-sonnet-4-5-20250929",
     "alias/cheapest": "copilot/gpt-5-mini",
 }
 
