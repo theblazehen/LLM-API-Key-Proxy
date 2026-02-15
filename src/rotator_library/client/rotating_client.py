@@ -337,49 +337,140 @@ class RotatingClient:
 
         # Extract internal logging parameters (not passed to API)
         parent_log_dir = kwargs.pop("_parent_log_dir", None)
+        is_streaming = kwargs.get("stream", False)
+
+        # For streaming with fallback chain, use wrapper that peeks at first chunk
+        if is_streaming and len(candidates) > 1:
+            return self._streaming_with_fallback(
+                candidates, kwargs, parent_log_dir, request, pre_request_callback,
+            )
 
         for i, model in enumerate(candidates):
             provider = model.split("/")[0]
             is_last = i == len(candidates) - 1
 
-            # Resolve model ID
-            resolved_model = self._model_resolver.resolve_model_id(model, provider)
-            attempt_kwargs = {**kwargs, "model": resolved_model}
-
-            # Create transaction logger if enabled
-            transaction_logger = None
-            if self.enable_request_logging:
-                transaction_logger = TransactionLogger(
-                    provider=provider,
-                    model=resolved_model,
-                    enabled=True,
-                    parent_dir=parent_log_dir,
-                )
-                transaction_logger.log_request(attempt_kwargs)
-
-            # Build request context
-            context = RequestContext(
-                model=resolved_model,
-                provider=provider,
-                kwargs=attempt_kwargs,
-                streaming=attempt_kwargs.get("stream", False),
-                credentials=self.all_credentials.get(provider, []),
-                deadline=time.time() + self.global_timeout,
-                request=request,
-                pre_request_callback=pre_request_callback,
-                transaction_logger=transaction_logger,
+            context = self._build_completion_context(
+                model, provider, kwargs, parent_log_dir, request, pre_request_callback,
             )
 
             try:
                 return await self._executor.execute(context)
-            except (NoAvailableKeysError, ValueError) as exc:
+            except (NoAvailableKeysError, ValueError):
                 if not is_last:
                     lib_logger.info(
-                        f"Provider {provider} exhausted for {resolved_model}, "
+                        f"Provider {provider} exhausted for {context.model}, "
                         f"falling back to next provider in chain"
                     )
                     continue
                 raise
+
+    def _build_completion_context(
+        self,
+        model: str,
+        provider: str,
+        kwargs: Dict[str, Any],
+        parent_log_dir: Optional[str],
+        request: Optional[Any],
+        pre_request_callback: Optional[callable],
+    ) -> RequestContext:
+        """Build a RequestContext for a single provider attempt."""
+        resolved_model = self._model_resolver.resolve_model_id(model, provider)
+        attempt_kwargs = {**kwargs, "model": resolved_model}
+
+        transaction_logger = None
+        if self.enable_request_logging:
+            transaction_logger = TransactionLogger(
+                provider=provider,
+                model=resolved_model,
+                enabled=True,
+                parent_dir=parent_log_dir,
+            )
+            transaction_logger.log_request(attempt_kwargs)
+
+        return RequestContext(
+            model=resolved_model,
+            provider=provider,
+            kwargs=attempt_kwargs,
+            streaming=attempt_kwargs.get("stream", False),
+            credentials=self.all_credentials.get(provider, []),
+            deadline=time.time() + self.global_timeout,
+            request=request,
+            pre_request_callback=pre_request_callback,
+            transaction_logger=transaction_logger,
+        )
+
+    @staticmethod
+    def _is_stream_error(chunk: str) -> bool:
+        """Check if an SSE chunk is a terminal error from the executor."""
+        return (
+            '"proxy_error"' in chunk
+            or '"proxy_busy"' in chunk
+            or '"proxy_all_credentials_exhausted"' in chunk
+            or '"proxy_timeout"' in chunk
+        )
+
+    async def _streaming_with_fallback(
+        self,
+        candidates: List[str],
+        kwargs: Dict[str, Any],
+        parent_log_dir: Optional[str],
+        request: Optional[Any],
+        pre_request_callback: Optional[callable],
+    ) -> AsyncGenerator[str, None]:
+        """Stream with cross-provider fallback.
+
+        Peeks at the first chunk from each provider's stream. If it's an error
+        (all credentials exhausted), tries the next provider in the chain.
+        Once real content is flowing, commits to that provider's stream.
+        """
+        for i, model in enumerate(candidates):
+            provider = model.split("/")[0]
+            is_last = i == len(candidates) - 1
+
+            context = self._build_completion_context(
+                model, provider, kwargs, parent_log_dir, request, pre_request_callback,
+            )
+
+            try:
+                gen = await self._executor.execute(context)
+            except (NoAvailableKeysError, ValueError):
+                if not is_last:
+                    lib_logger.info(
+                        f"Provider {provider} exhausted for {context.model}, "
+                        f"falling back to next provider in chain"
+                    )
+                    continue
+                raise
+
+            # Peek at first chunk to detect immediate failure
+            try:
+                first_chunk = await gen.__anext__()
+            except StopAsyncIteration:
+                # Empty stream, try next
+                if not is_last:
+                    continue
+                return
+
+            if self._is_stream_error(first_chunk) and not is_last:
+                # Consume remaining chunks (the [DONE]) and try next provider
+                lib_logger.info(
+                    f"Provider {provider} exhausted for {context.model}, "
+                    f"falling back to next provider in chain"
+                )
+                async for _ in gen:
+                    pass
+                continue
+
+            # Commit to this stream: yield first chunk then everything else
+            yield first_chunk
+            async for chunk in gen:
+                yield chunk
+            return
+
+        # Should not reach here, but just in case
+        raise NoAvailableKeysError(
+            f"All providers exhausted for model chain: {candidates}"
+        )
 
     def aembedding(
         self,
