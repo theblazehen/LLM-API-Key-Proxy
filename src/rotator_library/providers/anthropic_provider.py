@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import time
 import logging
 import uuid
@@ -75,8 +76,8 @@ def _get_thinking_cache():
     if _thinking_sig_cache is None:
         _thinking_sig_cache = create_provider_cache(
             "anthropic_thinking_signatures",
-            memory_ttl_seconds=7200,    # 2 hours in memory
-            disk_ttl_seconds=172800,    # 48 hours on disk
+            memory_ttl_seconds=7200,  # 2 hours in memory
+            disk_ttl_seconds=172800,  # 48 hours on disk
         )
     return _thinking_sig_cache
 
@@ -89,11 +90,83 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
 
     skip_cost_calculation = True
 
+    # =========================================================================
+    # ROTATION & TIER CONFIGURATION
+    # =========================================================================
+
+    # Sequential mode preserves Anthropic prompt caching (per-credential)
+    default_rotation_mode: str = "sequential"
+
+    # Provider name for env var lookups (ROTATION_MODE_ANTHROPIC, etc.)
+    provider_env_name: str = "anthropic"
+
+    # Priority tiers for credential ordering (lower number = used first).
+    # get_credential_tier_name() maps credentials to these via env vars.
+    tier_priorities = {"priority-1": 1, "priority-2": 2}
+    default_tier_priority: int = 999
+
     def __init__(self):
         super().__init__()
 
     def has_custom_logic(self) -> bool:
         return True
+
+    # =========================================================================
+    # CREDENTIAL PRIORITY (env-var based)
+    # =========================================================================
+
+    @staticmethod
+    def _extract_credential_number(credential: str) -> Optional[int]:
+        """
+        Extract the numeric index from a credential identifier.
+
+        Handles:
+        - File paths: /app/oauth_creds/anthropic_oauth_2.json -> 2
+        - Env URIs:   env://anthropic/2 -> 2
+        """
+        if not credential:
+            return None
+
+        # env://anthropic/2
+        env_match = re.match(r"^env://[^/]+/(\d+)$", credential)
+        if env_match:
+            return int(env_match.group(1))
+
+        # /app/oauth_creds/anthropic_oauth_2.json
+        file_match = re.search(r"_oauth_(\d+)\.json$", credential)
+        if file_match:
+            return int(file_match.group(1))
+
+        return None
+
+    def get_credential_tier_name(self, credential: str) -> Optional[str]:
+        """
+        Map credential -> synthetic tier name "priority-{N}".
+
+        Priority is configured via env vars:
+            ANTHROPIC_CREDENTIAL_PRIORITY_1=2   (oauth_1 -> priority 2)
+            ANTHROPIC_CREDENTIAL_PRIORITY_2=1   (oauth_2 -> priority 1, used first)
+
+        Falls back to default_tier_priority when not configured.
+        """
+        number = self._extract_credential_number(credential)
+        if number is not None:
+            raw = os.getenv(f"ANTHROPIC_CREDENTIAL_PRIORITY_{number}")
+            if raw is not None:
+                try:
+                    priority = int(raw)
+                    if priority >= 1:
+                        tier_name = f"priority-{priority}"
+                        # Register tier if not pre-defined (e.g. priority-3+)
+                        self.tier_priorities.setdefault(tier_name, priority)
+                        return tier_name
+                except ValueError:
+                    lib_logger.warning(
+                        f"Invalid ANTHROPIC_CREDENTIAL_PRIORITY_{number}={raw!r}; "
+                        f"using default priority {self.default_tier_priority}"
+                    )
+
+        return f"priority-{self.default_tier_priority}"
 
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         """Fetch models live from Anthropic API, falling back to hardcoded list."""
@@ -108,9 +181,7 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
             if resp.status_code == 200:
                 data = resp.json()
                 models = [
-                    f"anthropic/{m['id']}"
-                    for m in data.get("data", [])
-                    if m.get("id")
+                    f"anthropic/{m['id']}" for m in data.get("data", []) if m.get("id")
                 ]
                 if models:
                     return models
@@ -150,7 +221,9 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                 tool_result = {
                     "type": "tool_result",
                     "tool_use_id": msg.get("tool_call_id", ""),
-                    "content": content if isinstance(content, str) else json.dumps(content),
+                    "content": content
+                    if isinstance(content, str)
+                    else json.dumps(content),
                 }
                 if anthropic_messages and anthropic_messages[-1]["role"] == "user":
                     if isinstance(anthropic_messages[-1]["content"], list):
@@ -178,20 +251,28 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                     # the original Anthropic response)
                     cached = self._retrieve_thinking_blocks(reasoning)
                     if cached:
-                        lib_logger.info(f"Thinking signature cache HIT – restored {len(cached)} block(s)")
+                        lib_logger.info(
+                            f"Thinking signature cache HIT – restored {len(cached)} block(s)"
+                        )
                         blocks.extend(cached)
                     else:
                         # Fallback: inline signature from client (custom clients)
                         thinking_sig = msg.get("thinking_signature")
                         if thinking_sig and len(thinking_sig) >= 100:
-                            lib_logger.debug("Using inline thinking signature from client")
-                            blocks.append({
-                                "type": "thinking",
-                                "thinking": reasoning,
-                                "signature": thinking_sig,
-                            })
+                            lib_logger.debug(
+                                "Using inline thinking signature from client"
+                            )
+                            blocks.append(
+                                {
+                                    "type": "thinking",
+                                    "thinking": reasoning,
+                                    "signature": thinking_sig,
+                                }
+                            )
                         else:
-                            lib_logger.warning("Thinking signature cache MISS – dropping thinking block")
+                            lib_logger.warning(
+                                "Thinking signature cache MISS – dropping thinking block"
+                            )
 
                 if isinstance(content, str) and content.strip():
                     blocks.append({"type": "text", "text": content})
@@ -586,10 +667,12 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                 block_thinking = stream_state.pop("_block_thinking", "")
                 block_sig = stream_state.pop("_block_signature", "")
                 if block_thinking and block_sig:
-                    stream_state.setdefault("_thinking_blocks", []).append({
-                        "thinking": block_thinking,
-                        "signature": block_sig,
-                    })
+                    stream_state.setdefault("_thinking_blocks", []).append(
+                        {
+                            "thinking": block_thinking,
+                            "signature": block_sig,
+                        }
+                    )
             return
 
         if event_type == "message_delta":
@@ -629,7 +712,9 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                 full_thinking = "".join(b["thinking"] for b in thinking_blocks)
                 cache_key = hashlib.sha256(full_thinking.encode()).hexdigest()
                 _get_thinking_cache().store(cache_key, json.dumps(thinking_blocks))
-                lib_logger.info(f"Thinking signature cache STORE – {len(thinking_blocks)} block(s), key={cache_key[:12]}...")
+                lib_logger.info(
+                    f"Thinking signature cache STORE – {len(thinking_blocks)} block(s), key={cache_key[:12]}..."
+                )
 
             return
 

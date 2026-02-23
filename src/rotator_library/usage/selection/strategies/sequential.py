@@ -13,7 +13,6 @@ from typing import Dict, List, Optional
 
 from ...types import CredentialState, SelectionContext, RotationMode
 from ....error_handler import mask_credential
-from ....error_handler import mask_credential
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -78,6 +77,32 @@ class SequentialStrategy:
         # Check if current sticky credential is still available
         current = self._current.get(key)
         if current and current in context.candidates:
+            # Check if a higher-priority credential has become available
+            # (e.g., primary credential's cooldown expired)
+            current_priority = context.priorities.get(current, 999)
+            best_available_priority = min(
+                context.priorities.get(c, 999) for c in context.candidates
+            )
+            if best_available_priority < current_priority:
+                # Higher-priority credential is back — switch to it
+                selected = self._select_by_priority(
+                    context.candidates,
+                    context.priorities,
+                    context.usage_counts,
+                    states,
+                )
+                if selected and selected != current:
+                    self._current[key] = selected
+                    masked = (
+                        mask_credential(states[selected].accessor, style="full")
+                        if selected in states
+                        else mask_credential(selected, style="full")
+                    )
+                    lib_logger.info(
+                        f"Sequential: returning to higher-priority credential "
+                        f"{masked} for {key}"
+                    )
+                    return selected
             return current
 
         # Current not available - select new one by tier -> usage -> recency
