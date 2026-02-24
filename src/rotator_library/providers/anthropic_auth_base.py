@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import time
 import asyncio
@@ -68,6 +69,7 @@ def _build_authorize_url(verifier: str, challenge: str) -> str:
         "state": verifier,
     }
     from urllib.parse import urlencode
+
     return f"https://claude.ai/oauth/authorize?{urlencode(params)}"
 
 
@@ -522,21 +524,9 @@ class AnthropicAuthBase:
                 success=False, error=f"Token exchange failed: {e}"
             )
 
-        creds = {
-            **tokens,
-            "email": "anthropic-oauth-user",
-            "_proxy_metadata": {
-                "email": "anthropic-oauth-user",
-                "last_check_timestamp": time.time(),
-                "credential_type": "oauth",
-            },
-        }
-
-        # Find next available file number
         existing = sorted(oauth_dir.glob("anthropic_oauth_*.json"))
         next_num = len(existing) + 1
 
-        # Check for duplicate by access token prefix
         is_update = False
         file_path = None
         new_prefix = tokens["access_token"][:20]
@@ -554,6 +544,20 @@ class AnthropicAuthBase:
         if not file_path:
             file_path = str(oauth_dir / f"anthropic_oauth_{next_num}.json")
 
+        cred_num = re.search(r"_oauth_(\d+)\.json$", file_path)
+        cred_num = cred_num.group(1) if cred_num else str(next_num)
+        email_id = f"anthropic-oauth-user-{cred_num}"
+
+        creds = {
+            **tokens,
+            "email": email_id,
+            "_proxy_metadata": {
+                "email": email_id,
+                "last_check_timestamp": time.time(),
+                "credential_type": "oauth",
+            },
+        }
+
         if not safe_write_json(file_path, creds, lib_logger, secure_permissions=True):
             return AnthropicCredentialSetupResult(
                 success=False, error="Failed to save credentials"
@@ -565,7 +569,7 @@ class AnthropicAuthBase:
         return AnthropicCredentialSetupResult(
             success=True,
             file_path=file_path,
-            email="anthropic-oauth-user",
+            email=email_id,
             is_update=is_update,
             credentials=creds,
         )

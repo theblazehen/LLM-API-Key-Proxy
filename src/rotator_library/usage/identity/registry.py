@@ -49,17 +49,26 @@ class CredentialRegistry:
         Returns:
             Stable identifier string
         """
-        # Check cache first
         if accessor in self._cache:
             return self._cache[accessor].stable_id
 
-        # Determine if OAuth or API key
         if self._is_oauth_path(accessor):
             stable_id = self._get_oauth_stable_id(accessor)
         else:
             stable_id = self._get_api_key_stable_id(accessor)
 
-        # Cache the result
+        existing_accessor = self._id_to_accessor.get(stable_id)
+        if existing_accessor is not None and existing_accessor != accessor:
+            suffix = self._hash_content(accessor)[:8]
+            original_id = stable_id
+            stable_id = f"{stable_id}:{suffix}"
+            lib_logger.warning(
+                f"Stable ID collision detected: '{original_id}' already mapped to "
+                f"'{Path(existing_accessor).name if '/' in existing_accessor else existing_accessor}'. "
+                f"Disambiguating '{Path(accessor).name if '/' in accessor else accessor}' "
+                f"as '{stable_id}'"
+            )
+
         info = CredentialInfo(
             accessor=accessor,
             stable_id=stable_id,
