@@ -105,6 +105,12 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
     tier_priorities = {"priority-1": 1, "priority-2": 2}
     default_tier_priority: int = 999
 
+    # Fair cycle conflicts with priority rotation: it blocks the primary
+    # credential after exhaustion until ALL credentials exhaust, defeating
+    # the "return to primary when cooldown expires" behavior.
+    # Override with FAIR_CYCLE_ANTHROPIC=true if needed.
+    default_fair_cycle_enabled = False
+
     def __init__(self):
         super().__init__()
 
