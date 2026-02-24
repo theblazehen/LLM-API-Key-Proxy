@@ -8,6 +8,8 @@ import logging
 from typing import Optional, Dict, Any, Tuple
 import httpx
 
+from .core.constants import COOLDOWN_RATE_LIMIT_DEFAULT
+
 from litellm.exceptions import (
     APIConnectionError,
     RateLimitError,
@@ -22,6 +24,16 @@ from litellm.exceptions import (
 )
 
 lib_logger = logging.getLogger("rotator_library")
+
+
+def _get_default_rate_limit_cooldown() -> int:
+    """Return default cooldown for 429s when provider gives no retry-after."""
+    raw = os.getenv("COOLDOWN_RATE_LIMIT_DEFAULT", str(COOLDOWN_RATE_LIMIT_DEFAULT))
+    try:
+        value = int(raw)
+        return max(1, value)
+    except (TypeError, ValueError):
+        return COOLDOWN_RATE_LIMIT_DEFAULT
 
 
 def _parse_duration_string(duration_str: str) -> Optional[int]:
@@ -860,7 +872,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                 status_code=status_code,
             )
         if status_code == 429:
-            retry_after = get_retry_after(e)
+            retry_after = get_retry_after(e) or _get_default_rate_limit_cooldown()
             # Check if this is a quota error vs rate limit
             if "quota" in error_body or "resource_exhausted" in error_body:
                 # Extract quota details from the original (non-lowercased) response
@@ -994,7 +1006,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
         )
 
     if isinstance(e, RateLimitError):
-        retry_after = get_retry_after(e)
+        retry_after = get_retry_after(e) or _get_default_rate_limit_cooldown()
         # Check if this is a quota error vs rate limit
         error_msg = str(e).lower()
         if "quota" in error_msg or "resource_exhausted" in error_msg:
