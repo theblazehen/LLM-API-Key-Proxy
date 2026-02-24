@@ -139,7 +139,9 @@ COOLDOWN_AUTH_ERROR: int = 300  # 5 minutes
 COOLDOWN_TRANSIENT_ERROR: int = 30
 
 # Default rate limit cooldown when retry_after not provided (seconds)
-COOLDOWN_RATE_LIMIT_DEFAULT: int = 60
+# Set to 20 minutes to avoid hammering providers that return bare 429s
+# without Retry-After headers.
+COOLDOWN_RATE_LIMIT_DEFAULT: int = 1200
 
 # =============================================================================
 # SMALL COOLDOWN AUTO-RETRY
