@@ -295,6 +295,11 @@ class AnthropicAuthBase:
             if not force and cached_creds and not self._is_token_expired(cached_creds):
                 return cached_creds
 
+            # [ROTATING TOKEN FIX] Always read fresh from disk before refresh.
+            # Anthropic uses rotating refresh tokens - each refresh invalidates the previous token.
+            # If we use a stale cached token, refresh will fail with invalid_grant.
+            # Reading fresh from disk ensures we have the latest token (e.g., if another
+            # process/pod refreshed and wrote a new token to the shared credential file).
             if not path.startswith("env://"):
                 await self._read_creds_from_file(path)
             creds = self._credentials_cache[path]
@@ -374,6 +379,17 @@ class AnthropicAuthBase:
             if not access_token:
                 raise ValueError("Missing access_token in Anthropic refresh response")
 
+            # [ROTATING TOKEN TRACKING] Log when refresh token changes for debugging
+            old_refresh = creds.get("refresh_token", "")
+            new_refresh = new_token_data.get("refresh_token", "")
+            if new_refresh and new_refresh != old_refresh:
+                display_name = Path(path).name if not path.startswith("env://") else path
+                lib_logger.debug(
+                    f"Refresh token rotated for '{display_name}' "
+                    f"(old: ...{old_refresh[-8:] if len(old_refresh) > 8 else '?'} → "
+                    f"new: ...{new_refresh[-8:] if len(new_refresh) > 8 else '?'})"
+                )
+
             creds["access_token"] = access_token
             creds["refresh_token"] = new_token_data.get(
                 "refresh_token", creds["refresh_token"]
@@ -390,10 +406,22 @@ class AnthropicAuthBase:
                 creds["_proxy_metadata"] = {}
             creds["_proxy_metadata"]["last_check_timestamp"] = time.time()
 
+            # [VALIDATION] Verify required fields exist after refresh
+            required_fields = ["access_token", "refresh_token"]
+            missing_fields = [
+                field for field in required_fields if not creds.get(field)
+            ]
+            if missing_fields:
+                raise ValueError(
+                    f"Refreshed credentials missing required fields: {missing_fields}"
+                )
+
             self._refresh_failures.pop(path, None)
             self._next_refresh_after.pop(path, None)
 
             if not await self._save_credentials(path, creds):
+                # CRITICAL: For rotating tokens, if we can't persist the new token,
+                # the old token is already invalidated by Anthropic. This is a critical failure.
                 raise IOError(
                     f"Failed to persist refreshed Anthropic credentials for '{Path(path).name}'."
                 )
