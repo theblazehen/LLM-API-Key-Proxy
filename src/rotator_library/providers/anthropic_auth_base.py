@@ -199,7 +199,11 @@ class AnthropicAuthBase:
         try:
             from datetime import datetime
 
-            expiry_dt = datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
+            # Strip trailing "Z" only if not already followed by an offset
+            cleaned = expiry_str
+            if cleaned.endswith("Z"):
+                cleaned = cleaned[:-1] + "+00:00"
+            expiry_dt = datetime.fromisoformat(cleaned)
             expiry_timestamp = expiry_dt.timestamp()
         except (ValueError, AttributeError):
             try:
@@ -280,7 +284,7 @@ class AnthropicAuthBase:
 
         expiry_date = (
             datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-        ).isoformat() + "Z"
+        ).isoformat()
 
         return {
             "access_token": access_token,
@@ -400,7 +404,7 @@ class AnthropicAuthBase:
 
             creds["expiry_date"] = (
                 datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-            ).isoformat() + "Z"
+            ).isoformat()
 
             if "_proxy_metadata" not in creds:
                 creds["_proxy_metadata"] = {}
