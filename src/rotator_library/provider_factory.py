@@ -8,6 +8,7 @@ from .providers.qwen_auth_base import QwenAuthBase
 from .providers.iflow_auth_base import IFlowAuthBase
 from .providers.antigravity_auth_base import AntigravityAuthBase
 from .providers.copilot_auth_base import CopilotAuthBase
+from .providers.openai_oauth_base import OpenAIOAuthBase
 from .providers.anthropic_auth_base import AnthropicAuthBase
 
 PROVIDER_MAP = {
@@ -15,6 +16,7 @@ PROVIDER_MAP = {
     "qwen_code": QwenAuthBase,
     "iflow": IFlowAuthBase,
     "antigravity": AntigravityAuthBase,
+    "codex": OpenAIOAuthBase,
     "copilot": CopilotAuthBase,
     "anthropic": AnthropicAuthBase,
 }

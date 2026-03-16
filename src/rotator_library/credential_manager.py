@@ -18,6 +18,7 @@ DEFAULT_OAUTH_DIRS = {
     "qwen_code": Path.home() / ".qwen",
     "iflow": Path.home() / ".iflow",
     "antigravity": Path.home() / ".antigravity",
+    "codex": Path.home() / ".codex",
     "copilot": Path.home() / ".copilot",
     "anthropic": Path.home() / ".anthropic",
 }
@@ -29,6 +30,7 @@ ENV_OAUTH_PROVIDERS = {
     "antigravity": "ANTIGRAVITY",
     "qwen_code": "QWEN_CODE",
     "iflow": "IFLOW",
+    "codex": "CODEX",
     "copilot": "COPILOT",
     "anthropic": "ANTHROPIC_OAUTH",
 }
