@@ -322,10 +322,50 @@ class RotatingClient:
         """
         Dispatcher for completion requests.
 
+        Supports alias models with cross-provider fallback chains.
+        If the requested model is an alias (e.g. "alias/gpt"), the full
+        fallback chain is resolved and each target is tried in order.
+
         Returns:
             Response object or async generator for streaming
         """
         model = kwargs.get("model", "")
+
+        chain = self._model_resolver.resolve_model_chain(model)
+        available_chain = [m for m in chain if m.split("/")[0] in self.all_credentials]
+        if not available_chain:
+            raise ValueError(
+                f"Invalid model format or no credentials for provider: {model}"
+            )
+
+        last_error: Optional[Exception] = None
+        for i, target in enumerate(available_chain):
+            try:
+                return await self._acompletion_single(
+                    target, request, pre_request_callback, **kwargs
+                )
+            except Exception as e:
+                last_error = e
+                if i < len(available_chain) - 1:
+                    next_target = available_chain[i + 1]
+                    lib_logger.warning(
+                        f"Alias fallback: {target} failed ({type(e).__name__}: {e}), "
+                        f"trying {next_target}"
+                    )
+                    continue
+                raise
+
+        assert last_error is not None
+        raise last_error
+
+    async def _acompletion_single(
+        self,
+        model: str,
+        request: Optional[Any] = None,
+        pre_request_callback: Optional[callable] = None,
+        **kwargs,
+    ) -> Union[Any, AsyncGenerator[str, None]]:
+        """Execute a completion request for a single resolved model."""
         provider = model.split("/")[0] if "/" in model else ""
 
         if not provider or provider not in self.all_credentials:
@@ -333,14 +373,11 @@ class RotatingClient:
                 f"Invalid model format or no credentials for provider: {model}"
             )
 
-        # Extract internal logging parameters (not passed to API)
         parent_log_dir = kwargs.pop("_parent_log_dir", None)
 
-        # Resolve model ID
         resolved_model = self._model_resolver.resolve_model_id(model, provider)
         kwargs["model"] = resolved_model
 
-        # Create transaction logger if enabled
         transaction_logger = None
         if self.enable_request_logging:
             transaction_logger = TransactionLogger(
@@ -351,7 +388,6 @@ class RotatingClient:
             )
             transaction_logger.log_request(kwargs)
 
-        # Build request context
         context = RequestContext(
             model=resolved_model,
             provider=provider,
@@ -495,6 +531,10 @@ class RotatingClient:
                 all_models[provider] = []
             else:
                 all_models[provider] = result
+
+        alias_models = self._model_resolver.get_alias_models()
+        if alias_models:
+            all_models["alias"] = alias_models
 
         if grouped:
             return all_models

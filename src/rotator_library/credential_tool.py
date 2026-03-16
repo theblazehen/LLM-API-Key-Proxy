@@ -67,6 +67,7 @@ OAUTH_FRIENDLY_NAMES = {
     "iflow": "iFlow",
     "antigravity": "Antigravity",
     "codex": "OpenAI Codex",
+    "copilot": "GitHub Copilot",
     "anthropic": "Claude / Claude Code (Pro & Max)",
 }
 

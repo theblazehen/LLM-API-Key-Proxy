@@ -16,6 +16,21 @@ from typing import Any, Dict, List, Optional
 
 lib_logger = logging.getLogger("rotator_library")
 
+MODEL_ALIAS_MAP: Dict[str, List[str]] = {
+    "alias/opus": ["anthropic/claude-opus-4-6", "copilot/claude-opus-4.6"],
+    "alias/high": ["anthropic/claude-opus-4-6", "copilot/claude-opus-4.6"],
+    "alias/normal": [
+        "anthropic/claude-sonnet-4-5-20250929",
+        "copilot/claude-sonnet-4.5",
+    ],
+    "alias/sonnet": [
+        "anthropic/claude-sonnet-4-5-20250929",
+        "copilot/claude-sonnet-4.5",
+    ],
+    "alias/cheapest": ["copilot/gpt-5-mini"],
+    "alias/gpt": ["codex/gpt-5.4", "copilot/gpt-5.4"],
+}
+
 
 class ModelResolver:
     """
@@ -69,6 +84,26 @@ class ModelResolver:
                 return None
         return self._plugin_instances[provider]
 
+    def resolve_request_model(self, model: str) -> str:
+        """Resolve top-level request aliases to canonical provider/model IDs.
+
+        Returns the first (primary) target for the alias, or the model unchanged.
+        """
+        chain = MODEL_ALIAS_MAP.get(model)
+        return chain[0] if chain else model
+
+    def resolve_model_chain(self, model: str) -> List[str]:
+        """Resolve a model alias to its full fallback chain.
+
+        Returns a list of provider/model targets to try in order.
+        For non-alias models, returns a single-element list.
+        """
+        return MODEL_ALIAS_MAP.get(model, [model])
+
+    def get_alias_models(self) -> List[str]:
+        """Return user-facing alias model IDs exposed by the API."""
+        return sorted(MODEL_ALIAS_MAP.keys())
+
     def resolve_model_id(self, model: str, provider: str) -> str:
         """
         Resolve display name to actual model ID.
@@ -83,6 +118,8 @@ class ModelResolver:
         Returns:
             Full model string with ID (e.g., "iflow/deepseek-v3.2")
         """
+        model = self.resolve_request_model(model)
+        provider = model.split("/")[0] if "/" in model else provider
         model_name = model.split("/")[-1] if "/" in model else model
 
         # Check provider plugin first
