@@ -8,7 +8,7 @@ import logging
 from typing import Optional, Dict, Any, Tuple
 import httpx
 
-from .core.constants import COOLDOWN_RATE_LIMIT_DEFAULT
+from .core.constants import COOLDOWN_RATE_LIMIT_DEFAULT, COOLDOWN_TRANSIENT_ERROR
 
 from litellm.exceptions import (
     APIConnectionError,
@@ -954,13 +954,14 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                 except Exception:
                     pass
 
-            # Apply default 30s cooldown for all server errors
-            # This prevents rapid retries against overloaded/erroring servers
+            # Apply short cooldown for server errors.
+            # Kept low so transient 5xx auto-retry the same credential
+            # (below SMALL_COOLDOWN_RETRY_THRESHOLD) instead of rotating.
             return ClassifiedError(
                 error_type="server_error",
                 original_exception=e,
                 status_code=status_code,
-                retry_after=30,  # Default 30s cooldown for server errors
+                retry_after=COOLDOWN_TRANSIENT_ERROR,
             )
 
     if isinstance(
@@ -992,7 +993,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             error_type="server_error",
             original_exception=e,
             status_code=503,
-            retry_after=30,  # Default 30s cooldown for server errors
+            retry_after=COOLDOWN_TRANSIENT_ERROR,
         )
 
     if isinstance(e, TransientQuotaError):
@@ -1002,7 +1003,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             error_type="server_error",
             original_exception=e,
             status_code=503,
-            retry_after=30,  # Default 30s cooldown for server errors
+            retry_after=COOLDOWN_TRANSIENT_ERROR,
         )
 
     if isinstance(e, RateLimitError):
@@ -1068,7 +1069,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             error_type="server_error",
             original_exception=e,
             status_code=status_code or 503,
-            retry_after=30,  # Default 30s cooldown for server errors
+            retry_after=COOLDOWN_TRANSIENT_ERROR,
         )
 
     # Fallback for any other unclassified errors

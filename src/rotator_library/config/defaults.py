@@ -135,8 +135,10 @@ COOLDOWN_BACKOFF_MAX: int = 300  # 5 minutes
 COOLDOWN_AUTH_ERROR: int = 300  # 5 minutes
 
 # Transient/provider-level error cooldown (seconds)
-# Applied for errors that don't count against credential health
-COOLDOWN_TRANSIENT_ERROR: int = 30
+# Applied for errors that don't count against credential health.
+# Kept below DEFAULT_SMALL_COOLDOWN_RETRY_THRESHOLD so that transient 5xx
+# errors auto-retry the same credential instead of rotating+cooling down.
+COOLDOWN_TRANSIENT_ERROR: int = 5
 
 # Default rate limit cooldown when retry_after not provided (seconds)
 # Set to 20 minutes to avoid hammering providers that return bare 429s
