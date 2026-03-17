@@ -440,14 +440,31 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
         result = []
         for tool in tools:
             func = tool.get("function", {})
+            schema = func.get("parameters", {"type": "object"})
+            self._sanitize_schema(schema)
             result.append(
                 {
                     "name": func.get("name", ""),
                     "description": func.get("description", ""),
-                    "input_schema": func.get("parameters", {"type": "object"}),
+                    "input_schema": schema,
                 }
             )
         return result
+
+    @staticmethod
+    def _sanitize_schema(schema: Any) -> None:
+        """Remove fields from JSON Schema that Anthropic rejects (in-place)."""
+        if not isinstance(schema, dict):
+            return
+        schema.pop("$schema", None)
+        schema.pop("ref", None)  # non-standard; only $ref is valid
+        for value in schema.values():
+            if isinstance(value, dict):
+                AnthropicProvider._sanitize_schema(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        AnthropicProvider._sanitize_schema(item)
 
     # =========================================================================
     # MCP_ TOOL NAME PREFIXING / STRIPPING
@@ -878,6 +895,14 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
             payload = self._build_anthropic_payload(kwargs)
 
             file_logger.log_request(payload)
+
+            # DEBUG: Dump every payload for comparing working vs failing
+            try:
+                Path("/tmp/anthropic_last_payload.json").write_text(
+                    json.dumps(payload, indent=2, default=str)
+                )
+            except Exception:
+                pass
 
             url = f"{ANTHROPIC_API_BASE}/v1/messages?beta=true"
             return client.stream(
