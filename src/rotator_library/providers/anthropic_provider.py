@@ -40,7 +40,7 @@ ANTHROPIC_BETA_FEATURES = ",".join(
         "claude-code-20250219",
         "oauth-2025-04-20",
         "interleaved-thinking-2025-05-14",
-        # Disabled for debugging: "fine-grained-tool-streaming-2025-05-14",
+        "fine-grained-tool-streaming-2025-05-14",
     ]
 )
 
@@ -441,7 +441,6 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
         for tool in tools:
             func = tool.get("function", {})
             schema = func.get("parameters", {"type": "object"})
-            self._sanitize_schema(schema)
             result.append(
                 {
                     "name": func.get("name", ""),
@@ -450,21 +449,6 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                 }
             )
         return result
-
-    @staticmethod
-    def _sanitize_schema(schema: Any) -> None:
-        """Remove fields from JSON Schema that Anthropic rejects (in-place)."""
-        if not isinstance(schema, dict):
-            return
-        schema.pop("$schema", None)
-        schema.pop("ref", None)  # non-standard; only $ref is valid
-        for value in schema.values():
-            if isinstance(value, dict):
-                AnthropicProvider._sanitize_schema(value)
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict):
-                        AnthropicProvider._sanitize_schema(item)
 
     # =========================================================================
     # MCP_ TOOL NAME PREFIXING / STRIPPING
@@ -508,16 +492,18 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
     def _inject_system_prompt(
         self, system_blocks: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Prepend Claude Code identity to system prompt."""
+        """Prepend Claude Code identity to system prompt.
+
+        The claude-code beta validates that the first system block is the
+        exact prefix string byte-for-byte.  Merging client text into it
+        (even with ``\\n\\n``) triggers a 400.  Keep them as separate blocks.
+        """
         result = [{"type": "text", "text": CLAUDE_CODE_SYSTEM_PREFIX}]
         if system_blocks:
             for block in system_blocks:
-                result.append(block)
-            if len(result) >= 2:
-                result[1]["text"] = (
-                    CLAUDE_CODE_SYSTEM_PREFIX + "\n\n" + result[1]["text"]
-                )
-                result.pop(0)
+                text = block.get("text", "")
+                if isinstance(text, str) and text.strip():
+                    result.append(block)
         return result
 
     # =========================================================================
@@ -895,14 +881,6 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
             payload = self._build_anthropic_payload(kwargs)
 
             file_logger.log_request(payload)
-
-            # DEBUG: Dump every payload for comparing working vs failing
-            try:
-                Path("/tmp/anthropic_last_payload.json").write_text(
-                    json.dumps(payload, indent=2, default=str)
-                )
-            except Exception:
-                pass
 
             url = f"{ANTHROPIC_API_BASE}/v1/messages?beta=true"
             return client.stream(
