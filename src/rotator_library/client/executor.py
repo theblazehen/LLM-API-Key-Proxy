@@ -646,8 +646,12 @@ class RequestExecutor:
 
                     except PreRequestCallbackError:
                         raise
-                    except Exception:
-                        # Let context manager handle cleanup
+                    except Exception as exc:
+                        # Re-raise non-rotatable errors (invalid_request, context_window_exceeded)
+                        classified_exc = classify_error(exc, provider)
+                        if not should_rotate_on_error(classified_exc):
+                            raise
+                        # For rotatable errors, let the outer while loop try the next credential
                         pass
 
             except NoAvailableKeysError:
@@ -997,8 +1001,13 @@ class RequestExecutor:
 
                         except PreRequestCallbackError:
                             raise
-                        except Exception:
-                            # Let context manager handle cleanup
+                        except Exception as exc:
+                            # Re-raise non-rotatable errors (invalid_request, context_window_exceeded)
+                            # instead of swallowing them and rotating to the next credential.
+                            classified_exc = classify_error(exc, provider)
+                            if not should_rotate_on_error(classified_exc):
+                                raise
+                            # For rotatable errors, let the outer while loop try the next credential
                             pass
 
                 except NoAvailableKeysError:
