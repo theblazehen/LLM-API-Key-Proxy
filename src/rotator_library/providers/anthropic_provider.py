@@ -40,7 +40,7 @@ ANTHROPIC_BETA_FEATURES = ",".join(
         "claude-code-20250219",
         "oauth-2025-04-20",
         "interleaved-thinking-2025-05-14",
-        "fine-grained-tool-streaming-2025-05-14",
+        # Disabled for debugging: "fine-grained-tool-streaming-2025-05-14",
     ]
 )
 
