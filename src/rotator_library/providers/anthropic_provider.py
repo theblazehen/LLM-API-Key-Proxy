@@ -918,7 +918,7 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                         )
                         file_logger.log_error(error_msg)
                         if response.status_code == 400:
-                            # Log request summary for debugging opaque 400s
+                            # Dump full payload to file for debugging opaque 400s
                             payload = self._build_anthropic_payload(kwargs)
                             msg_summary = []
                             for m in payload.get("messages", []):
@@ -932,6 +932,13 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                                 f"has_tools={bool(payload.get('tools'))}, "
                                 f"has_thinking={bool(payload.get('thinking'))}"
                             )
+                            # Write full payload for inspection
+                            try:
+                                dump_path = Path("/tmp/anthropic_400_payload.json")
+                                dump_path.write_text(json.dumps(payload, indent=2, default=str))
+                                lib_logger.warning(f"Anthropic 400 payload dumped to {dump_path}")
+                            except Exception as dump_err:
+                                lib_logger.warning(f"Failed to dump 400 payload: {dump_err}")
                         raise httpx.HTTPStatusError(
                             error_msg,
                             request=response.request,
