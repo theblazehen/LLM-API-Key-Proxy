@@ -1198,17 +1198,90 @@ class RequestExecutor:
         model: str,
         kwargs: Dict[str, Any],
     ) -> None:
+        # Provider-specific validation
         plugin = self._get_plugin_instance(provider)
-        if not plugin or not hasattr(plugin, "validate_request"):
+        if plugin and hasattr(plugin, "validate_request"):
+            result = plugin.validate_request(kwargs, model)
+            if asyncio.iscoroutine(result):
+                result = await result
+            if result is False:
+                raise ValueError(f"Request validation failed for {provider}/{model}")
+            if isinstance(result, str):
+                raise ValueError(result)
+
+        # Pre-flight context window check
+        self._check_context_window(model, kwargs)
+
+    def _check_context_window(self, model: str, kwargs: Dict[str, Any]) -> None:
+        """
+        Pre-flight check: estimate input tokens and reject if they exceed
+        the model's context window. Prevents wasting API calls on requests
+        that will definitely fail with opaque 400 errors.
+        """
+        messages = kwargs.get("messages")
+        if not messages:
             return
 
-        result = plugin.validate_request(kwargs, model)
-        if asyncio.iscoroutine(result):
-            result = await result
-        if result is False:
-            raise ValueError(f"Request validation failed for {provider}/{model}")
-        if isinstance(result, str):
-            raise ValueError(result)
+        try:
+            from litellm.litellm_core_utils.token_counter import token_counter
+
+            # Count input tokens (messages + tools)
+            input_tokens = token_counter(model=model, messages=messages)
+            tools = kwargs.get("tools")
+            if tools:
+                try:
+                    input_tokens += token_counter(model=model, text=json.dumps(tools))
+                except Exception:
+                    input_tokens += len(json.dumps(tools)) // 4  # rough fallback
+
+            # Look up context window
+            try:
+                model_info = litellm.get_model_info(model)
+                context_window = model_info.get("max_input_tokens") or model_info.get("max_tokens")
+            except Exception:
+                context_window = None
+
+            if not context_window:
+                # Try custom ModelRegistry as fallback
+                try:
+                    from ..model_info_service import get_model_info_service
+                    registry = get_model_info_service()
+                    metadata = registry.lookup(model)
+                    if metadata and metadata.limits.context_window:
+                        context_window = metadata.limits.context_window
+                except Exception:
+                    pass
+
+            if not context_window:
+                return  # Can't validate without known limits
+
+            max_output = kwargs.get("max_tokens", 4096)
+
+            if input_tokens + max_output > context_window:
+                raise litellm.ContextWindowExceededError(
+                    message=(
+                        f"Request too large for {model}: "
+                        f"~{input_tokens:,} input tokens + {max_output:,} max_tokens "
+                        f"= ~{input_tokens + max_output:,} total, "
+                        f"but context window is {context_window:,} tokens"
+                    ),
+                    model=model,
+                    llm_provider=model.split("/")[0] if "/" in model else "unknown",
+                )
+
+            # Warn if close to limit (>90%)
+            usage_pct = input_tokens / context_window
+            if usage_pct > 0.9:
+                lib_logger.warning(
+                    f"Context window {usage_pct:.0%} full for {model}: "
+                    f"~{input_tokens:,}/{context_window:,} tokens"
+                )
+
+        except litellm.ContextWindowExceededError:
+            raise  # Don't catch our own error
+        except Exception as e:
+            # Token counting is best-effort — don't block requests on counting failures
+            lib_logger.debug(f"Pre-flight token check failed (non-fatal): {e}")
 
     def _extract_usage_tokens(self, response: Any) -> tuple[int, int, int, int, int]:
         prompt_tokens = 0
