@@ -454,7 +454,7 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
     # =========================================================================
 
     def _prefix_tool_names(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Add mcp_ prefix to tool names in definitions and messages."""
+        """Add mcp_ prefix to tool names in definitions, messages, and tool_choice."""
         payload = copy.deepcopy(payload)
 
         if payload.get("tools"):
@@ -470,6 +470,11 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                         if isinstance(block, dict) and block.get("type") == "tool_use":
                             if block.get("name"):
                                 block["name"] = f"{TOOL_PREFIX}{block['name']}"
+
+        # Also prefix tool_choice.name to match prefixed tool definitions
+        tc = payload.get("tool_choice")
+        if isinstance(tc, dict) and tc.get("type") == "tool" and tc.get("name"):
+            tc["name"] = f"{TOOL_PREFIX}{tc['name']}"
 
         return payload
 
