@@ -955,6 +955,45 @@ async def chat_completions(
             client_info=(request.client.host, request.client.port),
             request_data=request_data,
         )
+        # Sanitize trailing assistant messages to prevent:
+        # - Anthropic "assistant message prefill" 400 errors (Claude 4.6+ rejects prefill)
+        # - Copilot/GPT generation loops (model "continues" from trailing assistant turn)
+        # Empty trailing assistant turns (opencode bug) are stripped.
+        # Non-empty ones are converted to a user instruction to preserve prefill intent.
+        messages = request_data.get("messages")
+        if messages and isinstance(messages, list):
+            prefill_parts = []
+            while (
+                messages
+                and isinstance(messages[-1], dict)
+                and messages[-1].get("role") == "assistant"
+            ):
+                content = messages.pop().get("content", "")
+                # Normalize content: extract text from list-of-dicts format
+                if isinstance(content, list):
+                    content = " ".join(
+                        c.get("text", "") for c in content
+                        if isinstance(c, dict) and c.get("type") == "text"
+                    )
+                if isinstance(content, str) and content.strip():
+                    prefill_parts.append(content.strip())
+            # If there was meaningful prefill content, inject as user instruction
+            if prefill_parts:
+                prefill_text = " ".join(reversed(prefill_parts))
+                if messages and messages[-1].get("role") == "user":
+                    # Append to existing last user message
+                    last_content = messages[-1].get("content", "")
+                    if isinstance(last_content, str):
+                        messages[-1]["content"] = (
+                            f"{last_content}\n\nBegin your response with: {prefill_text}"
+                        )
+                else:
+                    # No user message to append to; create one
+                    messages.append({
+                        "role": "user",
+                        "content": f"Begin your response with: {prefill_text}",
+                    })
+
         is_streaming = request_data.get("stream", False)
 
         if is_streaming:
@@ -1053,6 +1092,39 @@ async def anthropic_messages(
             ),
             request_data=body.model_dump(exclude_none=True),
         )
+
+        # Sanitize trailing assistant messages (same logic as OpenAI endpoint)
+        if body.messages:
+            prefill_parts = []
+            while body.messages and body.messages[-1].role == "assistant":
+                msg = body.messages.pop()
+                content = msg.content
+                # Normalize: content can be str or list of content blocks
+                if isinstance(content, list):
+                    text = " ".join(
+                        (b.text if hasattr(b, "text") else b.get("text", ""))
+                        for b in content
+                        if (hasattr(b, "type") and b.type == "text")
+                        or (isinstance(b, dict) and b.get("type") == "text")
+                    )
+                else:
+                    text = content or ""
+                if text.strip():
+                    prefill_parts.append(text.strip())
+            if prefill_parts:
+                prefill_text = " ".join(reversed(prefill_parts))
+                from rotator_library.anthropic_compat.models import AnthropicMessage
+                if body.messages and body.messages[-1].role == "user":
+                    last = body.messages[-1]
+                    if isinstance(last.content, str):
+                        last.content = (
+                            f"{last.content}\n\nBegin your response with: {prefill_text}"
+                        )
+                else:
+                    body.messages.append(AnthropicMessage(
+                        role="user",
+                        content=f"Begin your response with: {prefill_text}",
+                    ))
 
         # Use the library method to handle the request
         result = await client.anthropic_messages(body, raw_request=request)
