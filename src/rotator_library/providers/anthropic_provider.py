@@ -364,7 +364,50 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                 if blocks:
                     anthropic_messages.append({"role": "user", "content": blocks})
 
+        # Enforce Anthropic message constraints:
+        # 1. Merge consecutive same-role messages
+        # 2. Ensure conversation starts with user
+        # 3. Ensure conversation doesn't end with trailing assistant (prefill)
+        anthropic_messages = self._enforce_alternation(anthropic_messages)
+
         return system_blocks, anthropic_messages
+
+    @staticmethod
+    def _enforce_alternation(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Enforce strict user/assistant alternation required by Anthropic API.
+
+        Merges consecutive same-role messages and ensures the conversation
+        starts with a user message.
+        """
+        if not messages:
+            return messages
+
+        # Merge consecutive same-role messages
+        merged = [messages[0]]
+        for msg in messages[1:]:
+            if msg["role"] == merged[-1]["role"]:
+                # Same role — merge content into previous message
+                prev_content = merged[-1]["content"]
+                new_content = msg["content"]
+                # Normalize both to list form
+                if isinstance(prev_content, str):
+                    prev_content = [{"type": "text", "text": prev_content}]
+                if isinstance(new_content, str):
+                    new_content = [{"type": "text", "text": new_content}]
+                if not isinstance(prev_content, list):
+                    prev_content = [prev_content]
+                if not isinstance(new_content, list):
+                    new_content = [new_content]
+                merged[-1]["content"] = prev_content + new_content
+            else:
+                merged.append(msg)
+
+        # Ensure conversation starts with user (Anthropic requirement)
+        if merged and merged[0]["role"] != "user":
+            merged.insert(0, {"role": "user", "content": "Continue."})
+
+        return merged
 
     def _retrieve_thinking_blocks(
         self, reasoning_content: str
@@ -874,6 +917,21 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                             f"Anthropic HTTP {response.status_code}: {error_text}"
                         )
                         file_logger.log_error(error_msg)
+                        if response.status_code == 400:
+                            # Log request summary for debugging opaque 400s
+                            payload = self._build_anthropic_payload(kwargs)
+                            msg_summary = []
+                            for m in payload.get("messages", []):
+                                role = m.get("role", "?")
+                                c = m.get("content", "")
+                                clen = len(json.dumps(c)) if not isinstance(c, str) else len(c)
+                                msg_summary.append(f"{role}({clen})")
+                            lib_logger.warning(
+                                f"Anthropic 400 debug: model={payload.get('model')}, "
+                                f"msgs=[{', '.join(msg_summary)}], "
+                                f"has_tools={bool(payload.get('tools'))}, "
+                                f"has_thinking={bool(payload.get('thinking'))}"
+                            )
                         raise httpx.HTTPStatusError(
                             error_msg,
                             request=response.request,
