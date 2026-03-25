@@ -263,7 +263,7 @@ class CopilotProvider(CopilotAuthBase, ProviderInterface):
 
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
-    ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
+    ) -> Union[litellm.ModelResponse, AsyncGenerator[Any, None]]:
         """
         Handle completion requests to Copilot API.
 
@@ -331,6 +331,8 @@ class CopilotProvider(CopilotAuthBase, ProviderInterface):
             body["tools"] = kwargs["tools"]
         if kwargs.get("tool_choice"):
             body["tool_choice"] = kwargs["tool_choice"]
+        if kwargs.get("stream_options") is not None:
+            body["stream_options"] = kwargs["stream_options"]
 
         lib_logger.debug(
             f"Copilot request: model={model}, initiator={initiator}, "
@@ -386,7 +388,7 @@ class CopilotProvider(CopilotAuthBase, ProviderInterface):
         headers: Dict[str, str],
         body: Dict[str, Any],
         model: str,
-    ) -> AsyncGenerator[litellm.ModelResponse, None]:
+    ) -> AsyncGenerator[Dict[str, Any], None]:
         """Handle streaming Copilot API response."""
         url = f"{base_url}/chat/completions"
 
@@ -472,9 +474,11 @@ class CopilotProvider(CopilotAuthBase, ProviderInterface):
 
     def _convert_to_litellm_chunk(
         self, chunk_data: Dict[str, Any], model: str
-    ) -> litellm.ModelResponse:
-        """Convert Copilot streaming chunk to LiteLLM format."""
+    ) -> Dict[str, Any]:
+        """Convert Copilot streaming chunk to OpenAI chunk dict format."""
         choices = []
+        source_usage = chunk_data.get("usage")
+
         for choice in chunk_data.get("choices", []):
             delta = choice.get("delta", {})
             delta_payload = {
@@ -484,20 +488,36 @@ class CopilotProvider(CopilotAuthBase, ProviderInterface):
             if delta.get("tool_calls"):
                 delta_payload["tool_calls"] = delta["tool_calls"]
 
+            finish_reason = choice.get("finish_reason")
             choices.append(
                 {
                     "index": choice.get("index", 0),
                     "delta": delta_payload,
-                    "finish_reason": choice.get("finish_reason"),
+                    "finish_reason": finish_reason,
                 }
             )
 
-        return litellm.ModelResponse(
-            id=chunk_data.get("id", f"copilot-{uuid.uuid4()}"),
-            choices=choices,
-            created=chunk_data.get("created", int(time.time())),
-            model=f"copilot/{model}",
+        chunk = {
+            "id": chunk_data.get("id", f"copilot-{uuid.uuid4()}"),
+            "object": "chat.completion.chunk",
+            "choices": choices,
+            "created": chunk_data.get("created", int(time.time())),
+            "model": f"copilot/{model}",
+        }
+
+        has_final_finish_reason = any(
+            choice.get("finish_reason") is not None for choice in choices
         )
+        if source_usage is not None:
+            chunk["usage"] = source_usage
+        elif has_final_finish_reason:
+            chunk["usage"] = {
+                "prompt_tokens": 0,
+                "completion_tokens": 1,
+                "total_tokens": 1,
+            }
+
+        return chunk
 
     async def aembedding(
         self, client: httpx.AsyncClient, **kwargs
