@@ -834,6 +834,10 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
             payload["temperature"] = kwargs["temperature"]
 
         reasoning_effort = kwargs.get("reasoning_effort")
+        # Opus models always use thinking (matching antigravity provider behavior)
+        is_opus = "opus" in model.lower()
+        if is_opus and not reasoning_effort:
+            reasoning_effort = "medium"
         if reasoning_effort and str(reasoning_effort).lower() not in (
             "none",
             "disabled",
@@ -932,7 +936,11 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                             for m in payload.get("messages", []):
                                 role = m.get("role", "?")
                                 c = m.get("content", "")
-                                clen = len(json.dumps(c)) if not isinstance(c, str) else len(c)
+                                clen = (
+                                    len(json.dumps(c))
+                                    if not isinstance(c, str)
+                                    else len(c)
+                                )
                                 msg_summary.append(f"{role}({clen})")
                             lib_logger.warning(
                                 f"Anthropic 400 debug: model={payload.get('model')}, "
@@ -943,10 +951,16 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                             # Write full payload for inspection
                             try:
                                 dump_path = Path("/tmp/anthropic_400_payload.json")
-                                dump_path.write_text(json.dumps(payload, indent=2, default=str))
-                                lib_logger.warning(f"Anthropic 400 payload dumped to {dump_path}")
+                                dump_path.write_text(
+                                    json.dumps(payload, indent=2, default=str)
+                                )
+                                lib_logger.warning(
+                                    f"Anthropic 400 payload dumped to {dump_path}"
+                                )
                             except Exception as dump_err:
-                                lib_logger.warning(f"Failed to dump 400 payload: {dump_err}")
+                                lib_logger.warning(
+                                    f"Failed to dump 400 payload: {dump_err}"
+                                )
                         raise httpx.HTTPStatusError(
                             error_msg,
                             request=response.request,
