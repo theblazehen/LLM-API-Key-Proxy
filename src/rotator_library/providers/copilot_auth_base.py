@@ -603,11 +603,11 @@ class CopilotAuthBase:
                 f"Failed to initialize {self.ENV_PREFIX} OAuth for '{path}': {e}"
             )
 
-    async def get_auth_header(self, credential_path: str) -> Dict[str, str]:
+    async def get_auth_header(self, credential_identifier: str) -> Dict[str, str]:
         """Get Authorization header with fresh Copilot API token."""
-        creds = await self._load_credentials(credential_path)
+        creds = await self._load_credentials(credential_identifier)
         if self._is_token_expired(creds):
-            creds = await self._refresh_copilot_token(credential_path, creds)
+            creds = await self._refresh_copilot_token(credential_identifier, creds)
         return {"Authorization": f"Bearer {creds['access_token']}"}
 
     async def get_user_info(

@@ -29,8 +29,9 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 import httpx
 import litellm
 
-from .provider_interface import ProviderInterface
+from .provider_interface import ProviderInterface, QuotaGroupMap, UsageResetConfigDef
 from .copilot_auth_base import CopilotAuthBase
+from .utilities.copilot_quota_tracker import CopilotQuotaTracker
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -115,7 +116,7 @@ def _env_float(key: str, default: float) -> float:
 # =============================================================================
 
 
-class CopilotProvider(CopilotAuthBase, ProviderInterface):
+class CopilotProvider(CopilotAuthBase, CopilotQuotaTracker, ProviderInterface):
     """
     GitHub Copilot provider with custom API integration.
 
@@ -136,8 +137,24 @@ class CopilotProvider(CopilotAuthBase, ProviderInterface):
 
     skip_cost_calculation = True  # Copilot uses subscription, not token billing
 
+    provider_env_name: str = "copilot"
+
+    usage_reset_configs = {
+        "default": UsageResetConfigDef(
+            window_seconds=30 * 24 * 60 * 60,
+            mode="per_model",
+            description="30-day Copilot quota window",
+            field_name="models",
+        ),
+    }
+
+    model_quota_groups: QuotaGroupMap = {
+        "premium-requests": ["_premium_requests_window"],
+    }
+
     def __init__(self):
         super().__init__()
+        self._init_quota_tracker()
 
         # X-Initiator header configuration
         # Based on https://github.com/Tarquinen/dotfiles/tree/main/.config/opencode/plugin/copilot-force-agent-header

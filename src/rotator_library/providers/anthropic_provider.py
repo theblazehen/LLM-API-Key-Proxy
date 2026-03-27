@@ -18,9 +18,10 @@ import httpx
 import litellm
 from litellm.exceptions import RateLimitError
 
-from .provider_interface import ProviderInterface
+from .provider_interface import ProviderInterface, QuotaGroupMap, UsageResetConfigDef
 from .anthropic_auth_base import AnthropicAuthBase
 from .provider_cache import create_provider_cache
+from .utilities.anthropic_quota_tracker import AnthropicQuotaTracker
 from ..timeout_config import TimeoutConfig
 from ..transaction_logger import ProviderLogger
 
@@ -82,7 +83,7 @@ def _get_thinking_cache():
     return _thinking_sig_cache
 
 
-class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
+class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterface):
     """
     Anthropic provider using OAuth authentication (Claude Pro/Max).
     Calls Anthropic's Messages API directly, impersonating Claude Code.
@@ -111,8 +112,29 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
     # Override with FAIR_CYCLE_ANTHROPIC=true if needed.
     default_fair_cycle_enabled = False
 
+    usage_reset_configs = {
+        frozenset({1, 2}): UsageResetConfigDef(
+            window_seconds=5 * 60 * 60,
+            mode="per_model",
+            description="5-hour Anthropic quota window",
+            field_name="models",
+        ),
+        "default": UsageResetConfigDef(
+            window_seconds=7 * 24 * 60 * 60,
+            mode="per_model",
+            description="7-day Anthropic quota window",
+            field_name="models",
+        ),
+    }
+
+    model_quota_groups: QuotaGroupMap = {
+        "5h-limit": ["_5h_window"],
+        "7d-limit": ["_7d_window"],
+    }
+
     def __init__(self):
         super().__init__()
+        self._init_quota_tracker()
 
     def has_custom_logic(self) -> bool:
         return True
