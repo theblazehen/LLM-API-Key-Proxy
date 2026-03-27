@@ -149,7 +149,7 @@ class CopilotProvider(CopilotAuthBase, CopilotQuotaTracker, ProviderInterface):
     }
 
     model_quota_groups: QuotaGroupMap = {
-        "premium-requests": ["_premium_requests_window"],
+        "premium-interactions": ["_premium_interactions_window"],
     }
 
     def __init__(self):

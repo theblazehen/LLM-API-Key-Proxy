@@ -268,7 +268,9 @@ class CopilotQuotaTracker:
                 continue
 
             if not isinstance(result, tuple) or len(result) != 2:
-                lib_logger.warning(f"Copilot quota fetch returned invalid result: {result}")
+                lib_logger.warning(
+                    f"Copilot quota fetch returned invalid result: {result}"
+                )
                 continue
 
             cred_path, snapshot = result
@@ -379,48 +381,58 @@ class CopilotQuotaTracker:
             if quota_data.get("status") != "success":
                 continue
 
-            bucket = quota_data.get("buckets", {}).get("premium_requests")
-            if not bucket:
-                continue
-
-            if bucket.get("unlimited"):
-                continue
-
-            entitlement = bucket.get("entitlement")
-            remaining = bucket.get("remaining")
-            if entitlement is None or remaining is None:
-                continue
-
-            try:
-                quota_max_requests = int(entitlement)
-                quota_used = max(0, quota_max_requests - int(remaining))
-            except (TypeError, ValueError):
-                continue
-
+            buckets = quota_data.get("buckets", {})
             reset_ts = quota_data.get("quota_reset_ts")
-            apply_exhaustion = bool(
-                is_initial_fetch
-                and not bucket.get("overage_permitted", False)
-                and quota_used >= quota_max_requests
-                and reset_ts
-            )
 
-            try:
-                await usage_manager.update_quota_baseline(
-                    accessor=cred_path,
-                    model="copilot/_premium_requests_window",
-                    quota_max_requests=quota_max_requests,
-                    quota_reset_ts=reset_ts,
-                    quota_used=quota_used,
-                    quota_group="premium-requests",
-                    force=force,
-                    apply_exhaustion=apply_exhaustion,
+            # Store baselines for all non-unlimited buckets with entitlement data
+            for bucket_key, bucket in buckets.items():
+                if not isinstance(bucket, dict):
+                    continue
+
+                if bucket.get("unlimited"):
+                    continue
+
+                entitlement = bucket.get("entitlement")
+                remaining = bucket.get("remaining")
+                if entitlement is None or remaining is None:
+                    continue
+
+                try:
+                    quota_max_requests = int(entitlement)
+                    if quota_max_requests <= 0:
+                        continue
+                    quota_used = max(0, quota_max_requests - int(remaining))
+                except (TypeError, ValueError):
+                    continue
+
+                apply_exhaustion = bool(
+                    is_initial_fetch
+                    and not bucket.get("overage_permitted", False)
+                    and quota_used >= quota_max_requests
+                    and reset_ts
                 )
-                stored_count += 1
-            except Exception as e:
-                lib_logger.warning(
-                    f"Failed to store Copilot baseline for {_get_credential_identifier(cred_path)}: {e}"
-                )
+
+                # Use bucket key as the virtual model/group name
+                model_name = f"copilot/_{bucket_key}_window"
+                quota_group = bucket_key.replace("_", "-")
+
+                try:
+                    await usage_manager.update_quota_baseline(
+                        accessor=cred_path,
+                        model=model_name,
+                        quota_max_requests=quota_max_requests,
+                        quota_reset_ts=reset_ts,
+                        quota_used=quota_used,
+                        quota_group=quota_group,
+                        force=force,
+                        apply_exhaustion=apply_exhaustion,
+                    )
+                    stored_count += 1
+                except Exception as e:
+                    lib_logger.warning(
+                        f"Failed to store Copilot baseline for "
+                        f"{_get_credential_identifier(cred_path)} bucket {bucket_key}: {e}"
+                    )
 
         return stored_count
 

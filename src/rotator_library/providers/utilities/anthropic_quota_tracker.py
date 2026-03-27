@@ -190,7 +190,20 @@ class AnthropicQuotaTracker:
             extra_usage_enabled: Optional[bool] = None
 
             for key, value in data.items():
-                if not isinstance(value, dict):
+                # Null entries (e.g. seven_day_opus: null) — skip
+                if value is None or not isinstance(value, dict):
+                    continue
+
+                if key == "extra_usage":
+                    if "is_enabled" in value:
+                        extra_usage_enabled = bool(value.get("is_enabled"))
+                    # Also capture monthly_limit info from extra_usage
+                    if value.get("monthly_limit") is not None:
+                        monthly_limit = AnthropicMonthlyLimit(
+                            monthly_limit=value.get("monthly_limit"),
+                            used_credits=value.get("used_credits"),
+                            is_enabled=bool(value.get("is_enabled", False)),
+                        )
                     continue
 
                 if key == "monthly_limit":
@@ -201,26 +214,27 @@ class AnthropicQuotaTracker:
                     )
                     continue
 
-                if key == "extra_usage":
-                    if "is_enabled" in value:
-                        extra_usage_enabled = bool(value.get("is_enabled"))
-                    continue
-
-                if "utilization" in value and "resets_at" in value:
+                # Regular quota windows have "utilization" (0-100 percent scale)
+                if "utilization" in value:
                     utilization = value.get("utilization", 0.0)
                     try:
-                        utilization_float = float(utilization)
+                        utilization_pct = float(utilization)
                     except (TypeError, ValueError):
-                        utilization_float = 0.0
+                        utilization_pct = 0.0
 
-                    utilization_float = max(0.0, min(1.0, utilization_float))
+                    # API returns 0-100 scale, convert to 0.0-1.0 fraction
+                    utilization_fraction = max(0.0, min(1.0, utilization_pct / 100.0))
 
+                    # Windows are enabled if they exist with utilization data
+                    # (is_enabled only appears on extra_usage, not regular windows)
                     windows[key] = AnthropicQuotaWindow(
                         key=key,
-                        utilization=utilization_float,
-                        remaining_fraction=max(0.0, min(1.0, 1.0 - utilization_float)),
+                        utilization=utilization_fraction,
+                        remaining_fraction=max(
+                            0.0, min(1.0, 1.0 - utilization_fraction)
+                        ),
                         resets_at=_parse_iso_timestamp(value.get("resets_at")),
-                        is_enabled=bool(value.get("is_enabled", False)),
+                        is_enabled=True,
                     )
 
             snapshot = AnthropicQuotaSnapshot(
