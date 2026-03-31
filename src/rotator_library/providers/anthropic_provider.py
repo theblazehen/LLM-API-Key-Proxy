@@ -36,14 +36,17 @@ TOOL_PREFIX = "mcp_"
 
 ANTHROPIC_API_BASE = "https://api.anthropic.com"
 
-ANTHROPIC_BETA_FEATURES = ",".join(
-    [
-        "claude-code-20250219",
-        "oauth-2025-04-20",
-        "interleaved-thinking-2025-05-14",
-        "fine-grained-tool-streaming-2025-05-14",
-    ]
-)
+BETA_CLAUDE_CODE = "claude-code-20250219"
+BETA_OAUTH = "oauth-2025-04-20"
+BETA_INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
+BETA_EFFORT = "effort-2025-11-24"
+BETA_PROMPT_CACHING_SCOPE = "prompt-caching-scope-2026-01-05"
+BETA_CONTEXT_MANAGEMENT = "context-management-2025-06-27"
+BETA_FAST_MODE = "fast-mode-2026-02-01"
+BETA_REDACT_THINKING = "redact-thinking-2026-02-12"
+BETA_STRUCTURED_OUTPUTS = "structured-outputs-2025-12-15"
+BETA_TOKEN_EFFICIENT_TOOLS = "token-efficient-tools-2026-03-28"
+BETA_WEB_SEARCH = "web-search-2025-03-05"
 
 CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
 
@@ -541,12 +544,13 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
         Anthropic caches the full prefix up to each breakpoint. This saves
         ~90% on cached input token costs and reduces latency.
         """
-        cache_marker = {"type": "ephemeral"}
+        system_cache_marker = {"type": "ephemeral", "ttl": "1h", "scope": "global"}
+        cache_marker = {"type": "ephemeral", "ttl": "1h"}
 
         # 1. Cache the last system block (system prompt rarely changes)
         system = payload.get("system")
         if system and isinstance(system, list) and len(system) > 0:
-            system[-1]["cache_control"] = cache_marker
+            system[-1]["cache_control"] = system_cache_marker
 
         # 2. Cache the last tool definition (tools rarely change)
         tools = payload.get("tools")
@@ -554,19 +558,17 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
             tools[-1]["cache_control"] = cache_marker
 
         # 3. Cache the end of conversation history for multi-turn caching.
-        #    Mark the last content block of the second-to-last message
-        #    (the turn before the new user message) so the growing
-        #    conversation prefix gets cached across turns.
+        #    Mark the last content block of the latest message so the full
+        #    conversation, including the newest turn, is cached across turns.
         messages = payload.get("messages")
-        if messages and len(messages) >= 2:
-            # The last message is the new user turn; cache up to the one before it
-            prev_msg = messages[-2]
-            content = prev_msg.get("content")
+        if messages and len(messages) >= 1:
+            last_msg = messages[-1]
+            content = last_msg.get("content")
             if isinstance(content, list) and len(content) > 0:
                 content[-1]["cache_control"] = cache_marker
             elif isinstance(content, str) and content:
                 # Convert string content to block format so we can attach cache_control
-                prev_msg["content"] = [
+                last_msg["content"] = [
                     {"type": "text", "text": content, "cache_control": cache_marker}
                 ]
 
@@ -602,6 +604,10 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
             index = data.get("index", 0)
             stream_state["current_block_type"] = block_type
             stream_state["current_block_index"] = index
+
+            if block_type == "redacted_thinking":
+                # Redacted thinking blocks don't stream visible content.
+                return
 
             if block_type == "thinking":
                 stream_state["_block_thinking"] = ""
@@ -801,17 +807,60 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
     # MAIN API CALL
     # =========================================================================
 
-    def _build_anthropic_headers(self, access_token: str) -> Dict[str, str]:
+    def _build_beta_header(self, payload: Optional[Dict[str, Any]] = None) -> str:
+        betas = [
+            BETA_CLAUDE_CODE,
+            BETA_OAUTH,
+            BETA_INTERLEAVED_THINKING,
+        ]
+
+        if payload is None:
+            return ",".join(betas)
+
+        betas.extend(
+            [
+                BETA_PROMPT_CACHING_SCOPE,
+                BETA_STRUCTURED_OUTPUTS,
+                BETA_TOKEN_EFFICIENT_TOOLS,
+                BETA_WEB_SEARCH,
+            ]
+        )
+
+        # Always send effort beta for adaptive-thinking models (upstream behavior)
+        model = payload.get("model", "")
+        if self._model_supports_adaptive_thinking(model):
+            betas.append(BETA_EFFORT)
+
+        if "context_management" in payload:
+            betas.append(BETA_CONTEXT_MANAGEMENT)
+
+        if "speed" in payload:
+            betas.append(BETA_FAST_MODE)
+
+        return ",".join(betas)
+
+    def _build_anthropic_headers(
+        self, access_token: str, payload: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, str]:
         return {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
             "anthropic-version": "2023-06-01",
-            "anthropic-beta": ANTHROPIC_BETA_FEATURES,
+            "anthropic-beta": self._build_beta_header(payload),
             "user-agent": f"claude-cli/{CLAUDE_CODE_VERSION} (external, cli)",
             "x-app": "cli",
             "anthropic-dangerous-direct-browser-access": "true",
         }
+
+    @staticmethod
+    def _model_supports_adaptive_thinking(model: str) -> bool:
+        """Models trained on adaptive thinking (4.6+)."""
+        model_lower = model.lower()
+        # Explicit known model families that support adaptive thinking
+        return any(
+            tag in model_lower for tag in ("opus-4-6", "sonnet-4-6", "haiku-4-6")
+        )
 
     def _build_anthropic_payload(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """Build the Anthropic Messages API payload from OpenAI-format kwargs."""
@@ -852,27 +901,60 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
                 if func_name:
                     payload["tool_choice"] = {"type": "tool", "name": func_name}
 
-        if kwargs.get("temperature") is not None:
-            payload["temperature"] = kwargs["temperature"]
-
         reasoning_effort = kwargs.get("reasoning_effort")
+
         # Opus models always use thinking (matching antigravity provider behavior)
         is_opus = "opus" in model.lower()
         if is_opus and not reasoning_effort:
             reasoning_effort = "medium"
-        if reasoning_effort and str(reasoning_effort).lower() not in (
+
+        reasoning_effort_str = (
+            str(reasoning_effort).lower().strip() if reasoning_effort else ""
+        )
+        reasoning_disabled = reasoning_effort is not None and reasoning_effort_str in (
             "none",
             "disabled",
             "off",
             "false",
             "disable",
-        ):
+        )
+
+        if self._model_supports_adaptive_thinking(model):
+            if not reasoning_disabled:
+                payload["thinking"] = {"type": "adaptive"}
+
+                if reasoning_effort_str in ("low", "medium", "high", "max"):
+                    payload["output_config"] = {"effort": reasoning_effort_str}
+        elif reasoning_effort and not reasoning_disabled:
             payload["thinking"] = {
                 "type": "enabled",
                 "budget_tokens": self._reasoning_effort_to_budget(
                     reasoning_effort, kwargs.get("max_tokens", 16384)
                 ),
             }
+
+        # Context management: preserve thinking blocks across turns
+        if payload.get("thinking") and payload["thinking"].get("type") != "disabled":
+            payload["context_management"] = {
+                "edits": [
+                    {
+                        "type": "clear_thinking_20251015",
+                        "keep": "all",
+                    }
+                ]
+            }
+
+        speed = kwargs.get("speed")
+        if speed:
+            payload["speed"] = speed
+
+        # Only send temperature when thinking is disabled — API requires
+        # temperature=1 when thinking is enabled, which is already the default.
+        has_thinking = (
+            "thinking" in payload and payload["thinking"].get("type") != "disabled"
+        )
+        if kwargs.get("temperature") is not None and not has_thinking:
+            payload["temperature"] = kwargs["temperature"]
 
         payload = self._prefix_tool_names(payload)
         payload = self._inject_cache_control(payload)
@@ -903,8 +985,8 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
 
         async def make_request():
             access_token = await self.get_access_token(credential_path)
-            headers = self._build_anthropic_headers(access_token)
             payload = self._build_anthropic_payload(kwargs)
+            headers = self._build_anthropic_headers(access_token, payload)
 
             file_logger.log_request(payload)
 
