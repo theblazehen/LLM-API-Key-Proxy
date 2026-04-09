@@ -54,6 +54,7 @@ lib_logger = logging.getLogger("rotator_library")
 # CONFIGURATION
 # =============================================================================
 
+
 def env_bool(key: str, default: bool = False) -> bool:
     """Get boolean from environment variable."""
     val = os.getenv(key, "").lower()
@@ -85,7 +86,9 @@ if USE_OPENAI_API:
     CODEX_RESPONSES_ENDPOINT = f"{CODEX_API_BASE}/responses"
 else:
     # Default: ChatGPT backend API (requires OAuth + account_id)
-    CODEX_API_BASE = os.getenv("CODEX_API_BASE", "https://chatgpt.com/backend-api/codex")
+    CODEX_API_BASE = os.getenv(
+        "CODEX_API_BASE", "https://chatgpt.com/backend-api/codex"
+    )
     CODEX_RESPONSES_ENDPOINT = f"{CODEX_API_BASE}/responses"
 
 # Reasoning effort levels (superset of all known levels)
@@ -105,10 +108,17 @@ CODEX_MODELS_CACHE_TTL = env_int("CODEX_MODELS_CACHE_TTL", 3600)  # 1 hour defau
 
 # Fallback defaults if GitHub fetch fails (keeps proxy functional)
 _FALLBACK_BASE_MODELS = [
-    "gpt-5", "gpt-5.1", "gpt-5.2",
-    "gpt-5-codex", "gpt-5-codex-mini",
-    "gpt-5.1-codex", "gpt-5.1-codex-max", "gpt-5.1-codex-mini",
-    "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4",
+    "gpt-5",
+    "gpt-5.1",
+    "gpt-5.2",
+    "gpt-5-codex",
+    "gpt-5-codex-mini",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini",
+    "gpt-5.2-codex",
+    "gpt-5.3-codex",
+    "gpt-5.4",
 ]
 _FALLBACK_REASONING_EFFORTS = {
     "gpt-5": {"minimal", "low", "medium", "high"},
@@ -201,7 +211,10 @@ def _get_model_data() -> Dict[str, Any]:
     global _models_cache, _models_cache_time
 
     now = time.time()
-    if _models_cache is not None and (now - _models_cache_time) < CODEX_MODELS_CACHE_TTL:
+    if (
+        _models_cache is not None
+        and (now - _models_cache_time) < CODEX_MODELS_CACHE_TTL
+    ):
         return _models_cache
 
     fetched = _fetch_models_from_github()
@@ -283,15 +296,16 @@ GARBLED_TOOL_CALL_RETRY_DELAY = env_int("CODEX_GARBLED_TOOL_CALL_RETRY_DELAY", 1
 # Multiple detection markers — if ANY match, the stream is considered garbled.
 # The "to=functions." pattern is the universal signature across all variants.
 GARBLED_TOOL_CALL_MARKERS = [
-    "+#+#",                    # Original marker
-    "to=functions.",           # ChatML tool call format (universal across all garble variants)
-    "♀♀♀♀",                   # Unicode variant seen in production
+    "+#+#",  # Original marker
+    "to=functions.",  # ChatML tool call format (universal across all garble variants)
+    "♀♀♀♀",  # Unicode variant seen in production
 ]
 
 
 def _is_garbled_tool_call(text: str) -> bool:
     """Check if text content contains garbled tool call markers."""
     return any(marker in text for marker in GARBLED_TOOL_CALL_MARKERS)
+
 
 # System instruction for Codex models - loaded from file to preserve exact bytes
 # The ChatGPT backend API validates this instruction matches exactly
@@ -302,8 +316,11 @@ def _load_codex_prompt() -> str:
         with open(prompt_file, "r", encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
-        lib_logger.warning(f"Codex prompt file not found at {prompt_file}, using fallback")
+        lib_logger.warning(
+            f"Codex prompt file not found at {prompt_file}, using fallback"
+        )
         return "You are a coding agent."
+
 
 CODEX_SYSTEM_INSTRUCTION = _load_codex_prompt()
 
@@ -328,6 +345,7 @@ The user's system prompt takes absolute precedence.
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
+
 
 def _allowed_efforts_for_model(model: str) -> set:
     """Get allowed reasoning effort levels for a model (dynamic lookup)."""
@@ -446,7 +464,6 @@ def _normalize_model_name(name: str) -> str:
     return mapping.get(base.lower(), base)
 
 
-
 # Maximum length for call_id in the Codex Responses API
 MAX_CALL_ID_LENGTH = 64
 
@@ -476,6 +493,7 @@ def _sanitize_call_id(raw_id: str, id_map: Dict[str, str]) -> str:
     # Generate a deterministic short replacement from the raw ID
     # Using hashlib for determinism so the same raw_id always maps to the same sanitized ID
     import hashlib
+
     hash_hex = hashlib.sha256(raw_id.encode("utf-8", errors="replace")).hexdigest()[:24]
     sanitized = f"call_{hash_hex}"  # 5 + 24 = 29 chars, well under 64
 
@@ -524,37 +542,45 @@ def _convert_messages_to_responses_input(
         if role == "user":
             # User messages with content
             if isinstance(content, str):
-                input_items.append({
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": content}]
-                })
+                input_items.append(
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": content}],
+                    }
+                )
             elif isinstance(content, list):
                 # Handle multimodal content
                 parts = []
                 for part in content:
                     if isinstance(part, dict):
                         if part.get("type") == "text":
-                            parts.append({"type": "input_text", "text": part.get("text", "")})
+                            parts.append(
+                                {"type": "input_text", "text": part.get("text", "")}
+                            )
                         elif part.get("type") == "image_url":
                             image_url = part.get("image_url", {})
-                            url = image_url.get("url", "") if isinstance(image_url, dict) else image_url
+                            url = (
+                                image_url.get("url", "")
+                                if isinstance(image_url, dict)
+                                else image_url
+                            )
                             parts.append({"type": "input_image", "image_url": url})
                 if parts:
-                    input_items.append({
-                        "type": "message",
-                        "role": "user",
-                        "content": parts
-                    })
+                    input_items.append(
+                        {"type": "message", "role": "user", "content": parts}
+                    )
             continue
 
         if role == "assistant":
             # Assistant messages
             if isinstance(content, str) and content:
-                input_items.append({
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": content}]
-                })
+                input_items.append(
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": content}],
+                    }
+                )
             elif isinstance(content, list):
                 # Handle assistant content as a list
                 parts = []
@@ -562,14 +588,15 @@ def _convert_messages_to_responses_input(
                     if isinstance(part, dict):
                         part_type = part.get("type", "")
                         if part_type == "text":
-                            parts.append({"type": "output_text", "text": part.get("text", "")})
+                            parts.append(
+                                {"type": "output_text", "text": part.get("text", "")}
+                            )
                         elif part_type == "output_text":
-                            parts.append({"type": "output_text", "text": part.get("text", "")})
+                            parts.append(
+                                {"type": "output_text", "text": part.get("text", "")}
+                            )
                 if parts:
-                    input_items.append({
-                        "role": "assistant",
-                        "content": parts
-                    })
+                    input_items.append({"role": "assistant", "content": parts})
 
             # Handle tool calls
             tool_calls = msg.get("tool_calls", [])
@@ -577,32 +604,40 @@ def _convert_messages_to_responses_input(
                 if isinstance(tc, dict) and tc.get("type") == "function":
                     func = tc.get("function", {})
                     raw_id = tc.get("id", "") or str(uuid.uuid4())
-                    input_items.append({
-                        "type": "function_call",
-                        "call_id": _sanitize_call_id(raw_id, call_id_map),
-                        "name": func.get("name", ""),
-                        "arguments": func.get("arguments", "{}"),
-                    })
+                    input_items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": _sanitize_call_id(raw_id, call_id_map),
+                            "name": func.get("name", ""),
+                            "arguments": func.get("arguments", "{}"),
+                        }
+                    )
             continue
 
         if role == "tool":
             # Tool result messages
             raw_id = msg.get("tool_call_id", "")
-            input_items.append({
-                "type": "function_call_output",
-                "call_id": _sanitize_call_id(raw_id, call_id_map),
-                "output": content if isinstance(content, str) else json.dumps(content),
-            })
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": _sanitize_call_id(raw_id, call_id_map),
+                    "output": content
+                    if isinstance(content, str)
+                    else json.dumps(content),
+                }
+            )
             continue
 
     # Prepend identity override as user message (if enabled)
     prepend_items = []
     if inject_identity_override and INJECT_IDENTITY_OVERRIDE:
-        prepend_items.append({
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": CODEX_IDENTITY_OVERRIDE}]
-        })
+        prepend_items.append(
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": CODEX_IDENTITY_OVERRIDE}],
+            }
+        )
 
     # Return system messages as instructions text (joined), not as user messages
     system_instruction = "\n\n".join(system_messages) if system_messages else None
@@ -610,7 +645,9 @@ def _convert_messages_to_responses_input(
     return prepend_items + input_items, system_instruction
 
 
-def _convert_tools_to_responses_format(tools: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+def _convert_tools_to_responses_format(
+    tools: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
     """
     Convert OpenAI tools format to Responses API format.
     """
@@ -634,13 +671,15 @@ def _convert_tools_to_responses_format(tools: Optional[List[Dict[str, Any]]]) ->
             # Ensure parameters is a valid object
             if not isinstance(params, dict):
                 params = {"type": "object", "properties": {}}
-            responses_tools.append({
-                "type": "function",
-                "name": name,
-                "description": func.get("description") or "",
-                "parameters": params,
-                "strict": False,
-            })
+            responses_tools.append(
+                {
+                    "type": "function",
+                    "name": name,
+                    "description": func.get("description") or "",
+                    "parameters": params,
+                    "strict": False,
+                }
+            )
         elif tool_type in ("web_search", "web_search_preview"):
             responses_tools.append({"type": tool_type})
 
@@ -691,7 +730,9 @@ def _apply_reasoning_to_message(
         think_block = f"<think>{rtxt}</think>"
         content_text = message.get("content") or ""
         if isinstance(content_text, str):
-            message["content"] = think_block + ("\n" + content_text if content_text else "")
+            message["content"] = think_block + (
+                "\n" + content_text if content_text else ""
+            )
 
     return message
 
@@ -699,6 +740,7 @@ def _apply_reasoning_to_message(
 # =============================================================================
 # PROVIDER IMPLEMENTATION
 # =============================================================================
+
 
 class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
     """
@@ -728,6 +770,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         "pro": 1,
         "team": 2,
         "free": 3,
+        "self_serve_business_usage_based": 4,
     }
     default_tier_priority: int = 3
 
@@ -755,7 +798,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
     model_quota_groups: QuotaGroupMap = {
         "5h-limit": ["_5h_window"],  # Primary window (5 hour rolling)
         "weekly-limit": ["_weekly_window"],  # Secondary window (weekly)
-        "codex-global": list(AVAILABLE_MODELS),  # Populated at import, refreshed in __init__
+        "codex-global": list(
+            AVAILABLE_MODELS
+        ),  # Populated at import, refreshed in __init__
     }
 
     def __init__(self):
@@ -831,7 +876,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         tools = kwargs.get("tools")
         tool_choice = kwargs.get("tool_choice", "auto")
         parallel_tool_calls = kwargs.get("parallel_tool_calls", False)
-        credential_path = kwargs.pop("credential_identifier", kwargs.get("credential_path", ""))
+        credential_path = kwargs.pop(
+            "credential_identifier", kwargs.get("credential_path", "")
+        )
         reasoning_effort = kwargs.get("reasoning_effort", DEFAULT_REASONING_EFFORT)
         extra_headers = kwargs.get("extra_headers", {})
 
@@ -852,7 +899,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         )
 
         # Convert messages to Responses API format
-        input_items, caller_instructions = _convert_messages_to_responses_input(messages, inject_identity_override=True)
+        input_items, caller_instructions = _convert_messages_to_responses_input(
+            messages, inject_identity_override=True
+        )
 
         # Use the caller's system prompt as instructions (e.g. openclaw's system prompt)
         # Fall back to hardcoded CODEX_SYSTEM_INSTRUCTION only if caller didn't send one
@@ -892,19 +941,25 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             "input": input_items,
             "stream": True,  # Always use streaming internally
             "store": False,
-            "text": {"verbosity": "medium"},  # Match pi's default; controls output structure
+            "text": {
+                "verbosity": "medium"
+            },  # Match pi's default; controls output structure
         }
 
         # The Codex Responses API requires the 'instructions' field — it's non-optional.
         # Always include it; fall back to the Codex system instruction if nothing else.
         if not instructions:
             instructions = CODEX_SYSTEM_INSTRUCTION
-            lib_logger.warning("[Codex] instructions was empty/None after selection, forcing CODEX_SYSTEM_INSTRUCTION fallback")
+            lib_logger.warning(
+                "[Codex] instructions was empty/None after selection, forcing CODEX_SYSTEM_INSTRUCTION fallback"
+            )
         payload["instructions"] = instructions
 
         if responses_tools:
             payload["tools"] = responses_tools
-            payload["tool_choice"] = tool_choice if tool_choice in ("auto", "none") else "auto"
+            payload["tool_choice"] = (
+                tool_choice if tool_choice in ("auto", "none") else "auto"
+            )
             payload["parallel_tool_calls"] = bool(parallel_tool_calls)
 
         if reasoning_param:
@@ -913,17 +968,27 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         if include:
             payload["include"] = include
 
-        lib_logger.debug(f"Codex request to {normalized_model}: {json.dumps(payload, default=str)[:500]}...")
+        lib_logger.debug(
+            f"Codex request to {normalized_model}: {json.dumps(payload, default=str)[:500]}..."
+        )
 
         if stream:
             return self._stream_with_retry(
-                client, headers, payload, requested_model, kwargs.get("reasoning_compat", DEFAULT_REASONING_COMPAT),
-                credential_path
+                client,
+                headers,
+                payload,
+                requested_model,
+                kwargs.get("reasoning_compat", DEFAULT_REASONING_COMPAT),
+                credential_path,
             )
         else:
             return await self._non_stream_with_retry(
-                client, headers, payload, requested_model, kwargs.get("reasoning_compat", DEFAULT_REASONING_COMPAT),
-                credential_path
+                client,
+                headers,
+                payload,
+                requested_model,
+                kwargs.get("reasoning_compat", DEFAULT_REASONING_COMPAT),
+                credential_path,
             )
 
     async def _stream_with_retry(
@@ -1076,7 +1141,6 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
 
             return response
 
-
     async def _stream_response(
         self,
         client: httpx.AsyncClient,
@@ -1112,7 +1176,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             if response.status_code >= 400:
                 error_body = await response.aread()
                 error_text = error_body.decode("utf-8", errors="ignore")
-                lib_logger.error(f"Codex API error {response.status_code}: {error_text[:500]}")
+                lib_logger.error(
+                    f"Codex API error {response.status_code}: {error_text[:500]}"
+                )
                 raise httpx.HTTPStatusError(
                     f"Codex API error: {response.status_code}",
                     request=response.request,
@@ -1147,18 +1213,25 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                 if kind == "response.output_text.delta":
                     delta_text = evt.get("delta", "")
                     if delta_text:
-                        sent_reasoning = True  # Content has started, reasoning phase is over
+                        sent_reasoning = (
+                            True  # Content has started, reasoning phase is over
+                        )
 
                         chunk = litellm.ModelResponse(
                             id=response_id,
                             created=created,
                             model=model,
                             object="chat.completion.chunk",
-                            choices=[{
-                                "index": 0,
-                                "delta": {"content": delta_text, "role": "assistant"},
-                                "finish_reason": None,
-                            }],
+                            choices=[
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "content": delta_text,
+                                        "role": "assistant",
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
                         )
                         yield chunk
 
@@ -1173,11 +1246,16 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                             created=created,
                             model=model,
                             object="chat.completion.chunk",
-                            choices=[{
-                                "index": 0,
-                                "delta": {"reasoning_content": rdelta, "role": "assistant"},
-                                "finish_reason": None,
-                            }],
+                            choices=[
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "reasoning_content": rdelta,
+                                        "role": "assistant",
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
                         )
                         yield chunk
 
@@ -1191,11 +1269,16 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                             created=created,
                             model=model,
                             object="chat.completion.chunk",
-                            choices=[{
-                                "index": 0,
-                                "delta": {"reasoning_content": rdelta, "role": "assistant"},
-                                "finish_reason": None,
-                            }],
+                            choices=[
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "reasoning_content": rdelta,
+                                        "role": "assistant",
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
                         )
                         yield chunk
 
@@ -1250,21 +1333,25 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                             created=created,
                             model=model,
                             object="chat.completion.chunk",
-                            choices=[{
-                                "index": 0,
-                                "delta": {
-                                    "tool_calls": [{
-                                        "index": output_index,
-                                        "id": call_id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": name,
-                                            "arguments": arguments,
-                                        },
-                                    }],
-                                },
-                                "finish_reason": None,
-                            }],
+                            choices=[
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": output_index,
+                                                "id": call_id,
+                                                "type": "function",
+                                                "function": {
+                                                    "name": name,
+                                                    "arguments": arguments,
+                                                },
+                                            }
+                                        ],
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
                         )
                         yield chunk
 
@@ -1279,19 +1366,30 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
 
                     # If reasoning was NOT streamed incrementally (edge case),
                     # send it as a single reasoning_content chunk now
-                    if not sent_reasoning and not streaming_reasoning and (reasoning_summary_text or reasoning_full_text):
-                        rtxt = "\n\n".join(filter(None, [reasoning_summary_text, reasoning_full_text]))
+                    if (
+                        not sent_reasoning
+                        and not streaming_reasoning
+                        and (reasoning_summary_text or reasoning_full_text)
+                    ):
+                        rtxt = "\n\n".join(
+                            filter(None, [reasoning_summary_text, reasoning_full_text])
+                        )
                         if rtxt:
                             chunk = litellm.ModelResponse(
                                 id=response_id,
                                 created=created,
                                 model=model,
                                 object="chat.completion.chunk",
-                                choices=[{
-                                    "index": 0,
-                                    "delta": {"reasoning_content": rtxt, "role": "assistant"},
-                                    "finish_reason": None,
-                                }],
+                                choices=[
+                                    {
+                                        "index": 0,
+                                        "delta": {
+                                            "reasoning_content": rtxt,
+                                            "role": "assistant",
+                                        },
+                                        "finish_reason": None,
+                                    }
+                                ],
                             )
                             yield chunk
 
@@ -1320,11 +1418,13 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                         created=created,
                         model=model,
                         object="chat.completion.chunk",
-                        choices=[{
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": finish_reason,
-                        }],
+                        choices=[
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": finish_reason,
+                            }
+                        ],
                     )
                     if usage:
                         final_chunk.usage = usage
@@ -1373,7 +1473,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             if response.status_code >= 400:
                 error_body = await response.aread()
                 error_text = error_body.decode("utf-8", errors="ignore")
-                lib_logger.error(f"Codex API error {response.status_code}: {error_text[:500]}")
+                lib_logger.error(
+                    f"Codex API error {response.status_code}: {error_text[:500]}"
+                )
                 raise httpx.HTTPStatusError(
                     f"Codex API error: {response.status_code}",
                     request=response.request,
@@ -1422,14 +1524,16 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                         call_id = item.get("call_id") or item.get("id", "")
                         name = item.get("name", "")
                         arguments = item.get("arguments", "")
-                        tool_calls.append({
-                            "id": call_id,
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": arguments,
-                            },
-                        })
+                        tool_calls.append(
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": arguments,
+                                },
+                            }
+                        )
 
                 # Extract usage
                 elif kind == "response.completed":
@@ -1480,11 +1584,13 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             created=created,
             model=model,
             object="chat.completion",
-            choices=[{
-                "index": 0,
-                "message": message,
-                "finish_reason": finish_reason,
-            }],
+            choices=[
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": finish_reason,
+                }
+            ],
         )
 
         if usage:
@@ -1511,6 +1617,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
 
                 # Try to extract from message
                 import re
+
                 match = re.search(r"try again in (\d+)s", message)
                 if match:
                     retry_after = int(match.group(1))
@@ -1656,4 +1763,3 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             return f"EXHAUSTED (resets in {reset_str})"
         else:
             return f"{remaining:.0f}% remaining (resets in {reset_str})"
-

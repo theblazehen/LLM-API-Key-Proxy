@@ -67,6 +67,7 @@ class CredentialSetupResult:
     """
     Standardized result structure for credential setup operations.
     """
+
     success: bool
     file_path: Optional[str] = None
     email: Optional[str] = None
@@ -88,9 +89,11 @@ def _generate_pkce() -> Tuple[str, str]:
     code_verifier = secrets.token_urlsafe(32)
 
     # Create code challenge using S256 method
-    code_challenge = base64.urlsafe_b64encode(
-        hashlib.sha256(code_verifier.encode()).digest()
-    ).decode().rstrip("=")
+    code_challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode()).digest())
+        .decode()
+        .rstrip("=")
+    )
 
     return code_verifier, code_challenge
 
@@ -120,6 +123,29 @@ def _parse_jwt_claims(token: str) -> Optional[Dict[str, Any]]:
         return json.loads(decoded)
     except Exception:
         return None
+
+
+def _extract_openai_auth_claims(claims: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Extract nested OpenAI auth claims from a decoded JWT payload."""
+    if not isinstance(claims, dict):
+        return {}
+
+    auth_claims = claims.get("https://api.openai.com/auth", {})
+    return auth_claims if isinstance(auth_claims, dict) else {}
+
+
+def _extract_chatgpt_plan_type(
+    access_token_claims: Optional[Dict[str, Any]],
+    id_token_claims: Optional[Dict[str, Any]],
+) -> str:
+    """Extract ChatGPT plan type from nested auth claims."""
+    access_auth_claims = _extract_openai_auth_claims(access_token_claims)
+    id_auth_claims = _extract_openai_auth_claims(id_token_claims)
+
+    plan_type = access_auth_claims.get("chatgpt_plan_type") or id_auth_claims.get(
+        "chatgpt_plan_type", ""
+    )
+    return plan_type if isinstance(plan_type, str) else ""
 
 
 class OpenAIOAuthBase:
@@ -202,7 +228,9 @@ class OpenAIOAuthBase:
             return parts[1]
         return "0"
 
-    def _load_from_env(self, credential_index: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def _load_from_env(
+        self, credential_index: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         """
         Load OAuth credentials from environment variables.
 
@@ -278,7 +306,9 @@ class OpenAIOAuthBase:
 
             # Try file-based loading
             try:
-                lib_logger.debug(f"Loading {self.ENV_PREFIX} credentials from file: {path}")
+                lib_logger.debug(
+                    f"Loading {self.ENV_PREFIX} credentials from file: {path}"
+                )
                 with open(path, "r") as f:
                     creds = json.load(f)
                 self._credentials_cache[path] = creds
@@ -310,7 +340,9 @@ class OpenAIOAuthBase:
         if safe_write_json(
             path, creds, lib_logger, secure_permissions=True, buffer_on_failure=True
         ):
-            lib_logger.debug(f"Saved updated {self.ENV_PREFIX} OAuth credentials to '{path}'.")
+            lib_logger.debug(
+                f"Saved updated {self.ENV_PREFIX} OAuth credentials to '{path}'."
+            )
         else:
             lib_logger.warning(
                 f"Credentials for {self.ENV_PREFIX} cached in memory only (buffered for retry)."
@@ -377,7 +409,9 @@ class OpenAIOAuthBase:
                                 "refresh_token": refresh_token,
                                 "client_id": self.CLIENT_ID,
                             },
-                            headers={"Content-Type": "application/x-www-form-urlencoded"},
+                            headers={
+                                "Content-Type": "application/x-www-form-urlencoded"
+                            },
                             timeout=30.0,
                         )
                         response.raise_for_status()
@@ -422,7 +456,7 @@ class OpenAIOAuthBase:
 
                         elif status_code >= 500:
                             if attempt < max_retries - 1:
-                                await asyncio.sleep(2 ** attempt)
+                                await asyncio.sleep(2**attempt)
                                 continue
                             raise
 
@@ -432,7 +466,7 @@ class OpenAIOAuthBase:
                     except (httpx.RequestError, httpx.TimeoutException) as e:
                         last_error = e
                         if attempt < max_retries - 1:
-                            await asyncio.sleep(2 ** attempt)
+                            await asyncio.sleep(2**attempt)
                             continue
                         raise
 
@@ -454,6 +488,16 @@ class OpenAIOAuthBase:
             if "_proxy_metadata" not in creds:
                 creds["_proxy_metadata"] = {}
             creds["_proxy_metadata"]["last_check_timestamp"] = time.time()
+
+            access_token_claims = (
+                _parse_jwt_claims(new_token_data.get("access_token", "")) or {}
+            )
+            id_token_claims = (
+                _parse_jwt_claims(new_token_data.get("id_token", "")) or {}
+            )
+            plan_type = _extract_chatgpt_plan_type(access_token_claims, id_token_claims)
+            if plan_type:
+                creds["_proxy_metadata"]["plan_type"] = plan_type
 
             await self._save_credentials(path, creds)
             lib_logger.debug(
@@ -556,9 +600,7 @@ class OpenAIOAuthBase:
                         self._queue_retry_count.pop(path, None)
 
                     except asyncio.TimeoutError:
-                        lib_logger.warning(
-                            f"Refresh timeout for '{Path(path).name}'"
-                        )
+                        lib_logger.warning(f"Refresh timeout for '{Path(path).name}'")
                         await self._handle_refresh_failure(path, force, "timeout")
 
                     except httpx.HTTPStatusError as e:
@@ -566,7 +608,9 @@ class OpenAIOAuthBase:
                             self._queue_retry_count.pop(path, None)
                             async with self._queue_tracking_lock:
                                 self._queued_credentials.discard(path)
-                            await self._queue_refresh(path, force=True, needs_reauth=True)
+                            await self._queue_refresh(
+                                path, force=True, needs_reauth=True
+                            )
                         else:
                             await self._handle_refresh_failure(
                                 path, force, f"HTTP {e.response.status_code}"
@@ -678,6 +722,7 @@ class OpenAIOAuthBase:
                     pass
 
                 from urllib.parse import urlparse, parse_qs
+
                 query_params = parse_qs(urlparse(path_str).query)
 
                 writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n")
@@ -700,7 +745,9 @@ class OpenAIOAuthBase:
                 else:
                     error = query_params.get("error", ["Unknown error"])[0]
                     if not auth_code_future.done():
-                        auth_code_future.set_exception(Exception(f"OAuth failed: {error}"))
+                        auth_code_future.set_exception(
+                            Exception(f"OAuth failed: {error}")
+                        )
                     writer.write(
                         f"<html><body><h1>Authentication Failed</h1><p>Error: {error}</p></body></html>".encode()
                     )
@@ -807,16 +854,18 @@ class OpenAIOAuthBase:
 
             # Parse ID token for claims
             id_token_claims = _parse_jwt_claims(token_data.get("id_token", "")) or {}
-            access_token_claims = _parse_jwt_claims(token_data.get("access_token", "")) or {}
+            access_token_claims = (
+                _parse_jwt_claims(token_data.get("access_token", "")) or {}
+            )
 
             # Extract account ID and email
-            auth_claims = id_token_claims.get("https://api.openai.com/auth", {})
+            auth_claims = _extract_openai_auth_claims(id_token_claims)
             account_id = auth_claims.get("chatgpt_account_id", "")
             org_id = id_token_claims.get("organization_id")
             project_id = id_token_claims.get("project_id")
 
             email = id_token_claims.get("email", "")
-            plan_type = access_token_claims.get("chatgpt_plan_type", "")
+            plan_type = _extract_chatgpt_plan_type(access_token_claims, id_token_claims)
 
             new_creds["account_id"] = account_id
 
@@ -885,6 +934,7 @@ class OpenAIOAuthBase:
     ) -> Dict[str, Any]:
         """Initialize OAuth token, triggering interactive OAuth flow if needed."""
         path = creds_or_path if isinstance(creds_or_path, str) else None
+        creds: Dict[str, Any]
 
         if isinstance(creds_or_path, dict):
             display_name = creds_or_path.get("_proxy_metadata", {}).get(
@@ -893,12 +943,19 @@ class OpenAIOAuthBase:
         else:
             display_name = Path(path).name if path else "in-memory object"
 
-        lib_logger.debug(f"Initializing {self.ENV_PREFIX} token for '{display_name}'...")
+        lib_logger.debug(
+            f"Initializing {self.ENV_PREFIX} token for '{display_name}'..."
+        )
 
         try:
-            creds = (
-                await self._load_credentials(creds_or_path) if path else creds_or_path
-            )
+            if path is not None:
+                creds = await self._load_credentials(path)
+            else:
+                if not isinstance(creds_or_path, dict):
+                    raise ValueError(
+                        "Expected in-memory credentials dict when path is absent"
+                    )
+                creds = creds_or_path
             reason = ""
 
             if force_interactive:
@@ -909,7 +966,11 @@ class OpenAIOAuthBase:
                 reason = "token is expired"
 
             if reason:
-                if reason == "token is expired" and creds.get("refresh_token"):
+                if (
+                    reason == "token is expired"
+                    and creds.get("refresh_token")
+                    and path is not None
+                ):
                     try:
                         return await self._refresh_token(path, creds)
                     except Exception as e:
@@ -924,7 +985,11 @@ class OpenAIOAuthBase:
                 coordinator = get_reauth_coordinator()
 
                 async def _do_interactive_oauth():
-                    return await self._perform_interactive_oauth(path, creds, display_name)
+                    if path is None:
+                        raise ValueError("Interactive OAuth requires a credential path")
+                    return await self._perform_interactive_oauth(
+                        path, creds, display_name
+                    )
 
                 return await coordinator.execute_reauth(
                     credential_path=path or display_name,
@@ -933,7 +998,9 @@ class OpenAIOAuthBase:
                     timeout=300.0,
                 )
 
-            lib_logger.info(f"{self.ENV_PREFIX} OAuth token at '{display_name}' is valid.")
+            lib_logger.info(
+                f"{self.ENV_PREFIX} OAuth token at '{display_name}' is valid."
+            )
             return creds
 
         except Exception as e:
@@ -941,8 +1008,9 @@ class OpenAIOAuthBase:
                 f"Failed to initialize {self.ENV_PREFIX} OAuth for '{path}': {e}"
             )
 
-    async def get_auth_header(self, credential_path: str) -> Dict[str, str]:
+    async def get_auth_header(self, credential_identifier: str) -> Dict[str, str]:
         """Get auth header with graceful degradation if refresh fails."""
+        credential_path = credential_identifier
         try:
             creds = await self._load_credentials(credential_path)
 
@@ -981,7 +1049,9 @@ class OpenAIOAuthBase:
     async def get_account_id(self, credential_path: str) -> Optional[str]:
         """Get the ChatGPT account ID for a credential."""
         creds = await self._load_credentials(credential_path)
-        return creds.get("account_id") or creds.get("_proxy_metadata", {}).get("account_id")
+        return creds.get("account_id") or creds.get("_proxy_metadata", {}).get(
+            "account_id"
+        )
 
     async def proactively_refresh(self, credential_path: str):
         """Proactively refresh a credential by queueing it for refresh."""
@@ -1123,12 +1193,15 @@ class OpenAIOAuthBase:
                 match = re.search(r"_oauth_(\d+)\.json$", cred_file)
                 number = int(match.group(1)) if match else 0
 
-                credentials.append({
-                    "file_path": cred_file,
-                    "email": metadata.get("email", "unknown"),
-                    "account_id": creds.get("account_id") or metadata.get("account_id"),
-                    "number": number,
-                })
+                credentials.append(
+                    {
+                        "file_path": cred_file,
+                        "email": metadata.get("email", "unknown"),
+                        "account_id": creds.get("account_id")
+                        or metadata.get("account_id"),
+                        "number": number,
+                    }
+                )
             except Exception:
                 continue
 
