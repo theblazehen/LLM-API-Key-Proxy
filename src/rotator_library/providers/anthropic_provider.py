@@ -40,13 +40,8 @@ BETA_CLAUDE_CODE = "claude-code-20250219"
 BETA_OAUTH = "oauth-2025-04-20"
 BETA_INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
 BETA_EFFORT = "effort-2025-11-24"
-BETA_PROMPT_CACHING_SCOPE = "prompt-caching-scope-2026-01-05"
 BETA_CONTEXT_MANAGEMENT = "context-management-2025-06-27"
 BETA_FAST_MODE = "fast-mode-2026-02-01"
-BETA_REDACT_THINKING = "redact-thinking-2026-02-12"
-BETA_STRUCTURED_OUTPUTS = "structured-outputs-2025-12-15"
-BETA_TOKEN_EFFICIENT_TOOLS = "token-efficient-tools-2026-03-28"
-BETA_WEB_SEARCH = "web-search-2025-03-05"
 
 CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
 
@@ -528,7 +523,11 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
             for block in system_blocks:
                 text = block.get("text", "")
                 if isinstance(text, str) and text.strip():
-                    result.append(block)
+                    rewritten = copy.deepcopy(block)
+                    rewritten["text"] = re.sub(
+                        r"OpenCode", "Claude Code", text, flags=re.IGNORECASE
+                    )
+                    result.append(rewritten)
         return result
 
     # =========================================================================
@@ -817,15 +816,6 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
         if payload is None:
             return ",".join(betas)
 
-        betas.extend(
-            [
-                BETA_PROMPT_CACHING_SCOPE,
-                BETA_STRUCTURED_OUTPUTS,
-                BETA_TOKEN_EFFICIENT_TOOLS,
-                BETA_WEB_SEARCH,
-            ]
-        )
-
         # Always send effort beta for adaptive-thinking models (upstream behavior)
         model = payload.get("model", "")
         if self._model_supports_adaptive_thinking(model):
@@ -839,8 +829,30 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
 
         return ",".join(betas)
 
+    @staticmethod
+    def _build_claude_session_id(
+        payload: Optional[Dict[str, Any]] = None,
+        transaction_context: Optional[Any] = None,
+    ) -> str:
+        if transaction_context is not None:
+            request_id = getattr(transaction_context, "request_id", None)
+            if request_id:
+                return request_id
+
+        if payload:
+            messages = payload.get("messages") or []
+            if messages:
+                material = json.dumps(messages, sort_keys=True, default=str)
+                digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+                return str(uuid.UUID(digest[:32]))
+
+        return str(uuid.uuid4())
+
     def _build_anthropic_headers(
-        self, access_token: str, payload: Optional[Dict[str, Any]] = None
+        self,
+        access_token: str,
+        payload: Optional[Dict[str, Any]] = None,
+        transaction_context: Optional[Any] = None,
     ) -> Dict[str, str]:
         return {
             "Authorization": f"Bearer {access_token}",
@@ -850,6 +862,9 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
             "anthropic-beta": self._build_beta_header(payload),
             "user-agent": f"claude-cli/{CLAUDE_CODE_VERSION} (external, cli)",
             "x-app": "cli",
+            "X-Claude-Code-Session-Id": self._build_claude_session_id(
+                payload, transaction_context
+            ),
             "anthropic-dangerous-direct-browser-access": "true",
         }
 
@@ -986,7 +1001,11 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
         async def make_request():
             access_token = await self.get_access_token(credential_path)
             payload = self._build_anthropic_payload(kwargs)
-            headers = self._build_anthropic_headers(access_token, payload)
+            headers = self._build_anthropic_headers(
+                access_token,
+                payload,
+                transaction_context,
+            )
 
             file_logger.log_request(payload)
 
