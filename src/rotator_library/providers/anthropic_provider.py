@@ -543,7 +543,7 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
         Anthropic caches the full prefix up to each breakpoint. This saves
         ~90% on cached input token costs and reduces latency.
         """
-        system_cache_marker = {"type": "ephemeral", "ttl": "1h", "scope": "global"}
+        system_cache_marker = {"type": "ephemeral", "ttl": "1h"}
         cache_marker = {"type": "ephemeral", "ttl": "1h"}
 
         # 1. Cache the last system block (system prompt rarely changes)
