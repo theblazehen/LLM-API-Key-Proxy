@@ -524,8 +524,11 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
                 text = block.get("text", "")
                 if isinstance(text, str) and text.strip():
                     rewritten = copy.deepcopy(block)
-                    rewritten["text"] = re.sub(
+                    rewritten_text = re.sub(
                         r"OpenCode", "Claude Code", text, flags=re.IGNORECASE
+                    )
+                    rewritten["text"] = rewritten_text.replace("<", "[").replace(
+                        ">", "]"
                     )
                     result.append(rewritten)
         return result
