@@ -527,9 +527,15 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
                     rewritten_text = re.sub(
                         r"OpenCode", "Claude Code", text, flags=re.IGNORECASE
                     )
-                    rewritten["text"] = rewritten_text.replace("<", "[").replace(
-                        ">", "]"
+                    rewritten_text = rewritten_text.replace("<env>", "< env>")
+                    rewritten_text = rewritten_text.replace("</env>", "< /env>")
+                    rewritten_text = rewritten_text.replace(
+                        "<directories>", "< directories>"
                     )
+                    rewritten_text = rewritten_text.replace(
+                        "</directories>", "< /directories>"
+                    )
+                    rewritten["text"] = rewritten_text
                     result.append(rewritten)
         return result
 
