@@ -81,6 +81,17 @@ def _get_thinking_cache():
     return _thinking_sig_cache
 
 
+def _coerce_openai_content_part(part: Any) -> Optional[Dict[str, Any]]:
+    """Normalize OpenAI content parts into dict form for Anthropic translation."""
+    if isinstance(part, dict):
+        return part
+    if isinstance(part, str):
+        text = part.strip()
+        if text:
+            return {"type": "text", "text": text}
+    return None
+
+
 class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterface):
     """
     Anthropic provider using OAuth authentication (Claude Pro/Max).
@@ -229,6 +240,9 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
         anthropic_messages = []
 
         for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+
             role = msg.get("role", "user")
             content = msg.get("content", "")
 
@@ -236,8 +250,9 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
                 if isinstance(content, str):
                     system_blocks.append({"type": "text", "text": content})
                 elif isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
+                    for raw_block in content:
+                        block = _coerce_openai_content_part(raw_block)
+                        if block and block.get("type") == "text":
                             system_blocks.append(
                                 {"type": "text", "text": block.get("text", "")}
                             )
@@ -303,34 +318,38 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
                 if isinstance(content, str) and content.strip():
                     blocks.append({"type": "text", "text": content})
                 elif isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict):
-                            if (
-                                block.get("type") == "text"
-                                and block.get("text", "").strip()
-                            ):
-                                blocks.append({"type": "text", "text": block["text"]})
-                            elif block.get("type") == "image_url":
-                                url = block.get("image_url", {}).get("url", "")
-                                if url.startswith("data:"):
-                                    parts = url.split(",", 1)
-                                    media_type = (
-                                        parts[0]
-                                        .replace("data:", "")
-                                        .replace(";base64", "")
-                                    )
-                                    blocks.append(
-                                        {
-                                            "type": "image",
-                                            "source": {
-                                                "type": "base64",
-                                                "media_type": media_type,
-                                                "data": parts[1]
-                                                if len(parts) > 1
-                                                else "",
-                                            },
-                                        }
-                                    )
+                    for raw_block in content:
+                        block = _coerce_openai_content_part(raw_block)
+                        if not block:
+                            continue
+                        if (
+                            block.get("type") == "text"
+                            and block.get("text", "").strip()
+                        ):
+                            blocks.append({"type": "text", "text": block["text"]})
+                        elif block.get("type") == "image_url":
+                            image_url = block.get("image_url", {})
+                            if isinstance(image_url, str):
+                                url = image_url
+                            elif isinstance(image_url, dict):
+                                url = image_url.get("url", "")
+                            else:
+                                url = ""
+                            if url.startswith("data:"):
+                                parts = url.split(",", 1)
+                                media_type = (
+                                    parts[0].replace("data:", "").replace(";base64", "")
+                                )
+                                blocks.append(
+                                    {
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": media_type,
+                                            "data": parts[1] if len(parts) > 1 else "",
+                                        },
+                                    }
+                                )
 
                 tool_calls = msg.get("tool_calls") or []
                 for tc in tool_calls:
@@ -358,29 +377,35 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
                     anthropic_messages.append({"role": "user", "content": content})
             elif isinstance(content, list):
                 blocks = []
-                for block in content:
-                    if isinstance(block, dict):
-                        if block.get("type") == "text":
-                            blocks.append(
-                                {"type": "text", "text": block.get("text", "")}
+                for raw_block in content:
+                    block = _coerce_openai_content_part(raw_block)
+                    if not block:
+                        continue
+                    if block.get("type") == "text":
+                        blocks.append({"type": "text", "text": block.get("text", "")})
+                    elif block.get("type") == "image_url":
+                        image_url = block.get("image_url", {})
+                        if isinstance(image_url, str):
+                            url = image_url
+                        elif isinstance(image_url, dict):
+                            url = image_url.get("url", "")
+                        else:
+                            url = ""
+                        if url.startswith("data:"):
+                            parts = url.split(",", 1)
+                            media_type = (
+                                parts[0].replace("data:", "").replace(";base64", "")
                             )
-                        elif block.get("type") == "image_url":
-                            url = block.get("image_url", {}).get("url", "")
-                            if url.startswith("data:"):
-                                parts = url.split(",", 1)
-                                media_type = (
-                                    parts[0].replace("data:", "").replace(";base64", "")
-                                )
-                                blocks.append(
-                                    {
-                                        "type": "image",
-                                        "source": {
-                                            "type": "base64",
-                                            "media_type": media_type,
-                                            "data": parts[1] if len(parts) > 1 else "",
-                                        },
-                                    }
-                                )
+                            blocks.append(
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": parts[1] if len(parts) > 1 else "",
+                                    },
+                                }
+                            )
                 if blocks:
                     anthropic_messages.append({"role": "user", "content": blocks})
 
@@ -573,7 +598,14 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
             last_msg = messages[-1]
             content = last_msg.get("content")
             if isinstance(content, list) and len(content) > 0:
-                content[-1]["cache_control"] = cache_marker
+                last_block = content[-1]
+                if isinstance(last_block, dict):
+                    last_block["cache_control"] = cache_marker
+                else:
+                    normalized = _coerce_openai_content_part(last_block)
+                    if normalized is not None:
+                        normalized["cache_control"] = cache_marker
+                        content[-1] = normalized
             elif isinstance(content, str) and content:
                 # Convert string content to block format so we can attach cache_control
                 last_msg["content"] = [
