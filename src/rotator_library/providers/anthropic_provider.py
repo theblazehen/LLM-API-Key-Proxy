@@ -92,6 +92,19 @@ def _coerce_openai_content_part(part: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _anthropic_tool_name(name: str) -> str:
+    """Normalize client tool names into a Claude-Code-like PascalCase shape."""
+    if not name:
+        return name
+
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name)
+    parts = [part for part in re.split(r"[^A-Za-z0-9]+|\s+", spaced) if part]
+    if not parts:
+        return name[:1].upper() + name[1:]
+
+    return "".join(part[:1].upper() + part[1:] for part in parts)
+
+
 class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterface):
     """
     Anthropic provider using OAuth authentication (Claude Pro/Max).
@@ -362,7 +375,7 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
                         {
                             "type": "tool_use",
                             "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:12]}"),
-                            "name": func.get("name", ""),
+                            "name": _anthropic_tool_name(func.get("name", "")),
                             "input": input_data,
                         }
                     )
@@ -488,7 +501,7 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
             schema = func.get("parameters", {"type": "object"})
             result.append(
                 {
-                    "name": func.get("name", ""),
+                    "name": _anthropic_tool_name(func.get("name", "")),
                     "description": func.get("description", ""),
                     "input_schema": schema,
                 }
@@ -525,9 +538,12 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
         return payload
 
     def _strip_tool_prefix(self, name: str) -> str:
-        """Remove mcp_ prefix from a tool name."""
+        """Remove mcp_ prefix and restore client-facing tool casing."""
         if name and name.startswith(TOOL_PREFIX):
-            return name[len(TOOL_PREFIX) :]
+            stripped = name[len(TOOL_PREFIX) :]
+            if stripped:
+                return stripped[:1].lower() + stripped[1:]
+            return stripped
         return name
 
     # =========================================================================
@@ -955,7 +971,10 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
             elif isinstance(tool_choice, dict):
                 func_name = tool_choice.get("function", {}).get("name", "")
                 if func_name:
-                    payload["tool_choice"] = {"type": "tool", "name": func_name}
+                    payload["tool_choice"] = {
+                        "type": "tool",
+                        "name": _anthropic_tool_name(func_name),
+                    }
 
         reasoning_effort = kwargs.get("reasoning_effort")
 
