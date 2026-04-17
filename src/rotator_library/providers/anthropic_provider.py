@@ -47,6 +47,7 @@ CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for C
 
 # Fallback model list — only used if live fetch fails
 FALLBACK_MODELS = [
+    "claude-opus-4-7",
     "claude-opus-4-6",
     "claude-opus-4-5-20251101",
     "claude-sonnet-4-5-20250929",
@@ -929,10 +930,8 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
     def _model_supports_adaptive_thinking(model: str) -> bool:
         """Models trained on adaptive thinking (4.6+)."""
         model_lower = model.lower()
-        # Explicit known model families that support adaptive thinking
-        return any(
-            tag in model_lower for tag in ("opus-4-6", "sonnet-4-6", "haiku-4-6")
-        )
+        # Match known adaptive-thinking families while allowing newer minor releases.
+        return bool(re.search(r"(?:opus|sonnet|haiku)-4-[6-9](?:\D|$)", model_lower))
 
     def _build_anthropic_payload(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """Build the Anthropic Messages API payload from OpenAI-format kwargs."""
