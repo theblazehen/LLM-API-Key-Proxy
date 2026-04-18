@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -854,13 +855,69 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         models = get_available_models()
         return [f"codex/{m}" for m in models]
 
+    @staticmethod
+    def _extract_credential_number(credential: str) -> Optional[int]:
+        """
+        Extract the numeric index from a credential identifier.
+
+        Handles:
+        - File paths: /app/oauth_creds/codex_oauth_2.json -> 2
+        - Env URIs:   env://codex/2 -> 2
+        """
+        if not credential:
+            return None
+        env_match = re.match(r"^env://[^/]+/(\d+)$", credential)
+        if env_match:
+            return int(env_match.group(1))
+        file_match = re.search(r"_oauth_(\d+)\.json$", credential)
+        if file_match:
+            return int(file_match.group(1))
+        return None
+
     def get_credential_tier_name(self, credential: str) -> Optional[str]:
-        """Get tier name for a credential."""
+        """
+        Resolve tier name for a Codex credential.
+
+        Priority resolution order:
+        1. Explicit per-credential override via env var
+           ``CODEX_CREDENTIAL_PRIORITY_N`` (lower = used first). Returns a
+           synthetic ``priority-{N}`` tier so the sequential strategy can
+           ladder between individual credentials.
+        2. ``_proxy_metadata.plan_type`` from the credential file
+           (plus/pro/team/...). Read from the in-memory cache when warm,
+           otherwise from disk so tier resolves correctly at startup.
+        """
+        number = self._extract_credential_number(credential)
+        if number is not None:
+            raw = os.getenv(f"CODEX_CREDENTIAL_PRIORITY_{number}")
+            if raw is not None:
+                try:
+                    priority = int(raw)
+                    if priority >= 1:
+                        tier_name = f"priority-{priority}"
+                        self.tier_priorities.setdefault(tier_name, priority)
+                        return tier_name
+                except ValueError:
+                    lib_logger.warning(
+                        f"Invalid CODEX_CREDENTIAL_PRIORITY_{number}={raw!r}; "
+                        f"falling back to plan_type"
+                    )
+
         creds = self._credentials_cache.get(credential)
-        if creds:
-            plan_type = creds.get("_proxy_metadata", {}).get("plan_type", "")
-            if plan_type:
-                return plan_type.lower()
+        if not creds and credential and os.path.isfile(credential):
+            try:
+                with open(credential, "r") as f:
+                    creds = json.load(f)
+            except Exception as e:
+                lib_logger.debug(
+                    f"Failed to read tier from credential file {credential}: {e}"
+                )
+                return None
+        if not creds:
+            return None
+        plan_type = creds.get("_proxy_metadata", {}).get("plan_type", "")
+        if plan_type:
+            return plan_type.lower()
         return None
 
     async def acompletion(

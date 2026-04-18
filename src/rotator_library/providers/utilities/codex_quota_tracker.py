@@ -340,7 +340,9 @@ class CodexQuotaTracker:
                 "User-Agent": "codex-cli",  # Required by Codex API
             }
             if account_id:
-                headers["ChatGPT-Account-Id"] = account_id  # Exact capitalization from Codex CLI
+                headers["ChatGPT-Account-Id"] = (
+                    account_id  # Exact capitalization from Codex CLI
+                )
 
             # Use the correct Codex API URL
             url = CODEX_USAGE_URL
@@ -363,7 +365,8 @@ class CodexQuotaTracker:
                 if primary_data:
                     primary = RateLimitWindow(
                         used_percent=float(primary_data.get("used_percent", 0)),
-                        remaining_percent=100 - float(primary_data.get("used_percent", 0)),
+                        remaining_percent=100
+                        - float(primary_data.get("used_percent", 0)),
                         window_minutes=_seconds_to_minutes(
                             primary_data.get("limit_window_seconds")
                         ),
@@ -374,7 +377,8 @@ class CodexQuotaTracker:
                 if secondary_data:
                     secondary = RateLimitWindow(
                         used_percent=float(secondary_data.get("used_percent", 0)),
-                        remaining_percent=100 - float(secondary_data.get("used_percent", 0)),
+                        remaining_percent=100
+                        - float(secondary_data.get("used_percent", 0)),
                         window_minutes=_seconds_to_minutes(
                             secondary_data.get("limit_window_seconds")
                         ),
@@ -417,7 +421,9 @@ class CodexQuotaTracker:
 
         except httpx.HTTPStatusError as e:
             error_msg = f"HTTP {e.response.status_code}: {e.response.text[:200]}"
-            lib_logger.warning(f"Failed to fetch Codex quota for {identifier}: {error_msg}")
+            lib_logger.warning(
+                f"Failed to fetch Codex quota for {identifier}: {error_msg}"
+            )
             return CodexQuotaSnapshot(
                 credential_path=credential_path,
                 identifier=identifier,
@@ -432,7 +438,9 @@ class CodexQuotaTracker:
 
         except Exception as e:
             error_msg = str(e)
-            lib_logger.warning(f"Failed to fetch Codex quota for {identifier}: {error_msg}")
+            lib_logger.warning(
+                f"Failed to fetch Codex quota for {identifier}: {error_msg}"
+            )
             return CodexQuotaSnapshot(
                 credential_path=credential_path,
                 identifier=identifier,
@@ -515,56 +523,49 @@ class CodexQuotaTracker:
 
         try:
             import asyncio
+
             loop = asyncio.get_event_loop()
         except RuntimeError:
             return
 
         async def _push():
             try:
+                # Codex rate limits come from the API as a percentage (0-100),
+                # not a request count. We intentionally do NOT pass
+                # quota_max_requests or quota_used here: that would encode the
+                # percent as a literal request cap and cause WindowLimitChecker
+                # to block credentials once local request_count crosses 100.
+                # Exhaustion is signalled via apply_exhaustion=is_exhausted,
+                # which applies a cooldown until reset_at.
                 if snapshot.primary:
-                    used_pct = snapshot.primary.used_percent
-                    # Convert percentage to a request count on a 100-scale
-                    quota_used = int(used_pct)
                     await self._usage_manager.update_quota_baseline(
                         accessor=credential_path,
                         model=f"{provider_prefix}/_5h_window",
-                        quota_max_requests=100,
                         quota_reset_ts=snapshot.primary.reset_at,
-                        quota_used=quota_used,
                         quota_group="5h-limit",
                         force=True,
                         apply_exhaustion=snapshot.primary.is_exhausted,
                     )
-                    # Also push to codex-global so the executor's quota display
-                    # can find the limit when looking up the model's quota group
                     await self._usage_manager.update_quota_baseline(
                         accessor=credential_path,
                         model=f"{provider_prefix}/_global_quota",
-                        quota_max_requests=100,
                         quota_reset_ts=snapshot.primary.reset_at,
-                        quota_used=quota_used,
                         quota_group="codex-global",
                         force=True,
                         apply_exhaustion=False,  # Exhaustion handled by 5h-limit
                     )
 
                 if snapshot.secondary:
-                    used_pct = snapshot.secondary.used_percent
-                    quota_used = int(used_pct)
                     await self._usage_manager.update_quota_baseline(
                         accessor=credential_path,
                         model=f"{provider_prefix}/_weekly_window",
-                        quota_max_requests=100,
                         quota_reset_ts=snapshot.secondary.reset_at,
-                        quota_used=quota_used,
                         quota_group="weekly-limit",
                         force=True,
                         apply_exhaustion=snapshot.secondary.is_exhausted,
                     )
             except Exception as e:
-                lib_logger.debug(
-                    f"Failed to push Codex quota to UsageManager: {e}"
-                )
+                lib_logger.debug(f"Failed to push Codex quota to UsageManager: {e}")
 
         # Schedule the async push - we're already in an async context
         # when this is called from the streaming/non-streaming handlers
@@ -675,9 +676,15 @@ class CodexQuotaTracker:
                 "plan_type": snapshot.plan_type,
                 "status": status,
                 "error": snapshot.error,
-                "primary": _window_to_dict(snapshot.primary) if snapshot.primary else None,
-                "secondary": _window_to_dict(snapshot.secondary) if snapshot.secondary else None,
-                "credits": _credits_to_dict(snapshot.credits) if snapshot.credits else None,
+                "primary": _window_to_dict(snapshot.primary)
+                if snapshot.primary
+                else None,
+                "secondary": _window_to_dict(snapshot.secondary)
+                if snapshot.secondary
+                else None,
+                "credits": _credits_to_dict(snapshot.credits)
+                if snapshot.credits
+                else None,
                 "fetched_at": snapshot.fetched_at,
                 "is_stale": snapshot.is_stale,
             }
@@ -854,31 +861,27 @@ class CodexQuotaTracker:
             else:
                 short_cred = Path(cred_path).stem
 
-            # Store primary window (5h limit) under virtual model "_5h_window"
+            # Codex reports quota as a percentage, not a request count.
+            # We only store reset_at + apply_exhaustion so the UsageManager
+            # can cooldown an exhausted window without treating the 0-100
+            # percent scale as a literal request cap.
             if primary:
                 primary_remaining = primary.get("remaining_fraction", 1.0)
-                primary_used_pct = primary.get("used_percent", 0)
                 primary_reset = primary.get("reset_at")
                 is_exhausted = primary.get("is_exhausted", False)
                 try:
                     await usage_manager.update_quota_baseline(
                         accessor=cred_path,
                         model=f"{provider_prefix}/_5h_window",
-                        quota_max_requests=100,
                         quota_reset_ts=primary_reset,
-                        quota_used=int(primary_used_pct),
                         quota_group="5h-limit",
                         force=force,
                         apply_exhaustion=is_exhausted and is_initial_fetch,
                     )
-                    # Also store in codex-global so the executor's quota display
-                    # can find the limit when looking up the model's quota group
                     await usage_manager.update_quota_baseline(
                         accessor=cred_path,
                         model=f"{provider_prefix}/_global_quota",
-                        quota_max_requests=100,
                         quota_reset_ts=primary_reset,
-                        quota_used=int(primary_used_pct),
                         quota_group="codex-global",
                         force=force,
                         apply_exhaustion=False,  # Exhaustion handled by 5h-limit
@@ -893,19 +896,15 @@ class CodexQuotaTracker:
                         f"Failed to store Codex 5h baseline for {short_cred}: {e}"
                     )
 
-            # Store secondary window (weekly limit) under virtual model "_weekly_window"
             if secondary:
                 secondary_remaining = secondary.get("remaining_fraction", 1.0)
-                secondary_used_pct = secondary.get("used_percent", 0)
                 secondary_reset = secondary.get("reset_at")
                 is_exhausted = secondary.get("is_exhausted", False)
                 try:
                     await usage_manager.update_quota_baseline(
                         accessor=cred_path,
                         model=f"{provider_prefix}/_weekly_window",
-                        quota_max_requests=100,
                         quota_reset_ts=secondary_reset,
-                        quota_used=int(secondary_used_pct),
                         quota_group="weekly-limit",
                         force=force,
                         apply_exhaustion=is_exhausted and is_initial_fetch,
@@ -986,13 +985,27 @@ class CodexQuotaTracker:
                     "error": None,
                     "plan_type": snapshot.plan_type,
                     "primary": {
-                        "remaining_fraction": snapshot.primary.remaining_fraction if snapshot.primary else 0,
-                        "remaining_percent": snapshot.primary.remaining_percent if snapshot.primary else 0,
-                        "used_percent": snapshot.primary.used_percent if snapshot.primary else 100,
-                        "reset_at": snapshot.primary.reset_at if snapshot.primary else None,
-                        "window_minutes": snapshot.primary.window_minutes if snapshot.primary else None,
-                        "is_exhausted": snapshot.primary.is_exhausted if snapshot.primary else True,
-                    } if snapshot.primary else None,
+                        "remaining_fraction": snapshot.primary.remaining_fraction
+                        if snapshot.primary
+                        else 0,
+                        "remaining_percent": snapshot.primary.remaining_percent
+                        if snapshot.primary
+                        else 0,
+                        "used_percent": snapshot.primary.used_percent
+                        if snapshot.primary
+                        else 100,
+                        "reset_at": snapshot.primary.reset_at
+                        if snapshot.primary
+                        else None,
+                        "window_minutes": snapshot.primary.window_minutes
+                        if snapshot.primary
+                        else None,
+                        "is_exhausted": snapshot.primary.is_exhausted
+                        if snapshot.primary
+                        else True,
+                    }
+                    if snapshot.primary
+                    else None,
                     "secondary": {
                         "remaining_fraction": snapshot.secondary.remaining_fraction,
                         "remaining_percent": snapshot.secondary.remaining_percent,
@@ -1000,12 +1013,16 @@ class CodexQuotaTracker:
                         "reset_at": snapshot.secondary.reset_at,
                         "window_minutes": snapshot.secondary.window_minutes,
                         "is_exhausted": snapshot.secondary.is_exhausted,
-                    } if snapshot.secondary else None,
+                    }
+                    if snapshot.secondary
+                    else None,
                     "credits": {
                         "has_credits": snapshot.credits.has_credits,
                         "unlimited": snapshot.credits.unlimited,
                         "balance": snapshot.credits.balance,
-                    } if snapshot.credits else None,
+                    }
+                    if snapshot.credits
+                    else None,
                 }
             else:
                 results[cred_path] = {
