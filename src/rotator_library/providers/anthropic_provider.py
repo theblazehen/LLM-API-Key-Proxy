@@ -106,6 +106,66 @@ def _anthropic_tool_name(name: str) -> str:
     return "".join(part[:1].upper() + part[1:] for part in parts)
 
 
+def _rewrite_opencode_environment_metadata(text: str) -> str:
+    """Rewrite OpenCode env metadata into plain prose to avoid client fingerprinting."""
+    env_pattern = re.compile(
+        r"Here is some useful information about the environment you are running in:\n"
+        r"<env>\n(?P<env_body>.*?)\n</env>\n<directories>\n(?P<dirs_body>.*?)\n</directories>",
+        flags=re.DOTALL,
+    )
+
+    def replace_match(match: re.Match[str]) -> str:
+        env_body = match.group("env_body")
+        dirs_body = match.group("dirs_body")
+
+        fields: Dict[str, str] = {}
+        for raw_line in env_body.splitlines():
+            line = raw_line.strip()
+            if not line or ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            fields[key.strip()] = value.strip()
+
+        summary_parts = []
+        platform = fields.get("Platform")
+        git_repo = fields.get("Is directory a git repo")
+        working_dir = fields.get("Working directory")
+        workspace_root = fields.get("Workspace root folder")
+        current_date = fields.get("Today's date")
+
+        if platform:
+            summary_parts.append(f"platform {platform}")
+        if git_repo:
+            repo_text = (
+                "inside a git repo"
+                if git_repo.lower() == "yes"
+                else "not in a git repo"
+            )
+            summary_parts.append(repo_text)
+        if working_dir:
+            summary_parts.append(f"working directory {working_dir}")
+        if workspace_root:
+            summary_parts.append(f"workspace root {workspace_root}")
+        if current_date:
+            summary_parts.append(f"date {current_date}")
+
+        summary = "Environment summary: "
+        if summary_parts:
+            summary += ", ".join(summary_parts) + "."
+        else:
+            summary += "local workspace context available."
+
+        directories_text = dirs_body.strip()
+        if directories_text:
+            summary += f" Directories: {directories_text}."
+        else:
+            summary += " Directories: none listed."
+
+        return summary
+
+    return env_pattern.sub(replace_match, text)
+
+
 class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterface):
     """
     Anthropic provider using OAuth authentication (Claude Pro/Max).
@@ -569,15 +629,9 @@ class AnthropicProvider(AnthropicAuthBase, AnthropicQuotaTracker, ProviderInterf
                     rewritten_text = re.sub(
                         r"OpenCode", "Claude Code", text, flags=re.IGNORECASE
                     )
-                    rewritten_text = rewritten_text.replace("<env>", "< env>")
-                    rewritten_text = rewritten_text.replace("</env>", "< /env>")
-                    rewritten_text = rewritten_text.replace(
-                        "<directories>", "< directories>"
+                    rewritten["text"] = _rewrite_opencode_environment_metadata(
+                        rewritten_text
                     )
-                    rewritten_text = rewritten_text.replace(
-                        "</directories>", "< /directories>"
-                    )
-                    rewritten["text"] = rewritten_text
                     result.append(rewritten)
         return result
 
