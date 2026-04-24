@@ -45,6 +45,7 @@ COPILOT_API_BASE = "https://api.githubcopilot.com"
 
 # Available Copilot models (these may vary based on subscription)
 DEFAULT_COPILOT_MODELS = [
+    "gpt-5.5",
     "gpt-5.4",
     "gpt-5.3-codex",
     "gpt-5.2-codex",
