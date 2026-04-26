@@ -136,6 +136,7 @@ _FALLBACK_REASONING_EFFORTS = {
     "gpt-5.2-codex": {"low", "medium", "high", "xhigh"},
     "gpt-5.3-codex": {"low", "medium", "high", "xhigh"},
 }
+_FALLBACK_FAST_MODELS = {"gpt-5.5", "gpt-5.4"}
 
 # Module-level cache for dynamic model data
 _models_cache: Optional[Dict[str, Any]] = None
@@ -167,6 +168,7 @@ def _fetch_models_from_github() -> Optional[Dict[str, Any]]:
 
         base_models = []
         reasoning_efforts = {}
+        fast_models = set()
 
         for m in models_list:
             slug = m.get("slug", "")
@@ -178,6 +180,8 @@ def _fetch_models_from_github() -> Optional[Dict[str, Any]]:
                 continue
 
             base_models.append(slug)
+            if "fast" in m.get("additional_speed_tiers", []):
+                fast_models.add(slug)
 
             # Extract reasoning effort levels
             levels = m.get("supported_reasoning_levels", [])
@@ -197,6 +201,7 @@ def _fetch_models_from_github() -> Optional[Dict[str, Any]]:
         return {
             "base_models": base_models,
             "reasoning_efforts": reasoning_efforts,
+            "fast_models": fast_models,
         }
 
     except Exception as e:
@@ -236,6 +241,7 @@ def _get_model_data() -> Dict[str, Any]:
     fallback = {
         "base_models": list(_FALLBACK_BASE_MODELS),
         "reasoning_efforts": dict(_FALLBACK_REASONING_EFFORTS),
+        "fast_models": set(_FALLBACK_FAST_MODELS),
     }
     _models_cache = fallback
     _models_cache_time = now
@@ -256,11 +262,18 @@ def _build_available_models() -> list:
     """Build full list of available models including reasoning variants."""
     data = _get_model_data()
     models = list(data["base_models"])
+    fast_models = data.get("fast_models", set())
+
+    # Add fast service tier variants for models that advertise support.
+    for model in sorted(fast_models):
+        models.append(f"{model}-fast")
 
     # Add reasoning effort variants for each model
     for model, efforts in data["reasoning_efforts"].items():
         for effort in sorted(efforts):
             models.append(f"{model}:{effort}")
+            if model in fast_models:
+                models.append(f"{model}-fast:{effort}")
 
     return models
 
@@ -432,12 +445,24 @@ def _build_reasoning_param(
     return reasoning
 
 
+def _extract_fast_service_tier(name: str) -> Optional[str]:
+    """Return Responses API service tier implied by model suffix, if any."""
+    if not isinstance(name, str) or not name.strip():
+        return None
+
+    base = name.split(":", 1)[0].strip()
+    return "priority" if base.lower().endswith("-fast") else None
+
+
 def _normalize_model_name(name: str) -> str:
-    """Normalize model name, stripping reasoning effort suffix."""
+    """Normalize model name, stripping fast and reasoning effort suffixes."""
     if not isinstance(name, str) or not name.strip():
         return "gpt-5"
 
     base = name.split(":", 1)[0].strip()
+
+    if base.lower().endswith("-fast"):
+        base = base[:-5]
 
     # Strip effort suffix
     for sep in ("-", "_"):
@@ -947,6 +972,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         requested_model = model
         if "/" in model:
             model = model.split("/", 1)[1]
+        service_tier = kwargs.get("service_tier") or _extract_fast_service_tier(model)
         normalized_model = _normalize_model_name(model)
 
         # Build reasoning parameters
@@ -1028,6 +1054,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
 
         if include:
             payload["include"] = include
+
+        if service_tier:
+            payload["service_tier"] = service_tier
 
         lib_logger.debug(
             f"Codex request to {normalized_model}: {json.dumps(payload, default=str)[:500]}..."
