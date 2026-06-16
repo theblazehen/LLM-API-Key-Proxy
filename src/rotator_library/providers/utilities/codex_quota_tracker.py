@@ -554,6 +554,15 @@ class CodexQuotaTracker:
                         force=True,
                         apply_exhaustion=False,  # Exhaustion handled by 5h-limit
                     )
+                    if not snapshot.primary.is_exhausted:
+                        await self._usage_manager.clear_cooldown_if_exists(
+                            accessor=credential_path,
+                            model_or_group="5h-limit",
+                        )
+                        await self._usage_manager.clear_cooldown_if_exists(
+                            accessor=credential_path,
+                            model_or_group="codex-global",
+                        )
 
                 if snapshot.secondary:
                     await self._usage_manager.update_quota_baseline(
@@ -564,6 +573,11 @@ class CodexQuotaTracker:
                         force=True,
                         apply_exhaustion=snapshot.secondary.is_exhausted,
                     )
+                    if not snapshot.secondary.is_exhausted:
+                        await self._usage_manager.clear_cooldown_if_exists(
+                            accessor=credential_path,
+                            model_or_group="weekly-limit",
+                        )
             except Exception as e:
                 lib_logger.debug(f"Failed to push Codex quota to UsageManager: {e}")
 
@@ -886,6 +900,15 @@ class CodexQuotaTracker:
                         force=force,
                         apply_exhaustion=False,  # Exhaustion handled by 5h-limit
                     )
+                    if not is_exhausted:
+                        await usage_manager.clear_cooldown_if_exists(
+                            accessor=cred_path,
+                            model_or_group="5h-limit",
+                        )
+                        await usage_manager.clear_cooldown_if_exists(
+                            accessor=cred_path,
+                            model_or_group="codex-global",
+                        )
                     stored_count += 1
                     lib_logger.debug(
                         f"Stored Codex 5h baseline for {short_cred}: "
@@ -909,6 +932,11 @@ class CodexQuotaTracker:
                         force=force,
                         apply_exhaustion=is_exhausted and is_initial_fetch,
                     )
+                    if not is_exhausted:
+                        await usage_manager.clear_cooldown_if_exists(
+                            accessor=cred_path,
+                            model_or_group="weekly-limit",
+                        )
                     stored_count += 1
                     lib_logger.debug(
                         f"Stored Codex weekly baseline for {short_cred}: "

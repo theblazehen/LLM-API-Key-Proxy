@@ -93,22 +93,6 @@ on:
         required: false
         type: boolean
         default: false
-  push:
-    # ┌─────────────────────────────────────────────────────────────────────────────────────┐
-    # │ BRANCHES: Update this list to match BUILD_BRANCHES in the env section above        │
-    # └─────────────────────────────────────────────────────────────────────────────────────┘
-    branches:
-      - dev
-      - main
-    # ┌─────────────────────────────────────────────────────────────────────────────────────┐
-    # │ PATHS: Files/directories that trigger a build when changed                         │
-    # │ The build will only run if changes are made to files matching these patterns       │
-    # └─────────────────────────────────────────────────────────────────────────────────────┘
-    paths:
-      - 'src/proxy_app/**'       # Main application source code
-      - 'src/rotator_library/**' # Key rotation library
-      - '.github/workflows/build.yml'  # This workflow file
-      - 'cliff.toml'             # Changelog configuration
 
 # ════════════════════════════════════════════════════════════════════════════════════════════
 #                                         JOBS

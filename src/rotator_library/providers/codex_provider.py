@@ -291,6 +291,7 @@ AVAILABLE_MODELS = _build_available_models()
 DEFAULT_REASONING_EFFORT = os.getenv("CODEX_REASONING_EFFORT", "medium")
 DEFAULT_REASONING_SUMMARY = os.getenv("CODEX_REASONING_SUMMARY", "auto")
 DEFAULT_REASONING_COMPAT = os.getenv("CODEX_REASONING_COMPAT", "think-tags")
+CODEX_CLIENT_METADATA = env_bool("CODEX_CLIENT_METADATA", True)
 
 # Empty response retry configuration
 EMPTY_RESPONSE_MAX_ATTEMPTS = max(1, env_int("CODEX_EMPTY_RESPONSE_ATTEMPTS", 3))
@@ -485,13 +486,28 @@ def _normalize_model_name(name: str) -> str:
         "gpt5-codex": "gpt-5-codex",
         "gpt-5-codex-latest": "gpt-5-codex",
         "gpt-5.3-codex-latest": "gpt-5.3-codex",
-        "codex-spark": "gpt-5.3-codex",
-        "gpt-5.3-codex-spark": "gpt-5.3-codex",
-        "gpt-5.3-codex-spark-latest": "gpt-5.3-codex",
+        "codex-spark": "gpt-5.3-codex-spark",
+        "gpt-5.3-codex-spark": "gpt-5.3-codex-spark",
+        "gpt-5.3-codex-spark-latest": "gpt-5.3-codex-spark",
         "codex-mini": "gpt-5.1-codex-mini",
     }
 
     return mapping.get(base.lower(), base)
+
+
+def _build_codex_request_metadata() -> Dict[str, str]:
+    """Build Codex CLI-style request metadata for backend routing/telemetry."""
+    installation_id = os.getenv("CODEX_INSTALLATION_ID") or str(uuid.uuid4())
+    session_id = os.getenv("CODEX_SESSION_ID") or str(uuid.uuid4())
+    thread_id = os.getenv("CODEX_THREAD_ID") or str(uuid.uuid4())
+    window_id = os.getenv("CODEX_WINDOW_ID") or str(uuid.uuid4())
+
+    return {
+        "x-codex-installation-id": installation_id,
+        "session_id": session_id,
+        "thread_id": thread_id,
+        "x-codex-window-id": window_id,
+    }
 
 
 # Maximum length for call_id in the Codex Responses API
@@ -1012,6 +1028,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             "Content-Type": "application/json",
             "Accept": "text/event-stream" if stream else "application/json",
             "OpenAI-Beta": "responses=experimental",
+            "User-Agent": "codex-cli",
+            "originator": "codex-tui",
+            "version": os.getenv("CODEX_CLIENT_VERSION", "0.0.0"),
         }
 
         if account_id:
@@ -1057,6 +1076,11 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
 
         if service_tier:
             payload["service_tier"] = service_tier
+
+        if CODEX_CLIENT_METADATA:
+            metadata = _build_codex_request_metadata()
+            payload["client_metadata"] = metadata
+            headers["x-codex-window-id"] = metadata["x-codex-window-id"]
 
         lib_logger.debug(
             f"Codex request to {normalized_model}: {json.dumps(payload, default=str)[:500]}..."
@@ -1699,6 +1723,23 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         try:
             error_data = json.loads(error_body)
             error_info = error_data.get("error", {})
+
+            if error_info.get("type") == "usage_limit_reached":
+                retry_after = error_info.get("resets_in_seconds")
+                reset_at = error_info.get("resets_at")
+
+                if retry_after is None and reset_at:
+                    retry_after = max(1, int(reset_at - time.time()))
+                if retry_after is None:
+                    retry_after = 3600
+
+                return {
+                    "retry_after": int(retry_after),
+                    "reason": "USAGE_LIMIT_REACHED",
+                    "reset_timestamp": reset_at,
+                    "quota_reset_timestamp": reset_at,
+                    "plan_type": error_info.get("plan_type"),
+                }
 
             if error_info.get("code") == "rate_limit_exceeded":
                 # Look for retry-after information
