@@ -32,45 +32,7 @@ class CooldownChecker(LimitChecker):
         model: str,
         quota_group: Optional[str] = None,
     ) -> LimitCheckResult:
-        """
-        Check if credential is in cooldown.
-
-        Args:
-            state: Credential state to check
-            model: Model being requested
-            quota_group: Quota group for this model
-
-        Returns:
-            LimitCheckResult indicating pass/fail
-        """
-        now = time.time()
-        group_key = quota_group or model
-
-        # Check model/group-specific cooldowns
-        keys_to_check = []
-        if group_key:
-            keys_to_check.append(group_key)
-        if quota_group and quota_group != model:
-            keys_to_check.append(model)
-
-        for key in keys_to_check:
-            cooldown = state.cooldowns.get(key)
-            if cooldown and cooldown.until > now:
-                return LimitCheckResult.blocked(
-                    result=LimitResult.BLOCKED_COOLDOWN,
-                    reason=f"Cooldown for '{key}': {cooldown.reason} (expires in {cooldown.remaining_seconds:.0f}s)",
-                    blocked_until=cooldown.until,
-                )
-
-        # Check global cooldown
-        global_cooldown = state.cooldowns.get("_global_")
-        if global_cooldown and global_cooldown.until > now:
-            return LimitCheckResult.blocked(
-                result=LimitResult.BLOCKED_COOLDOWN,
-                reason=f"Global cooldown: {global_cooldown.reason} (expires in {global_cooldown.remaining_seconds:.0f}s)",
-                blocked_until=global_cooldown.until,
-            )
-
+        """Cooldowns disabled — always pass."""
         return LimitCheckResult.ok()
 
     def reset(
