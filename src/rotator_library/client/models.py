@@ -16,6 +16,10 @@ from typing import Any, Dict, List, Optional
 
 lib_logger = logging.getLogger("rotator_library")
 
+PROVIDER_ALIASES: Dict[str, str] = {
+    "opencode-go": "opencode_go",
+}
+
 MODEL_ALIAS_MAP: Dict[str, List[str]] = {
     "alias/opus": ["anthropic/claude-opus-4-7", "copilot/claude-opus-4.6"],
     "alias/high": ["codex/gpt-5.4", "copilot/gpt-5.4", "copilot/gpt-5.2"],
@@ -130,7 +134,7 @@ class ModelResolver:
         Returns the first (primary) target for the alias, or the model unchanged.
         """
         chain = MODEL_ALIAS_MAP.get(model)
-        return chain[0] if chain else model
+        return self.normalize_provider_alias(chain[0] if chain else model)
 
     def resolve_model_chain(self, model: str) -> List[str]:
         """Resolve a model alias to its full fallback chain.
@@ -138,7 +142,8 @@ class ModelResolver:
         Returns a list of provider/model targets to try in order.
         For non-alias models, returns a single-element list.
         """
-        return MODEL_ALIAS_MAP.get(model, [model])
+        chain = MODEL_ALIAS_MAP.get(model, [model])
+        return [self.normalize_provider_alias(candidate) for candidate in chain]
 
     def get_alias_models(self) -> List[str]:
         """Return user-facing alias model IDs exposed by the API."""
@@ -157,6 +162,8 @@ class ModelResolver:
         Returns:
             True if model is allowed, False if blocked
         """
+        model = self.normalize_provider_alias(model)
+
         # Whitelist takes precedence
         if self._is_whitelisted(model, provider):
             return True
@@ -233,6 +240,15 @@ class ModelResolver:
                 return True
 
         return False
+
+    @staticmethod
+    def normalize_provider_alias(model: str) -> str:
+        """Map public provider aliases to internal provider names."""
+        if "/" not in model:
+            return model
+        provider, model_name = model.split("/", 1)
+        provider = PROVIDER_ALIASES.get(provider, provider)
+        return f"{provider}/{model_name}"
 
     @staticmethod
     def extract_provider(model: str) -> str:
