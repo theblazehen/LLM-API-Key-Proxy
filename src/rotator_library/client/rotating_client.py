@@ -354,7 +354,14 @@ class RotatingClient:
             )
 
             try:
-                return await self._executor.execute(context)
+                response = await self._executor.execute(context)
+                if self._is_error_response(response) and not is_last:
+                    lib_logger.info(
+                        f"Provider {provider} returned an exhausted/error response for {context.model}, "
+                        f"falling back to next provider in chain"
+                    )
+                    continue
+                return response
             except (NoAvailableKeysError, ValueError):
                 if not is_last:
                     lib_logger.info(
@@ -398,6 +405,21 @@ class RotatingClient:
             pre_request_callback=pre_request_callback,
             transaction_logger=transaction_logger,
         )
+
+    @staticmethod
+    def _is_error_response(response: Any) -> bool:
+        """Check if a non-streaming response is a terminal proxy error."""
+        if not isinstance(response, dict):
+            return False
+        error = response.get("error")
+        if not isinstance(error, dict):
+            return False
+        return error.get("type") in {
+            "proxy_error",
+            "proxy_busy",
+            "proxy_all_credentials_exhausted",
+            "proxy_timeout",
+        }
 
     @staticmethod
     def _is_stream_error(chunk: str) -> bool:
