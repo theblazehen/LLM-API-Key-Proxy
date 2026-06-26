@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from typing import Any, AsyncGenerator, Dict, List, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 import httpx
 import litellm
@@ -63,9 +63,13 @@ class OllamaCloudProvider(ProviderInterface):
 
         payload: Dict[str, Any] = {
             "model": model_name,
-            "messages": messages,
+            "messages": self._to_ollama_messages(messages),
             "stream": stream,
         }
+        if kwargs.get("tools") is not None:
+            payload["tools"] = kwargs["tools"]
+        if kwargs.get("tool_choice") is not None:
+            payload["tool_choice"] = kwargs["tool_choice"]
         for source_key, target_key in (
             ("temperature", "temperature"),
             ("top_p", "top_p"),
@@ -115,6 +119,9 @@ class OllamaCloudProvider(ProviderInterface):
                 data = json.loads(line)
                 message = data.get("message") or {}
                 content = message.get("content") or ""
+                tool_calls = self._to_openai_tool_calls(
+                    message.get("tool_calls"), include_index=True
+                )
                 if content:
                     saw_content = True
                     yield litellm.ModelResponse(
@@ -125,6 +132,20 @@ class OllamaCloudProvider(ProviderInterface):
                             litellm.utils.StreamingChoices(
                                 index=0,
                                 delta=litellm.utils.Delta(content=content),
+                                finish_reason=None,
+                            )
+                        ],
+                    )
+                if tool_calls:
+                    saw_content = True
+                    yield litellm.ModelResponse(
+                        id=f"ollama-cloud-{uuid.uuid4()}",
+                        created=int(time.time()),
+                        model=model,
+                        choices=[
+                            litellm.utils.StreamingChoices(
+                                index=0,
+                                delta=litellm.utils.Delta(tool_calls=tool_calls),
                                 finish_reason=None,
                             )
                         ],
@@ -140,7 +161,7 @@ class OllamaCloudProvider(ProviderInterface):
                             litellm.utils.StreamingChoices(
                                 index=0,
                                 delta=litellm.utils.Delta(content=""),
-                                finish_reason="stop",
+                                finish_reason="tool_calls" if tool_calls else "stop",
                             )
                         ],
                         usage=litellm.Usage(
@@ -154,28 +175,93 @@ class OllamaCloudProvider(ProviderInterface):
     def _to_litellm_response(self, data: Dict[str, Any], model: str) -> litellm.ModelResponse:
         message = data.get("message") or {}
         content = message.get("content", "")
-        if not content.strip():
+        tool_calls = self._to_openai_tool_calls(message.get("tool_calls"))
+        if not content.strip() and not tool_calls:
             raise ValueError(f"Ollama Cloud returned empty content for {model}")
 
         prompt_tokens = data.get("prompt_eval_count", 0) or 0
         completion_tokens = data.get("eval_count", 0) or 0
+        finish_reason = (
+            "tool_calls" if tool_calls else "stop" if data.get("done", True) else None
+        )
+        choice = litellm.Choices(
+            index=0,
+            message=litellm.Message(
+                role=message.get("role", "assistant"),
+                content=content,
+            ),
+            finish_reason=finish_reason,
+        )
+        if tool_calls:
+            choice.message.tool_calls = tool_calls
+
         return litellm.ModelResponse(
             id=f"ollama-cloud-{uuid.uuid4()}",
             created=int(time.time()),
             model=model,
-            choices=[
-                litellm.Choices(
-                    index=0,
-                    message=litellm.Message(
-                        role=message.get("role", "assistant"),
-                        content=content,
-                    ),
-                    finish_reason="stop" if data.get("done", True) else None,
-                )
-            ],
+            choices=[choice],
             usage=litellm.Usage(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=prompt_tokens + completion_tokens,
             ),
         )
+
+    def _to_ollama_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        ollama_messages = []
+        for message in messages:
+            converted = dict(message)
+            tool_calls = converted.get("tool_calls")
+            if tool_calls:
+                converted["tool_calls"] = self._to_ollama_tool_calls(tool_calls)
+            ollama_messages.append(converted)
+        return ollama_messages
+
+    def _to_ollama_tool_calls(
+        self, tool_calls: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        converted = []
+        for tool_call in tool_calls:
+            function = tool_call.get("function") or {}
+            arguments = function.get("arguments") or {}
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments) if arguments else {}
+                except json.JSONDecodeError:
+                    arguments = {}
+            converted.append(
+                {
+                    "function": {
+                        "name": function.get("name", ""),
+                        "arguments": arguments,
+                    }
+                }
+            )
+        return converted
+
+    def _to_openai_tool_calls(
+        self, tool_calls: Optional[List[Dict[str, Any]]], include_index: bool = False
+    ) -> List[Dict[str, Any]]:
+        if not tool_calls:
+            return []
+
+        converted = []
+        for index, tool_call in enumerate(tool_calls):
+            function = tool_call.get("function") or {}
+            arguments = function.get("arguments") or {}
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments)
+            converted_call = {
+                "id": tool_call.get("id") or f"call_{uuid.uuid4().hex}",
+                "type": "function",
+                "function": {
+                    "name": function.get("name", ""),
+                    "arguments": arguments,
+                },
+            }
+            if include_index:
+                converted_call["index"] = function.get(
+                    "index", tool_call.get("index", index)
+                )
+            converted.append(converted_call)
+        return converted
