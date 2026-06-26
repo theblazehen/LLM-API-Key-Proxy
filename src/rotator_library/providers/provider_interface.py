@@ -262,6 +262,10 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         """
         return False
 
+    def supports_responses_api(self) -> bool:
+        """Return True when the provider can handle /v1/responses natively."""
+        return False
+
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
     ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
@@ -270,6 +274,14 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         """
         raise NotImplementedError(
             f"{self.__class__.__name__} does not implement custom acompletion."
+        )
+
+    async def aresponses(
+        self, client: httpx.AsyncClient, **kwargs
+    ) -> Union[Dict[str, Any], AsyncGenerator[bytes, None]]:
+        """Handles a native OpenAI Responses API request for capable providers."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement native aresponses."
         )
 
     async def aembedding(

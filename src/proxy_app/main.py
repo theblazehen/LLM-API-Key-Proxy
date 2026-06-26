@@ -138,6 +138,11 @@ with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from proxy_app.request_logger import log_request_to_console
     from proxy_app.batch_manager import EmbeddingBatcher
     from proxy_app.detailed_logger import RawIOLogger
+    from proxy_app.responses_adapter import (
+        chat_response_to_responses,
+        chat_stream_to_responses_events,
+        responses_to_chat_request,
+    )
 
 print("  → Discovering provider plugins...")
 # Provider lazy loading happens during import, so time it here
@@ -1056,6 +1061,96 @@ async def chat_completions(
 
 
 # --- Anthropic Messages API Endpoint ---
+@app.post("/v1/responses")
+async def responses(
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_api_key),
+):
+    """
+    OpenAI Responses-compatible endpoint backed by the existing Chat Completions
+    routing stack. This is stateless and intentionally does not implement
+    hosted response persistence.
+    """
+    raw_logger = RawIOLogger() if ENABLE_RAW_LOGGING else None
+    try:
+        try:
+            request_data = await request.json()
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
+
+        if raw_logger:
+            raw_logger.log_request(headers=request.headers, body=request_data)
+
+        log_request_to_console(
+            url=str(request.url),
+            headers=dict(request.headers),
+            client_info=(request.client.host, request.client.port),
+            request_data=request_data,
+        )
+
+        if not request_data.get("model"):
+            raise HTTPException(status_code=400, detail="Invalid Request: model is required.")
+
+        native_response = await client.aresponses(request=request, **request_data)
+        if native_response is not None:
+            if request_data.get("stream", False):
+                return StreamingResponse(
+                    native_response,
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+            if raw_logger:
+                raw_logger.log_final_response(status_code=200, headers=None, body=native_response)
+            return JSONResponse(content=native_response)
+
+        chat_request = responses_to_chat_request(request_data)
+
+        if chat_request.get("stream", False):
+            response_generator = await client.acompletion(
+                request=request, **chat_request
+            )
+            return StreamingResponse(
+                chat_stream_to_responses_events(response_generator, request_data),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        chat_response = await client.acompletion(request=request, **chat_request)
+        if hasattr(chat_response, "model_dump"):
+            chat_response_data = chat_response.model_dump()
+        elif hasattr(chat_response, "dict"):
+            chat_response_data = chat_response.dict()
+        else:
+            chat_response_data = chat_response
+        response_data = chat_response_to_responses(chat_response_data, request_data)
+        if raw_logger:
+            raw_logger.log_final_response(status_code=200, headers=None, body=response_data)
+        return JSONResponse(content=response_data)
+
+    except (
+        litellm.InvalidRequestError,
+        ValueError,
+        litellm.ContextWindowExceededError,
+    ) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid Request: {str(e)}")
+    except litellm.AuthenticationError as e:
+        raise HTTPException(status_code=401, detail=f"Authentication Error: {str(e)}")
+    except litellm.RateLimitError as e:
+        raise HTTPException(status_code=429, detail=f"Rate Limit Error: {str(e)}")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred in /v1/responses: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+
+
 @app.post("/v1/messages")
 async def anthropic_messages(
     request: Request,

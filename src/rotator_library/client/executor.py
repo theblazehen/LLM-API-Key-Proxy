@@ -563,7 +563,17 @@ class RequestExecutor:
                                 await self._run_pre_request_callback(context, kwargs)
 
                                 # Make the API call
-                                if plugin and plugin.has_custom_logic():
+                                use_responses = bool(kwargs.get("_use_responses", False))
+                                if use_responses:
+                                    if not plugin or not getattr(plugin, "supports_responses_api", lambda: False)():
+                                        raise ValueError(f"Provider {provider} does not support native Responses API")
+                                    call_kwargs = dict(kwargs)
+                                    call_kwargs.pop("_use_responses", None)
+                                    call_kwargs["credential_identifier"] = cred
+                                    response = await plugin.aresponses(
+                                        self._http_client, **call_kwargs
+                                    )
+                                elif plugin and plugin.has_custom_logic():
                                     kwargs["credential_identifier"] = cred
                                     response = await plugin.acompletion(
                                         self._http_client, **kwargs
@@ -786,7 +796,17 @@ class RequestExecutor:
                                     )
 
                                     # Make the API call
-                                    if plugin and plugin.has_custom_logic():
+                                    use_responses = bool(kwargs.get("_use_responses", False))
+                                    if use_responses:
+                                        if not plugin or not getattr(plugin, "supports_responses_api", lambda: False)():
+                                            raise ValueError(f"Provider {provider} does not support native Responses API")
+                                        call_kwargs = dict(kwargs)
+                                        call_kwargs.pop("_use_responses", None)
+                                        call_kwargs["credential_identifier"] = cred
+                                        stream = await plugin.aresponses(
+                                            self._http_client, **call_kwargs
+                                        )
+                                    elif plugin and plugin.has_custom_logic():
                                         kwargs["credential_identifier"] = cred
                                         stream = await plugin.acompletion(
                                             self._http_client, **kwargs
@@ -798,6 +818,15 @@ class RequestExecutor:
                                         # Remove internal context before litellm call
                                         kwargs.pop("transaction_context", None)
                                         stream = await litellm.acompletion(**kwargs)
+
+                                    if use_responses:
+                                        cred_context.mark_success(response=None)
+                                        lib_logger.info(
+                                            f"Native Responses stream established for credential {mask_credential(cred)}."
+                                        )
+                                        async for chunk in stream:
+                                            yield chunk
+                                        return
 
                                     # Hand off to streaming handler with cred_context
                                     # The handler will call mark_success on completion

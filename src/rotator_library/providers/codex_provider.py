@@ -965,6 +965,92 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             return plan_type.lower()
         return None
 
+    def supports_responses_api(self) -> bool:
+        return True
+
+    async def aresponses(
+        self, client: httpx.AsyncClient, **kwargs
+    ) -> Union[Dict[str, Any], AsyncGenerator[bytes, None]]:
+        credential_path = kwargs.pop(
+            "credential_identifier", kwargs.get("credential_path", "")
+        )
+        kwargs.pop("transaction_context", None)
+
+        requested_model = kwargs.get("model", "gpt-5")
+        model = requested_model.split("/", 1)[1] if "/" in requested_model else requested_model
+        normalized_model = _normalize_model_name(model)
+        payload = dict(kwargs)
+        payload["model"] = normalized_model
+        payload.setdefault("store", False)
+        payload.setdefault("stream", bool(kwargs.get("stream", False)))
+        if not payload.get("instructions"):
+            payload["instructions"] = CODEX_SYSTEM_INSTRUCTION
+
+        auth_headers = await self.get_auth_header(credential_path)
+        account_id = await self.get_account_id(credential_path)
+        headers = {
+            **auth_headers,
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream" if payload.get("stream") else "application/json",
+            "OpenAI-Beta": "responses=experimental",
+            "User-Agent": "codex-cli",
+            "originator": "codex-tui",
+            "version": os.getenv("CODEX_CLIENT_VERSION", "0.0.0"),
+        }
+        if account_id:
+            headers["ChatGPT-Account-Id"] = account_id
+
+        if payload.get("stream"):
+            return self._stream_native_responses(client, headers, payload, credential_path)
+
+        response = await client.post(
+            CODEX_RESPONSES_ENDPOINT,
+            headers=headers,
+            json=payload,
+            timeout=TimeoutConfig.streaming(),
+        )
+        if credential_path:
+            self.update_quota_from_headers(
+                credential_path, {k.lower(): v for k, v in response.headers.items()}
+            )
+        if response.status_code >= 400:
+            raise ValueError(f"Codex Responses error {response.status_code}: {response.text}")
+        return response.json()
+
+    async def _stream_native_responses(
+        self,
+        client: httpx.AsyncClient,
+        headers: Dict[str, str],
+        payload: Dict[str, Any],
+        credential_path: str,
+    ) -> AsyncGenerator[bytes, None]:
+        async with client.stream(
+            "POST",
+            CODEX_RESPONSES_ENDPOINT,
+            headers=headers,
+            json=payload,
+            timeout=TimeoutConfig.streaming(),
+        ) as response:
+            if credential_path:
+                self.update_quota_from_headers(
+                    credential_path, {k.lower(): v for k, v in response.headers.items()}
+                )
+            if response.status_code >= 400:
+                body = await response.aread()
+                error = {
+                    "type": "error",
+                    "message": f"Codex Responses error {response.status_code}: {body.decode('utf-8', errors='replace')}",
+                    "code": "codex_responses_error",
+                }
+                yield f"data: {json.dumps(error)}\n\n".encode("utf-8")
+                yield b"data: [DONE]\n\n"
+                return
+            async for line in response.aiter_lines():
+                if not line:
+                    yield b"\n"
+                    continue
+                yield f"{line}\n".encode("utf-8")
+
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
     ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:

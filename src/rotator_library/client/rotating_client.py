@@ -305,6 +305,57 @@ class RotatingClient:
         if hasattr(self, "http_client") and self.http_client:
             await self.http_client.aclose()
 
+    async def aresponses(
+        self,
+        request: Optional[Any] = None,
+        pre_request_callback: Optional[callable] = None,
+        **kwargs,
+    ) -> Optional[Union[Any, AsyncGenerator[bytes, None]]]:
+        """Dispatch a native Responses API request when a provider supports it."""
+        requested_model = kwargs.get("model", "")
+        model_chain = self._model_resolver.resolve_model_chain(requested_model)
+
+        candidates = []
+        for candidate in model_chain:
+            provider = candidate.split("/")[0] if "/" in candidate else ""
+            plugin = self._get_provider_instance(provider)
+            if (
+                provider
+                and provider in self.all_credentials
+                and plugin
+                and getattr(plugin, "supports_responses_api", lambda: False)()
+            ):
+                candidates.append(candidate)
+
+        if not candidates:
+            return None
+
+        parent_log_dir = kwargs.pop("_parent_log_dir", None)
+        native_kwargs = {**kwargs, "_use_responses": True}
+        is_streaming = native_kwargs.get("stream", False)
+
+        if is_streaming and len(candidates) > 1:
+            return self._streaming_with_fallback(
+                candidates, native_kwargs, parent_log_dir, request, pre_request_callback,
+            )
+
+        for i, model in enumerate(candidates):
+            provider = model.split("/")[0]
+            is_last = i == len(candidates) - 1
+            context = self._build_completion_context(
+                model, provider, native_kwargs, parent_log_dir, request, pre_request_callback,
+            )
+            try:
+                response = await self._executor.execute(context)
+                if self._is_error_response(response) and not is_last:
+                    continue
+                return response
+            except (NoAvailableKeysError, ValueError):
+                if not is_last:
+                    continue
+                raise
+        return None
+
     async def acompletion(
         self,
         request: Optional[Any] = None,
@@ -422,8 +473,12 @@ class RotatingClient:
         }
 
     @staticmethod
-    def _is_stream_error(chunk: str) -> bool:
+    def _is_stream_error(chunk: Any) -> bool:
         """Check if an SSE chunk is a terminal error from the executor."""
+        if isinstance(chunk, (bytes, bytearray)):
+            chunk = chunk.decode("utf-8", errors="replace")
+        if not isinstance(chunk, str):
+            return False
         return (
             '"proxy_error"' in chunk
             or '"proxy_busy"' in chunk

@@ -50,6 +50,63 @@ class OllamaCloudProvider(ProviderInterface):
     def has_custom_logic(self) -> bool:
         return True
 
+    def supports_responses_api(self) -> bool:
+        return True
+
+    async def aresponses(
+        self, client: httpx.AsyncClient, **kwargs: Any
+    ) -> Union[Dict[str, Any], AsyncGenerator[bytes, None]]:
+        credential = kwargs.pop("credential_identifier")
+        kwargs.pop("transaction_context", None)
+
+        model = kwargs.get("model", "")
+        model_name = model.split("/", 1)[1] if "/" in model else model
+        payload = dict(kwargs)
+        payload["model"] = model_name
+        headers = {"Authorization": f"Bearer {credential}"}
+
+        if payload.get("stream", False):
+            return self._stream_responses(client, headers, payload)
+
+        response = await client.post(
+            f"{OLLAMA_CLOUD_API_BASE}/v1/responses",
+            headers=headers,
+            json=payload,
+            timeout=OLLAMA_CLOUD_TIMEOUT,
+        )
+        if response.status_code >= 400:
+            raise ValueError(f"Ollama Cloud Responses error {response.status_code}: {response.text}")
+        return response.json()
+
+    async def _stream_responses(
+        self,
+        client: httpx.AsyncClient,
+        headers: Dict[str, str],
+        payload: Dict[str, Any],
+    ) -> AsyncGenerator[bytes, None]:
+        async with client.stream(
+            "POST",
+            f"{OLLAMA_CLOUD_API_BASE}/v1/responses",
+            headers={**headers, "Accept": "text/event-stream"},
+            json=payload,
+            timeout=OLLAMA_CLOUD_TIMEOUT,
+        ) as response:
+            if response.status_code >= 400:
+                body = await response.aread()
+                error = {
+                    "type": "error",
+                    "message": f"Ollama Cloud Responses error {response.status_code}: {body.decode('utf-8', errors='replace')}",
+                    "code": "ollama_cloud_responses_error",
+                }
+                yield f"data: {json.dumps(error)}\n\n".encode("utf-8")
+                yield b"data: [DONE]\n\n"
+                return
+            async for line in response.aiter_lines():
+                if not line:
+                    yield b"\n"
+                    continue
+                yield f"{line}\n".encode("utf-8")
+
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs: Any
     ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
