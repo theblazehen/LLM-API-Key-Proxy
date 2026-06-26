@@ -40,6 +40,15 @@ MODEL_ALIAS_MAP: Dict[str, List[str]] = {
     ],
     "alias/gpt-fast": ["codex/gpt-5.5-fast"],
     "alias/gpt-spark": ["codex/gpt-5.3-codex-spark"],
+    "alias/glm": ["ollama_cloud/glm-5.2", "opencode-go/glm-5.2"],
+    "alias/deepseek-pro": [
+        "ollama_cloud/deepseek-v4-pro",
+        "opencode-go/deepseek-v4-pro",
+    ],
+    "alias/deepseek-flash": [
+        "ollama_cloud/deepseek-v4-flash",
+        "opencode-go/deepseek-v4-flash",
+    ],
 }
 
 
