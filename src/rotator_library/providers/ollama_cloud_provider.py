@@ -17,6 +17,7 @@ from .provider_interface import ProviderInterface
 
 OLLAMA_CLOUD_API_BASE = "https://ollama.com"
 OLLAMA_CLOUD_MODELS = ["glm-5.2", "deepseek-v4-pro", "deepseek-v4-flash"]
+OLLAMA_CLOUD_TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0)
 
 
 class OllamaCloudProvider(ProviderInterface):
@@ -30,6 +31,7 @@ class OllamaCloudProvider(ProviderInterface):
             response = await client.get(
                 f"{OLLAMA_CLOUD_API_BASE}/api/tags",
                 headers={"Authorization": f"Bearer {api_key}"},
+                timeout=OLLAMA_CLOUD_TIMEOUT,
             )
             response.raise_for_status()
             data = response.json().get("models", [])
@@ -80,6 +82,7 @@ class OllamaCloudProvider(ProviderInterface):
             f"{OLLAMA_CLOUD_API_BASE}/api/chat",
             headers=headers,
             json=payload,
+            timeout=OLLAMA_CLOUD_TIMEOUT,
         )
         if response.status_code >= 400:
             raise ValueError(f"Ollama Cloud error {response.status_code}: {response.text}")
@@ -97,6 +100,7 @@ class OllamaCloudProvider(ProviderInterface):
             f"{OLLAMA_CLOUD_API_BASE}/api/chat",
             headers=headers,
             json=payload,
+            timeout=OLLAMA_CLOUD_TIMEOUT,
         ) as response:
             if response.status_code >= 400:
                 body = await response.aread()
@@ -104,6 +108,7 @@ class OllamaCloudProvider(ProviderInterface):
                     f"Ollama Cloud error {response.status_code}: {body.decode('utf-8', errors='replace')}"
                 )
 
+            saw_content = False
             async for line in response.aiter_lines():
                 if not line:
                     continue
@@ -111,6 +116,7 @@ class OllamaCloudProvider(ProviderInterface):
                 message = data.get("message") or {}
                 content = message.get("content") or ""
                 if content:
+                    saw_content = True
                     yield litellm.ModelResponse(
                         id=f"ollama-cloud-{uuid.uuid4()}",
                         created=int(time.time()),
@@ -124,6 +130,8 @@ class OllamaCloudProvider(ProviderInterface):
                         ],
                     )
                 if data.get("done"):
+                    if not saw_content:
+                        raise ValueError(f"Ollama Cloud returned empty stream for {model}")
                     yield litellm.ModelResponse(
                         id=f"ollama-cloud-{uuid.uuid4()}",
                         created=int(time.time()),
@@ -145,6 +153,10 @@ class OllamaCloudProvider(ProviderInterface):
 
     def _to_litellm_response(self, data: Dict[str, Any], model: str) -> litellm.ModelResponse:
         message = data.get("message") or {}
+        content = message.get("content", "")
+        if not content.strip():
+            raise ValueError(f"Ollama Cloud returned empty content for {model}")
+
         prompt_tokens = data.get("prompt_eval_count", 0) or 0
         completion_tokens = data.get("eval_count", 0) or 0
         return litellm.ModelResponse(
@@ -156,7 +168,7 @@ class OllamaCloudProvider(ProviderInterface):
                     index=0,
                     message=litellm.Message(
                         role=message.get("role", "assistant"),
-                        content=message.get("content", ""),
+                        content=content,
                     ),
                     finish_reason="stop" if data.get("done", True) else None,
                 )
