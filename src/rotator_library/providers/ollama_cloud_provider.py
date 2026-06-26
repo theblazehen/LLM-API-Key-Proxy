@@ -98,7 +98,7 @@ class OllamaCloudProvider(ProviderInterface):
         headers: Dict[str, str],
         payload: Dict[str, Any],
         model: str,
-    ) -> AsyncGenerator[litellm.ModelResponse, None]:
+    ) -> AsyncGenerator[Dict[str, Any], None]:
         async with client.stream(
             "POST",
             f"{OLLAMA_CLOUD_API_BASE}/api/chat",
@@ -124,53 +124,57 @@ class OllamaCloudProvider(ProviderInterface):
                 )
                 if content:
                     saw_content = True
-                    yield litellm.ModelResponse(
-                        id=f"ollama-cloud-{uuid.uuid4()}",
-                        created=int(time.time()),
+                    yield self._to_stream_chunk(
                         model=model,
-                        choices=[
-                            litellm.utils.StreamingChoices(
-                                index=0,
-                                delta=litellm.utils.Delta(content=content),
-                                finish_reason=None,
-                            )
-                        ],
+                        delta={"content": content},
+                        finish_reason=None,
                     )
                 if tool_calls:
                     saw_content = True
-                    yield litellm.ModelResponse(
-                        id=f"ollama-cloud-{uuid.uuid4()}",
-                        created=int(time.time()),
+                    yield self._to_stream_chunk(
                         model=model,
-                        choices=[
-                            litellm.utils.StreamingChoices(
-                                index=0,
-                                delta=litellm.utils.Delta(tool_calls=tool_calls),
-                                finish_reason=None,
-                            )
-                        ],
+                        delta={"tool_calls": tool_calls},
+                        finish_reason=None,
                     )
                 if data.get("done"):
                     if not saw_content:
                         raise ValueError(f"Ollama Cloud returned empty stream for {model}")
-                    yield litellm.ModelResponse(
-                        id=f"ollama-cloud-{uuid.uuid4()}",
-                        created=int(time.time()),
+                    prompt_tokens = data.get("prompt_eval_count", 0) or 0
+                    completion_tokens = data.get("eval_count", 0) or 0
+                    yield self._to_stream_chunk(
                         model=model,
-                        choices=[
-                            litellm.utils.StreamingChoices(
-                                index=0,
-                                delta=litellm.utils.Delta(content=""),
-                                finish_reason="tool_calls" if tool_calls else "stop",
-                            )
-                        ],
-                        usage=litellm.Usage(
-                            prompt_tokens=data.get("prompt_eval_count", 0) or 0,
-                            completion_tokens=data.get("eval_count", 0) or 0,
-                            total_tokens=(data.get("prompt_eval_count", 0) or 0)
-                            + (data.get("eval_count", 0) or 0),
-                        ),
+                        delta={},
+                        finish_reason="tool_calls" if tool_calls else "stop",
+                        usage={
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": prompt_tokens + completion_tokens,
+                        },
                     )
+
+    def _to_stream_chunk(
+        self,
+        model: str,
+        delta: Dict[str, Any],
+        finish_reason: Optional[str],
+        usage: Optional[Dict[str, int]] = None,
+    ) -> Dict[str, Any]:
+        chunk: Dict[str, Any] = {
+            "id": f"ollama-cloud-{uuid.uuid4()}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                }
+            ],
+        }
+        if usage is not None:
+            chunk["usage"] = usage
+        return chunk
 
     def _to_litellm_response(self, data: Dict[str, Any], model: str) -> litellm.ModelResponse:
         message = data.get("message") or {}
