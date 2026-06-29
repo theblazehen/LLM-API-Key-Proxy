@@ -12,6 +12,8 @@ Extracts model-related logic from client.py including:
 
 import fnmatch
 import logging
+import os
+import random
 from typing import Any, Dict, List, Optional
 
 lib_logger = logging.getLogger("rotator_library")
@@ -50,6 +52,9 @@ MODEL_ALIAS_MAP: Dict[str, List[str]] = {
         "opencode-go/deepseek-v4-flash",
     ],
 }
+
+ROULETTE_ALIAS = "alias/roulette"
+DEFAULT_ROULETTE_WEIGHTS = "alias/gpt=70,alias/glm=30"
 
 
 class ModelResolver:
@@ -142,6 +147,9 @@ class ModelResolver:
 
         Returns the first (primary) target for the alias, or the model unchanged.
         """
+        if model == ROULETTE_ALIAS:
+            return self.resolve_model_chain(model)[0]
+
         chain = MODEL_ALIAS_MAP.get(model)
         return self.normalize_provider_alias(chain[0] if chain else model)
 
@@ -151,12 +159,42 @@ class ModelResolver:
         Returns a list of provider/model targets to try in order.
         For non-alias models, returns a single-element list.
         """
+        if model == ROULETTE_ALIAS:
+            model = self._select_roulette_alias()
+
         chain = MODEL_ALIAS_MAP.get(model, [model])
         return [self.normalize_provider_alias(candidate) for candidate in chain]
 
     def get_alias_models(self) -> List[str]:
         """Return user-facing alias model IDs exposed by the API."""
-        return sorted(MODEL_ALIAS_MAP.keys())
+        return sorted([*MODEL_ALIAS_MAP.keys(), ROULETTE_ALIAS])
+
+    def _select_roulette_alias(self) -> str:
+        """Pick an alias using ALIAS_ROULETTE_WEIGHTS, defaulting to 70/30 gpt/glm."""
+        weights_config = os.environ.get(
+            "ALIAS_ROULETTE_WEIGHTS", DEFAULT_ROULETTE_WEIGHTS
+        )
+        choices: List[str] = []
+        weights: List[float] = []
+
+        for entry in weights_config.split(","):
+            alias, sep, weight = entry.strip().partition("=")
+            if not sep or not alias or alias == ROULETTE_ALIAS:
+                continue
+            try:
+                parsed_weight = float(weight)
+            except ValueError:
+                continue
+            if parsed_weight <= 0 or alias not in MODEL_ALIAS_MAP:
+                continue
+            choices.append(alias)
+            weights.append(parsed_weight)
+
+        if not choices:
+            choices = ["alias/gpt", "alias/glm"]
+            weights = [70.0, 30.0]
+
+        return random.choices(choices, weights=weights, k=1)[0]
 
     def is_model_allowed(self, model: str, provider: str) -> bool:
         """
