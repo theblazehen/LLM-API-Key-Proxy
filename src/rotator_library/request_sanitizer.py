@@ -3,10 +3,24 @@
 
 from typing import Dict, Any
 
+
+def _strip_provider_specific_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        value.pop("provider_specific_fields", None)
+        for item in value.values():
+            _strip_provider_specific_fields(item)
+    elif isinstance(value, list):
+        for item in value:
+            _strip_provider_specific_fields(item)
+    return value
+
+
 def sanitize_request_payload(payload: Dict[str, Any], model: str) -> Dict[str, Any]:
     """
     Removes unsupported parameters from the request payload based on the model.
     """
+    _strip_provider_specific_fields(payload.get("messages", []))
+
     if "dimensions" in payload and not model.startswith("openai/text-embedding-3"):
         del payload["dimensions"]
         
