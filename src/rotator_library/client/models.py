@@ -14,7 +14,7 @@ import fnmatch
 import logging
 import os
 import random
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -54,7 +54,14 @@ MODEL_ALIAS_MAP: Dict[str, List[str]] = {
 }
 
 ROULETTE_ALIAS = "alias/roulette"
+ROULETTE_GLM_ALIAS = "alias/roulette-glm"
 DEFAULT_ROULETTE_WEIGHTS = "alias/gpt=70,alias/glm=30"
+DEFAULT_ROULETTE_GLM_WEIGHTS = "alias/glm=70,alias/gpt=30"
+
+ROULETTE_ALIASES: Dict[str, Tuple[str, str]] = {
+    ROULETTE_ALIAS: ("ALIAS_ROULETTE_WEIGHTS", DEFAULT_ROULETTE_WEIGHTS),
+    ROULETTE_GLM_ALIAS: ("ALIAS_ROULETTE_GLM_WEIGHTS", DEFAULT_ROULETTE_GLM_WEIGHTS),
+}
 
 
 class ModelResolver:
@@ -147,7 +154,7 @@ class ModelResolver:
 
         Returns the first (primary) target for the alias, or the model unchanged.
         """
-        if model == ROULETTE_ALIAS:
+        if model in ROULETTE_ALIASES:
             return self.resolve_model_chain(model)[0]
 
         chain = MODEL_ALIAS_MAP.get(model)
@@ -159,27 +166,26 @@ class ModelResolver:
         Returns a list of provider/model targets to try in order.
         For non-alias models, returns a single-element list.
         """
-        if model == ROULETTE_ALIAS:
-            model = self._select_roulette_alias()
+        if model in ROULETTE_ALIASES:
+            model = self._select_roulette_alias(model)
 
         chain = MODEL_ALIAS_MAP.get(model, [model])
         return [self.normalize_provider_alias(candidate) for candidate in chain]
 
     def get_alias_models(self) -> List[str]:
         """Return user-facing alias model IDs exposed by the API."""
-        return sorted([*MODEL_ALIAS_MAP.keys(), ROULETTE_ALIAS])
+        return sorted([*MODEL_ALIAS_MAP.keys(), *ROULETTE_ALIASES.keys()])
 
-    def _select_roulette_alias(self) -> str:
-        """Pick an alias using ALIAS_ROULETTE_WEIGHTS, defaulting to 70/30 gpt/glm."""
-        weights_config = os.environ.get(
-            "ALIAS_ROULETTE_WEIGHTS", DEFAULT_ROULETTE_WEIGHTS
-        )
+    def _select_roulette_alias(self, model: str = ROULETTE_ALIAS) -> str:
+        """Pick an alias using the weights env var for the given roulette alias."""
+        env_key, default_weights = ROULETTE_ALIASES.get(model, ("ALIAS_ROULETTE_WEIGHTS", DEFAULT_ROULETTE_WEIGHTS))
+        weights_config = os.environ.get(env_key, default_weights)
         choices: List[str] = []
         weights: List[float] = []
 
         for entry in weights_config.split(","):
             alias, sep, weight = entry.strip().partition("=")
-            if not sep or not alias or alias == ROULETTE_ALIAS:
+            if not sep or not alias or alias in ROULETTE_ALIASES:
                 continue
             try:
                 parsed_weight = float(weight)
