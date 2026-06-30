@@ -40,6 +40,10 @@ MODEL_ALIAS_MAP: Dict[str, List[str]] = {
         "copilot/gpt-5.5",
         "copilot/gpt-5.4",
     ],
+    "gpt-5.5": [
+        "codex/gpt-5.5",
+        "copilot/gpt-5.5",
+    ],
     "GPT-5.5": [
         "codex/gpt-5.5",
         "copilot/gpt-5.5",
@@ -51,9 +55,14 @@ MODEL_ALIAS_MAP: Dict[str, List[str]] = {
     "alias/gpt-fast": ["codex/gpt-5.5-fast"],
     "alias/gpt-spark": ["codex/gpt-5.3-codex-spark"],
     "alias/glm": ["ollama_cloud/glm-5.2", "opencode-go/glm-5.2"],
+    "glm-5.2": ["ollama_cloud/glm-5.2", "opencode-go/glm-5.2"],
     "GLM 5.2": ["ollama_cloud/glm-5.2", "opencode-go/glm-5.2"],
     "Z.ai: GLM 5.2": ["ollama_cloud/glm-5.2", "opencode-go/glm-5.2"],
     "alias/deepseek-pro": [
+        "ollama_cloud/deepseek-v4-pro",
+        "opencode-go/deepseek-v4-pro",
+    ],
+    "deepseek-v4-pro": [
         "ollama_cloud/deepseek-v4-pro",
         "opencode-go/deepseek-v4-pro",
     ],
