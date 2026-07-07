@@ -1263,12 +1263,20 @@ class RequestExecutor:
                 except Exception:
                     input_tokens += len(json.dumps(tools)) // 4  # rough fallback
 
-            # Look up context window
-            try:
-                model_info = litellm.get_model_info(model)
-                context_window = model_info.get("max_input_tokens") or model_info.get("max_tokens")
-            except Exception:
-                context_window = None
+            # Prefer provider-reported limits for custom providers. Generic catalogs can
+            # overestimate proxy routes that share a public model slug.
+            context_window = None
+            provider = model.split("/", 1)[0] if "/" in model else ""
+            plugin = self._get_plugin_instance(provider) if provider else None
+            if plugin and hasattr(plugin, "get_model_context_window"):
+                context_window = plugin.get_model_context_window(model)
+
+            if not context_window:
+                try:
+                    model_info = litellm.get_model_info(model)
+                    context_window = model_info.get("max_input_tokens") or model_info.get("max_tokens")
+                except Exception:
+                    context_window = None
 
             if not context_window:
                 # Try custom ModelRegistry as fallback

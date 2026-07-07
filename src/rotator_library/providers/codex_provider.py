@@ -103,7 +103,7 @@ REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
 
 CODEX_MODELS_JSON_URL = os.getenv(
     "CODEX_MODELS_JSON_URL",
-    "https://raw.githubusercontent.com/openai/codex/refs/heads/main/codex-rs/core/models.json",
+    "https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json",
 )
 CODEX_MODELS_CACHE_TTL = env_int("CODEX_MODELS_CACHE_TTL", 3600)  # 1 hour default
 
@@ -169,6 +169,7 @@ def _fetch_models_from_github() -> Optional[Dict[str, Any]]:
         base_models = []
         reasoning_efforts = {}
         fast_models = set()
+        model_limits = {}
 
         for m in models_list:
             slug = m.get("slug", "")
@@ -180,6 +181,13 @@ def _fetch_models_from_github() -> Optional[Dict[str, Any]]:
                 continue
 
             base_models.append(slug)
+            context_window = m.get("context_window") or m.get("max_context_window")
+            max_output = m.get("max_output_tokens") or m.get("max_completion_tokens")
+            if context_window or max_output:
+                model_limits[slug] = {
+                    "context_window": context_window,
+                    "max_output": max_output,
+                }
             if "fast" in m.get("additional_speed_tiers", []):
                 fast_models.add(slug)
 
@@ -202,6 +210,7 @@ def _fetch_models_from_github() -> Optional[Dict[str, Any]]:
             "base_models": base_models,
             "reasoning_efforts": reasoning_efforts,
             "fast_models": fast_models,
+            "model_limits": model_limits,
         }
 
     except Exception as e:
@@ -242,6 +251,7 @@ def _get_model_data() -> Dict[str, Any]:
         "base_models": list(_FALLBACK_BASE_MODELS),
         "reasoning_efforts": dict(_FALLBACK_REASONING_EFFORTS),
         "fast_models": set(_FALLBACK_FAST_MODELS),
+        "model_limits": {},
     }
     _models_cache = fallback
     _models_cache_time = now
@@ -899,6 +909,15 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         """Return available Codex models (dynamically fetched from GitHub)."""
         models = get_available_models()
         return [f"codex/{m}" for m in models]
+
+    def get_model_context_window(self, model: str) -> Optional[int]:
+        model_name = model.split("/", 1)[1] if "/" in model else model
+        model_name = model_name.split(":", 1)[0]
+        if model_name.endswith("-fast"):
+            model_name = model_name[: -len("-fast")]
+        limits = _get_model_data().get("model_limits", {}).get(model_name) or {}
+        context_window = limits.get("context_window")
+        return int(context_window) if context_window else None
 
     @staticmethod
     def _extract_credential_number(credential: str) -> Optional[int]:

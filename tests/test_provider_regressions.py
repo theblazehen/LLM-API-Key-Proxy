@@ -1,6 +1,7 @@
 import json
 import asyncio
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -106,6 +107,7 @@ sys.modules.setdefault("litellm.exceptions", fake_litellm_exceptions)
 import pytest
 
 from rotator_library.error_handler import EmptyResponseError
+from rotator_library.providers import codex_provider
 from rotator_library.providers.codex_provider import CodexProvider
 from rotator_library.providers.ollama_cloud_provider import OllamaCloudProvider
 
@@ -244,3 +246,24 @@ def test_codex_non_stream_completed_without_output_raises_empty_response_error()
 
     with pytest.raises(EmptyResponseError):
         asyncio.run(run_response())
+
+
+def test_codex_context_window_comes_from_codex_model_metadata():
+    codex_provider._models_cache = {
+        "base_models": ["gpt-5.5"],
+        "reasoning_efforts": {},
+        "fast_models": {"gpt-5.5"},
+        "model_limits": {
+            "gpt-5.5": {
+                "context_window": 272000,
+                "max_output": 128000,
+            }
+        },
+    }
+    codex_provider._models_cache_time = time.time()
+
+    provider = CodexProvider()
+
+    assert provider.get_model_context_window("codex/gpt-5.5") == 272000
+    assert provider.get_model_context_window("codex/gpt-5.5-fast") == 272000
+    assert provider.get_model_context_window("codex/gpt-5.5:xhigh") == 272000
