@@ -1360,6 +1360,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         reasoning_full_text = ""
         sent_reasoning = False
         streaming_reasoning = False  # True once we start streaming reasoning_content
+        emitted_output = False
 
         async with client.stream(
             "POST",
@@ -1413,6 +1414,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                 if kind == "response.output_text.delta":
                     delta_text = evt.get("delta", "")
                     if delta_text:
+                        emitted_output = True
                         sent_reasoning = (
                             True  # Content has started, reasoning phase is over
                         )
@@ -1440,6 +1442,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                     rdelta = evt.get("delta", "")
                     reasoning_summary_text += rdelta
                     if rdelta:
+                        emitted_output = True
                         streaming_reasoning = True
                         chunk = litellm.ModelResponse(
                             id=response_id,
@@ -1463,6 +1466,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                     rdelta = evt.get("delta", "")
                     reasoning_full_text += rdelta
                     if rdelta:
+                        emitted_output = True
                         streaming_reasoning = True
                         chunk = litellm.ModelResponse(
                             id=response_id,
@@ -1528,6 +1532,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                             if not arguments:
                                 arguments = tc["arguments"]
 
+                        emitted_output = True
                         chunk = litellm.ModelResponse(
                             id=response_id,
                             created=created,
@@ -1575,6 +1580,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                             filter(None, [reasoning_summary_text, reasoning_full_text])
                         )
                         if rtxt:
+                            emitted_output = True
                             chunk = litellm.ModelResponse(
                                 id=response_id,
                                 created=created,
@@ -1593,6 +1599,12 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                             )
                             yield chunk
 
+                    if not emitted_output:
+                        raise EmptyResponseError(
+                            "codex",
+                            model,
+                            f"Codex completed streaming response for {model} without text, reasoning, or tool calls",
+                        )
                     # Extract usage if available
                     usage = None
                     resp_data = evt.get("response", {})
@@ -1760,6 +1772,13 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
 
         if error_message:
             raise StreamedAPIError(f"Codex response failed: {error_message}")
+
+        if not full_text and not reasoning_summary_text and not reasoning_full_text and not tool_calls:
+            raise EmptyResponseError(
+                "codex",
+                model,
+                f"Codex completed response for {model} without text, reasoning, or tool calls",
+            )
 
         # Build message
         message: Dict[str, Any] = {

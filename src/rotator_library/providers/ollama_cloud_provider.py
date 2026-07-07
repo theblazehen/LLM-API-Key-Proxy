@@ -272,11 +272,39 @@ class OllamaCloudProvider(ProviderInterface):
         ollama_messages = []
         for message in messages:
             converted = dict(message)
+            converted["content"] = self._to_ollama_content(converted.get("content", ""))
             tool_calls = converted.get("tool_calls")
             if tool_calls:
                 converted["tool_calls"] = self._to_ollama_tool_calls(tool_calls)
             ollama_messages.append(converted)
         return ollama_messages
+
+    def _to_ollama_content(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+
+        if not isinstance(content, list):
+            return "" if content is None else str(content)
+
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+                continue
+            if not isinstance(block, dict):
+                continue
+
+            block_type = block.get("type")
+            if block_type == "text":
+                text = block.get("text")
+                if text:
+                    parts.append(str(text))
+            elif block_type == "input_text":
+                text = block.get("text")
+                if text:
+                    parts.append(str(text))
+
+        return "\n".join(parts)
 
     def _to_ollama_tool_calls(
         self, tool_calls: List[Dict[str, Any]]
