@@ -35,7 +35,7 @@ MODEL_ALIAS_MAP: Dict[str, List[str]] = {
     ],
     "alias/cheapest": ["copilot/gpt-5-mini"],
     "alias/gpt": [
-        "codex/gpt-5.5",
+        "codex/gpt-5.6-sol",
         "codex/gpt-5.3-codex-spark",
         "copilot/gpt-5.5",
         "copilot/gpt-5.4",
