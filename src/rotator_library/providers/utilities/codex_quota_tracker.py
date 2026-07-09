@@ -545,6 +545,10 @@ class CodexQuotaTracker:
                         quota_group="5h-limit",
                         force=True,
                         apply_exhaustion=snapshot.primary.is_exhausted,
+                        quota_used_percent=snapshot.primary.used_percent,
+                        quota_remaining_percent=snapshot.primary.remaining_percent,
+                        quota_window_minutes=snapshot.primary.window_minutes,
+                        quota_source="codex",
                     )
                     await self._usage_manager.update_quota_baseline(
                         accessor=credential_path,
@@ -572,6 +576,10 @@ class CodexQuotaTracker:
                         quota_group="weekly-limit",
                         force=True,
                         apply_exhaustion=snapshot.secondary.is_exhausted,
+                        quota_used_percent=snapshot.secondary.used_percent,
+                        quota_remaining_percent=snapshot.secondary.remaining_percent,
+                        quota_window_minutes=snapshot.secondary.window_minutes,
+                        quota_source="codex",
                     )
                     if not snapshot.secondary.is_exhausted:
                         await self._usage_manager.clear_cooldown_if_exists(
@@ -891,6 +899,10 @@ class CodexQuotaTracker:
                         quota_group="5h-limit",
                         force=force,
                         apply_exhaustion=is_exhausted and is_initial_fetch,
+                        quota_used_percent=primary.get("used_percent"),
+                        quota_remaining_percent=primary.get("remaining_percent"),
+                        quota_window_minutes=primary.get("window_minutes"),
+                        quota_source="codex",
                     )
                     await usage_manager.update_quota_baseline(
                         accessor=cred_path,
@@ -931,6 +943,10 @@ class CodexQuotaTracker:
                         quota_group="weekly-limit",
                         force=force,
                         apply_exhaustion=is_exhausted and is_initial_fetch,
+                        quota_used_percent=secondary.get("used_percent"),
+                        quota_remaining_percent=secondary.get("remaining_percent"),
+                        quota_window_minutes=secondary.get("window_minutes"),
+                        quota_source="codex",
                     )
                     if not is_exhausted:
                         await usage_manager.clear_cooldown_if_exists(

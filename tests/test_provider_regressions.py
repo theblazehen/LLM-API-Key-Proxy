@@ -42,11 +42,26 @@ class CredentialNeedsReauthError(Exception):
     pass
 
 
+class ClassifiedError:
+    pass
+
+
+def classify_error(error):
+    return ClassifiedError()
+
+
+def mask_credential(credential, style="default"):
+    return credential
+
+
 
 fake_error_handler = types.ModuleType("rotator_library.error_handler")
 fake_error_handler.CredentialNeedsReauthError = CredentialNeedsReauthError
 fake_error_handler.EmptyResponseError = EmptyResponseError
 fake_error_handler.TransientQuotaError = TransientQuotaError
+fake_error_handler.ClassifiedError = ClassifiedError
+fake_error_handler.classify_error = classify_error
+fake_error_handler.mask_credential = mask_credential
 sys.modules.setdefault("rotator_library.error_handler", fake_error_handler)
 
 core_package = types.ModuleType("rotator_library.core")
@@ -110,6 +125,7 @@ from rotator_library.error_handler import EmptyResponseError
 from rotator_library.providers import codex_provider
 from rotator_library.providers.codex_provider import CodexProvider
 from rotator_library.providers.ollama_cloud_provider import OllamaCloudProvider
+from rotator_library.usage.manager import UsageManager
 
 
 class FakeStreamResponse:
@@ -267,3 +283,68 @@ def test_codex_context_window_comes_from_codex_model_metadata():
     assert provider.get_model_context_window("codex/gpt-5.5") == 272000
     assert provider.get_model_context_window("codex/gpt-5.5-fast") == 272000
     assert provider.get_model_context_window("codex/gpt-5.5:xhigh") == 272000
+
+
+def test_codex_percent_quota_snapshots_are_exposed_in_group_stats_without_requests():
+    credential = "/credentials/codex-account.json"
+    primary_reset = 1_800_000_000
+    secondary_reset = 1_800_604_800
+
+    async def store_snapshots_and_get_stats():
+        manager = UsageManager(provider="codex")
+        await manager.initialize([credential])
+        provider = CodexProvider()
+
+        stored = await provider._store_baselines_to_usage_manager(
+            {
+                credential: {
+                    "status": "success",
+                    "primary": {
+                        "used_percent": 37.5,
+                        "remaining_percent": 62.5,
+                        "remaining_fraction": 0.625,
+                        "window_minutes": 300,
+                        "reset_at": primary_reset,
+                        "is_exhausted": False,
+                    },
+                    "secondary": {
+                        "used_percent": 81.25,
+                        "remaining_percent": 18.75,
+                        "remaining_fraction": 0.1875,
+                        "window_minutes": 10_080,
+                        "reset_at": secondary_reset,
+                        "is_exhausted": False,
+                    },
+                }
+            },
+            manager,
+            force=True,
+        )
+        return stored, await manager.get_stats_for_endpoint()
+
+    stored, stats = asyncio.run(store_snapshots_and_get_stats())
+
+    assert stored == 2
+    credential_stats = next(iter(stats["credentials"].values()))
+    expected_windows = {
+        "5h-limit": {
+            "used_percent": 37.5,
+            "remaining_percent": 62.5,
+            "window_minutes": 300,
+            "reset_at": primary_reset,
+            "quota_source": "codex",
+        },
+        "weekly-limit": {
+            "used_percent": 81.25,
+            "remaining_percent": 18.75,
+            "window_minutes": 10_080,
+            "reset_at": secondary_reset,
+            "quota_source": "codex",
+        },
+    }
+    for group_name, expected in expected_windows.items():
+        window = next(
+            iter(credential_stats["group_usage"][group_name]["windows"].values())
+        )
+        assert {field: window[field] for field in expected} == expected
+        assert window["request_count"] == 0

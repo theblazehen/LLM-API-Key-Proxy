@@ -961,6 +961,10 @@ class UsageManager:
                         "total_tokens": window.total_tokens,
                         "limit": window.limit,
                         "remaining": window.remaining,
+                        "used_percent": window.used_percent,
+                        "remaining_percent": window.remaining_percent,
+                        "window_minutes": window.window_minutes,
+                        "quota_source": window.quota_source,
                         "max_recorded_requests": window.max_recorded_requests,
                         "max_recorded_at": window.max_recorded_at,
                         "reset_at": window.reset_at,
@@ -1004,6 +1008,10 @@ class UsageManager:
                         "total_tokens": window.total_tokens,
                         "limit": window.limit,
                         "remaining": window.remaining,
+                        "used_percent": window.used_percent,
+                        "remaining_percent": window.remaining_percent,
+                        "window_minutes": window.window_minutes,
+                        "quota_source": window.quota_source,
                         "max_recorded_requests": window.max_recorded_requests,
                         "max_recorded_at": window.max_recorded_at,
                         "reset_at": window.reset_at,
@@ -1129,6 +1137,10 @@ class UsageManager:
                             "total_remaining": 0,
                             "total_max": 0,
                             "remaining_pct": None,
+                            "provider_used_percent": [],
+                            "provider_remaining_percent": [],
+                            "window_minutes": None,
+                            "quota_source": None,
                             "tier_availability": {},  # Per-window credential availability
                         },
                     )
@@ -1153,8 +1165,25 @@ class UsageManager:
                         if remaining > 0:
                             tier_avail["available"] += 1
                     else:
-                        # No limit = unlimited = always available
-                        tier_avail["available"] += 1
+                        # Percentage-based providers do not expose a request
+                        # limit; their authoritative remaining percentage
+                        # determines availability instead.
+                        remaining_percent = window.get("remaining_percent")
+                        if remaining_percent is None or remaining_percent > 0:
+                            tier_avail["available"] += 1
+
+                    if window.get("used_percent") is not None:
+                        window_agg["provider_used_percent"].append(
+                            window["used_percent"]
+                        )
+                    if window.get("remaining_percent") is not None:
+                        window_agg["provider_remaining_percent"].append(
+                            window["remaining_percent"]
+                        )
+                    if window.get("window_minutes") is not None:
+                        window_agg["window_minutes"] = window["window_minutes"]
+                    if window.get("quota_source") is not None:
+                        window_agg["quota_source"] = window["quota_source"]
 
             # Add active cooldowns
             for key, cooldown in state.cooldowns.items():
@@ -1208,6 +1237,20 @@ class UsageManager:
                         * 100,
                         1,
                     )
+                used_values = window_stats.pop("provider_used_percent", [])
+                remaining_values = window_stats.pop(
+                    "provider_remaining_percent", []
+                )
+                window_stats["used_percent"] = (
+                    round(sum(used_values) / len(used_values), 1)
+                    if used_values
+                    else None
+                )
+                window_stats["remaining_percent"] = (
+                    round(sum(remaining_values) / len(remaining_values), 1)
+                    if remaining_values
+                    else None
+                )
 
         total_input = (
             stats["tokens"]["input_cached"] + stats["tokens"]["input_uncached"]
@@ -1408,6 +1451,10 @@ class UsageManager:
         quota_group: Optional[str] = None,
         force: bool = False,
         apply_exhaustion: bool = False,
+        quota_used_percent: Optional[float] = None,
+        quota_remaining_percent: Optional[float] = None,
+        quota_window_minutes: Optional[int] = None,
+        quota_source: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Update quota baseline from provider API response.
@@ -1421,6 +1468,10 @@ class UsageManager:
             quota_max_requests: Max requests allowed in window
             quota_reset_ts: When quota resets (Unix timestamp)
             quota_used: Current used count from API
+            quota_used_percent: Provider-reported quota usage percentage
+            quota_remaining_percent: Provider-reported remaining percentage
+            quota_window_minutes: Provider-reported quota window duration
+            quota_source: Identifier for the authoritative quota source
             quota_group: Optional quota group (uses model if None)
             force: If True, always use API values (for manual refresh).
                 If False (default), use max(local, api) to prevent stale
@@ -1458,7 +1509,15 @@ class UsageManager:
                     group_stats.windows, primary_def.name
                 )
                 self._apply_quota_update(
-                    group_window, quota_max_requests, quota_reset_ts, quota_used, force
+                    group_window,
+                    quota_max_requests,
+                    quota_reset_ts,
+                    quota_used,
+                    force,
+                    quota_used_percent,
+                    quota_remaining_percent,
+                    quota_window_minutes,
+                    quota_source,
                 )
 
                 # Sync timing to all model windows in this group
@@ -1474,7 +1533,15 @@ class UsageManager:
                     model_stats.windows, primary_def.name
                 )
                 self._apply_quota_update(
-                    model_window, quota_max_requests, quota_reset_ts, quota_used, force
+                    model_window,
+                    quota_max_requests,
+                    quota_reset_ts,
+                    quota_used,
+                    force,
+                    quota_used_percent,
+                    quota_remaining_percent,
+                    quota_window_minutes,
+                    quota_source,
                 )
 
         # Mark state as updated
@@ -1743,6 +1810,10 @@ class UsageManager:
         quota_reset_ts: Optional[float],
         quota_used: Optional[int],
         force: bool,
+        quota_used_percent: Optional[float] = None,
+        quota_remaining_percent: Optional[float] = None,
+        quota_window_minutes: Optional[int] = None,
+        quota_source: Optional[str] = None,
     ) -> None:
         """Apply quota update to a window."""
         if quota_max_requests is not None:
@@ -1753,11 +1824,24 @@ class UsageManager:
             quota_used is not None and quota_used > 0
         ) or window.request_count > 0
 
-        # Only set started_at and reset_at if there's actual usage
-        # This prevents bogus reset times for unused windows
+        # An explicit provider reset timestamp is authoritative even when the
+        # provider reports percentages rather than request counts.
+        if quota_reset_ts is not None:
+            window.reset_at = quota_reset_ts
+
+        if quota_used_percent is not None:
+            window.used_percent = max(0.0, min(100.0, quota_used_percent))
+        if quota_remaining_percent is not None:
+            window.remaining_percent = max(
+                0.0, min(100.0, quota_remaining_percent)
+            )
+        if quota_window_minutes is not None:
+            window.window_minutes = quota_window_minutes
+        if quota_source is not None:
+            window.quota_source = quota_source
+
+        # Only infer a start time when there is actual request-count usage.
         if has_usage:
-            if quota_reset_ts is not None:
-                window.reset_at = quota_reset_ts
             # Set started_at to now if not already set (API shows usage we don't have locally)
             if window.started_at is None:
                 window.started_at = time.time()

@@ -110,6 +110,13 @@ class WindowStats:
     reset_at: Optional[float] = None  # When window resets
     limit: Optional[int] = None  # Max requests allowed (None = unlimited)
 
+    # Provider-reported percentage quota. These fields are independent of
+    # request-count limits so percentage-based APIs do not create fake caps.
+    used_percent: Optional[float] = None
+    remaining_percent: Optional[float] = None
+    window_minutes: Optional[int] = None
+    quota_source: Optional[str] = None
+
     # Historical max tracking (persists across window resets)
     max_recorded_requests: Optional[int] = (
         None  # Highest request_count ever in any window period
