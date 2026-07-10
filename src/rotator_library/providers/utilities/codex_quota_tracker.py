@@ -821,19 +821,44 @@ class CodexQuotaTracker:
 
         async def fetch_with_semaphore(cred_path: str):
             async with semaphore:
-                return await self.fetch_quota_from_api(cred_path)
+                snapshot = await self.fetch_quota_from_api(cred_path)
+                return cred_path, snapshot
 
         tasks = [fetch_with_semaphore(cred) for cred in active_credentials]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        success_count = sum(
-            1
-            for r in results
-            if isinstance(r, CodexQuotaSnapshot) and r.status == "success"
+        quota_results: Dict[str, Dict[str, Any]] = {}
+        for result in results:
+            if isinstance(result, Exception):
+                lib_logger.warning(f"Codex quota refresh error: {result}")
+                continue
+
+            cred_path, snapshot = result
+            if snapshot.status != "success":
+                continue
+
+            quota_results[cred_path] = {
+                "status": "success",
+                "error": None,
+                "plan_type": snapshot.plan_type,
+                "primary": _window_to_dict(snapshot.primary)
+                if snapshot.primary
+                else None,
+                "secondary": _window_to_dict(snapshot.secondary)
+                if snapshot.secondary
+                else None,
+            }
+
+        stored = await self._store_baselines_to_usage_manager(
+            quota_results,
+            usage_manager,
+            force=True,
         )
+        success_count = len(quota_results)
 
         lib_logger.debug(
-            f"Codex quota refresh complete: {success_count}/{len(active_credentials)} successful"
+            f"Codex quota refresh complete: {success_count}/{len(active_credentials)} "
+            f"successful, {stored} baselines stored"
         )
 
     # =========================================================================
