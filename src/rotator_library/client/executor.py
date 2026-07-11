@@ -781,6 +781,9 @@ class RequestExecutor:
                             skip_cost_calculation = bool(
                                 plugin
                                 and getattr(plugin, "skip_cost_calculation", False)
+                                and not getattr(
+                                    plugin, "calculate_api_equivalent_cost", False
+                                )
                             )
 
                             # Execute request with retries
@@ -830,10 +833,16 @@ class RequestExecutor:
 
                                     # Hand off to streaming handler with cred_context
                                     # The handler will call mark_success on completion
+                                    pricing_model = model
+                                    equivalent_model = getattr(
+                                        plugin, "get_api_equivalent_model", None
+                                    )
+                                    if equivalent_model:
+                                        pricing_model = equivalent_model(model)
                                     base_stream = self._streaming_handler.wrap_stream(
                                         stream,
                                         cred,
-                                        model,
+                                        pricing_model,
                                         context.request,
                                         cred_context,
                                         skip_cost_calculation=skip_cost_calculation,
@@ -1378,10 +1387,37 @@ class RequestExecutor:
 
     def _calculate_cost(self, provider: str, model: str, response: Any) -> float:
         plugin = self._get_plugin_instance(provider)
-        if plugin and getattr(plugin, "skip_cost_calculation", False):
+        use_api_equivalent = bool(
+            plugin and getattr(plugin, "calculate_api_equivalent_cost", False)
+        )
+        if plugin and getattr(plugin, "skip_cost_calculation", False) and not use_api_equivalent:
             return 0.0
 
         try:
+            if use_api_equivalent:
+                (
+                    prompt_tokens,
+                    completion_tokens,
+                    cached_tokens,
+                    cache_write_tokens,
+                    thinking_tokens,
+                ) = self._extract_usage_tokens(response)
+                from ..model_info_service import get_model_info_service
+
+                pricing_model = model
+                equivalent_model = getattr(plugin, "get_api_equivalent_model", None)
+                if equivalent_model:
+                    pricing_model = equivalent_model(model)
+                cost = get_model_info_service().compute_cost(
+                    pricing_model,
+                    prompt_tokens,
+                    completion_tokens + thinking_tokens,
+                    cached_tokens,
+                    cache_write_tokens,
+                )
+                if cost is not None:
+                    return float(cost)
+
             if isinstance(response, litellm.EmbeddingResponse):
                 model_info = litellm.get_model_info(model)
                 input_cost = model_info.get("input_cost_per_token")

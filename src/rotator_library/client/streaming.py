@@ -225,8 +225,10 @@ class StreamingHandler:
                     if not skip_cost_calculation:
                         approx_cost = self._calculate_stream_cost(
                             model,
-                            prompt_tokens_uncached + prompt_tokens_cached,
+                            prompt_tokens_uncached,
                             completion_tokens + thinking_tokens,
+                            prompt_tokens_cached,
+                            prompt_tokens_cache_write,
                         )
                     cred_context.mark_success(
                         prompt_tokens=prompt_tokens_uncached,
@@ -384,14 +386,30 @@ class StreamingHandler:
         model: str,
         prompt_tokens: int,
         completion_tokens: int,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
     ) -> float:
         try:
+            from ..model_info_service import get_model_info_service
+
+            registry_cost = get_model_info_service().compute_cost(
+                model,
+                prompt_tokens,
+                completion_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            )
+            if registry_cost is not None:
+                return float(registry_cost)
+
             model_info = litellm.get_model_info(model)
             input_cost = model_info.get("input_cost_per_token")
             output_cost = model_info.get("output_cost_per_token")
             total_cost = 0.0
             if input_cost:
-                total_cost += prompt_tokens * input_cost
+                # Without a published cache rate, charge cached tokens at the
+                # ordinary input rate rather than silently dropping them.
+                total_cost += (prompt_tokens + cache_read_tokens) * input_cost
             if output_cost:
                 total_cost += completion_tokens * output_cost
             return total_cost

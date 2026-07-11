@@ -18,6 +18,10 @@ providers_package = types.ModuleType("rotator_library.providers")
 providers_package.__path__ = [str(PACKAGE_ROOT / "providers")]
 sys.modules.setdefault("rotator_library.providers", providers_package)
 
+client_package = types.ModuleType("rotator_library.client")
+client_package.__path__ = [str(PACKAGE_ROOT / "client")]
+sys.modules.setdefault("rotator_library.client", client_package)
+
 utilities_package = types.ModuleType("rotator_library.providers.utilities")
 utilities_package.__path__ = [str(PACKAGE_ROOT / "providers" / "utilities")]
 sys.modules.setdefault("rotator_library.providers.utilities", utilities_package)
@@ -70,6 +74,14 @@ sys.modules.setdefault("rotator_library.core", core_package)
 
 fake_core_errors = types.ModuleType("rotator_library.core.errors")
 fake_core_errors.StreamedAPIError = StreamedAPIError
+fake_core_errors.CredentialNeedsReauthError = CredentialNeedsReauthError
+for _name in ("NoAvailableKeysError", "PreRequestCallbackError", "RequestErrorAccumulator"):
+    setattr(fake_core_errors, _name, type(_name, (Exception,), {}))
+fake_core_errors.ClassifiedError = ClassifiedError
+fake_core_errors.classify_error = classify_error
+fake_core_errors.should_rotate_on_error = lambda error: False
+fake_core_errors.should_retry_same_key = lambda error: False
+fake_core_errors.mask_credential = mask_credential
 sys.modules.setdefault("rotator_library.core.errors", fake_core_errors)
 
 
@@ -95,6 +107,7 @@ class _FakeUsage:
 
 fake_litellm = types.ModuleType("litellm")
 fake_litellm.ModelResponse = _FakeModelResponse
+fake_litellm.EmbeddingResponse = type("EmbeddingResponse", (), {})
 fake_litellm.Message = _FakeMessage
 fake_litellm.Choices = _FakeChoices
 fake_litellm.Usage = _FakeUsage
@@ -126,6 +139,9 @@ from rotator_library.providers import codex_provider
 from rotator_library.providers.codex_provider import CodexProvider
 from rotator_library.providers.ollama_cloud_provider import OllamaCloudProvider
 from rotator_library.usage.manager import UsageManager
+from rotator_library.client.executor import RequestExecutor
+from rotator_library.client.streaming import StreamingHandler
+from rotator_library.client.models import ModelResolver
 
 
 class FakeStreamResponse:
@@ -283,6 +299,71 @@ def test_codex_context_window_comes_from_codex_model_metadata():
     assert provider.get_model_context_window("codex/gpt-5.5") == 272000
     assert provider.get_model_context_window("codex/gpt-5.5-fast") == 272000
     assert provider.get_model_context_window("codex/gpt-5.5:xhigh") == 272000
+
+
+def test_api_equivalent_cost_opt_in_overrides_provider_skip_and_uses_cache_rates(
+    monkeypatch,
+):
+    class ApiEquivalentProvider:
+        skip_cost_calculation = True
+        calculate_api_equivalent_cost = True
+
+        @staticmethod
+        def get_api_equivalent_model(model):
+            return "openai/gpt-priced"
+
+    class PricingRegistry:
+        @staticmethod
+        def compute_cost(model, input_tokens, output_tokens, cache_read, cache_write):
+            assert model == "openai/gpt-priced"
+            assert (input_tokens, output_tokens, cache_read, cache_write) == (
+                70,
+                25,
+                30,
+                4,
+            )
+            return input_tokens * 0.01 + cache_read * 0.002 + output_tokens * 0.03
+
+    import rotator_library.model_info_service as model_info_service
+
+    monkeypatch.setattr(
+        model_info_service, "get_model_info_service", lambda: PricingRegistry()
+    )
+    executor = RequestExecutor.__new__(RequestExecutor)
+    executor._plugins = {"codex": ApiEquivalentProvider()}
+    executor._plugin_instances = {}
+    response = _FakeModelResponse(
+        usage=_FakeUsage(
+            prompt_tokens=100,
+            completion_tokens=25,
+            cache_read_tokens=30,
+            cache_creation_tokens=4,
+        )
+    )
+
+    assert executor._calculate_cost("codex", "codex/gpt-alias", response) == 1.51
+
+
+def test_stream_cost_is_zero_when_registry_and_litellm_have_no_pricing(monkeypatch):
+    class MissingPricingRegistry:
+        @staticmethod
+        def compute_cost(*args):
+            return None
+
+    import rotator_library.model_info_service as model_info_service
+
+    monkeypatch.setattr(
+        model_info_service, "get_model_info_service", lambda: MissingPricingRegistry()
+    )
+    monkeypatch.setattr(fake_litellm, "get_model_info", lambda model: {}, raising=False)
+
+    assert StreamingHandler()._calculate_stream_cost("ollama_cloud/unknown", 9, 3) == 0.0
+
+
+def test_completion_context_uses_concrete_model_resolved_from_alias():
+    resolver = ModelResolver(provider_plugins={})
+
+    assert resolver.resolve_model_id("alias/glm", "ollama_cloud") == "ollama_cloud/glm-5.2"
 
 
 def test_codex_percent_quota_snapshots_are_exposed_in_group_stats_without_requests():

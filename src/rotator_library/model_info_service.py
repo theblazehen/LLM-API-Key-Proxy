@@ -86,6 +86,8 @@ PROVIDER_ALIASES = {
     "gemini_cli": ["google"],
     "gemini": ["google"],
     "iflow": ["iflow", "iflowcn"],  # iflow may exist as either
+    # Subscription providers use these only for equivalent metered API pricing.
+    "codex": ["openai"],
 }
 
 

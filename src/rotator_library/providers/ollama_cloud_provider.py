@@ -25,6 +25,9 @@ class OllamaCloudProvider(ProviderInterface):
 
     provider_env_name: str = "ollama_cloud"
     skip_cost_calculation: bool = True
+    # Ollama Cloud reports input/output tokens but subscription usage is based
+    # on compute. Price those tokens using the matching metered API model.
+    calculate_api_equivalent_cost: bool = True
 
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         try:

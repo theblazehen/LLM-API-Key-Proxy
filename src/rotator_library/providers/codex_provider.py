@@ -816,6 +816,19 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
     # Provider configuration
     provider_env_name: str = "codex"
     skip_cost_calculation: bool = True  # Cost calculation handled differently
+    # Report what the observed tokens would cost through the metered API. This
+    # is intentionally independent of ChatGPT subscription/credit economics.
+    calculate_api_equivalent_cost: bool = True
+
+    @staticmethod
+    def get_api_equivalent_model(model: str) -> str:
+        """Return the metered API model used to value observed token usage."""
+        provider, separator, slug = model.partition("/")
+        if not separator:
+            provider, slug = "codex", provider
+        if slug.endswith("-fast"):
+            slug = slug[:-5]
+        return f"{provider}/{slug}"
 
     # Rotation configuration
     default_rotation_mode: str = "sequential"
