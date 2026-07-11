@@ -9,12 +9,20 @@ Good for providers that benefit from request caching.
 """
 
 import logging
+import time
 from typing import Dict, List, Optional
 
 from ...types import CredentialState, SelectionContext, RotationMode
 from ....error_handler import mask_credential
 
 lib_logger = logging.getLogger("rotator_library")
+
+_CODEX_QUOTA_GROUP = "codex-global"
+_WEEKLY_QUOTA_GROUP = "weekly-limit"
+_EFFECTIVE_DEADLINE_LEAD_HOURS = 24.0
+_MIN_PRESSURE_HOURS = 0.25
+_PRESSURE_HYSTERESIS = 1.25
+_MATERIAL_RESET_CHANGE_SECONDS = 6 * 60 * 60
 
 
 class SequentialStrategy:
@@ -39,6 +47,7 @@ class SequentialStrategy:
         self.fallback_multiplier = fallback_multiplier
         # Track current "sticky" credential per (provider, model_group)
         self._current: Dict[tuple, str] = {}
+        self._codex_weekly_generation: Dict[tuple, float] = {}
 
     @property
     def name(self) -> str:
@@ -73,6 +82,11 @@ class SequentialStrategy:
             return context.candidates[0]
 
         key = (context.provider, context.quota_group or context.model)
+
+        if context.provider == "codex" and context.quota_group == _CODEX_QUOTA_GROUP:
+            selected = self._select_codex_by_weekly_deadline(context, states, key)
+            if selected is not None:
+                return selected
 
         # Check if current sticky credential is still available
         current = self._current.get(key)
@@ -125,6 +139,81 @@ class SequentialStrategy:
 
         return selected
 
+    def _select_codex_by_weekly_deadline(
+        self,
+        context: SelectionContext,
+        states: Dict[str, CredentialState],
+        key: tuple,
+    ) -> Optional[str]:
+        """Select using complete, current Codex weekly quota snapshots.
+
+        Returning ``None`` delegates to the unchanged sequential algorithm;
+        known and unknown weekly state must not be mixed.
+        """
+        now = time.time()
+        snapshots = {}
+        for candidate in context.candidates:
+            group = states[candidate].group_usage.get(_WEEKLY_QUOTA_GROUP)
+            if not group:
+                return None
+
+            window = group.windows.get("daily")
+            if window is None:
+                quota_windows = [
+                    item
+                    for item in group.windows.values()
+                    if item.quota_source == "codex"
+                ]
+                if len(quota_windows) != 1:
+                    return None
+                window = quota_windows[0]
+
+            remaining = window.remaining_percent
+            reset_at = window.reset_at
+            if (
+                window.quota_source != "codex"
+                or remaining is None
+                or not 0.0 <= remaining <= 100.0
+                or reset_at is None
+                or reset_at <= now
+            ):
+                return None
+
+            effective_hours = (reset_at - now) / 3600.0 - _EFFECTIVE_DEADLINE_LEAD_HOURS
+            snapshots[candidate] = (
+                remaining / max(effective_hours, _MIN_PRESSURE_HOURS),
+                effective_hours <= 0.0,
+                reset_at,
+            )
+
+        current = self._current.get(key)
+        most_urgent = max(context.candidates, key=lambda c: snapshots[c][0])
+        selected = most_urgent
+        if current in context.candidates:
+            current_pressure, _, current_reset = snapshots[current]
+            other_pressure, other_past_deadline, _ = snapshots[most_urgent]
+            prior_reset = self._codex_weekly_generation.get(key)
+            generation_changed = (
+                prior_reset is not None
+                and abs(current_reset - prior_reset) >= _MATERIAL_RESET_CHANGE_SECONDS
+            )
+            if (
+                most_urgent == current
+                or (
+                    not generation_changed
+                    and not other_past_deadline
+                    and (
+                        other_pressure == current_pressure
+                        or other_pressure < current_pressure * _PRESSURE_HYSTERESIS
+                    )
+                )
+            ):
+                selected = current
+
+        self._current[key] = selected
+        self._codex_weekly_generation[key] = snapshots[selected][2]
+        return selected
+
     def mark_exhausted(self, provider: str, model_or_group: str) -> None:
         """
         Mark current credential as exhausted, forcing rotation.
@@ -137,6 +226,7 @@ class SequentialStrategy:
         if key in self._current:
             old = self._current[key]
             del self._current[key]
+            self._codex_weekly_generation.pop(key, None)
             lib_logger.debug(
                 f"Sequential: marked {mask_credential(old, style='full')} exhausted for {key}"
             )
@@ -213,5 +303,7 @@ class SequentialStrategy:
             keys_to_remove = [k for k in self._current if k[0] == provider]
             for key in keys_to_remove:
                 del self._current[key]
+                self._codex_weekly_generation.pop(key, None)
         else:
             self._current.clear()
+            self._codex_weekly_generation.clear()
