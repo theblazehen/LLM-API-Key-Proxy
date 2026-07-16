@@ -280,6 +280,106 @@ def test_codex_non_stream_completed_without_output_raises_empty_response_error()
         asyncio.run(run_response())
 
 
+def test_codex_stream_wrapper_yields_before_upstream_completes():
+    async def run_stream():
+        provider = CodexProvider()
+        upstream_can_finish = asyncio.Event()
+
+        async def fake_stream_response(*args, **kwargs):
+            yield _FakeModelResponse(
+                choices=[
+                    _FakeChoices(delta={"content": "first"}, finish_reason=None)
+                ]
+            )
+            await upstream_can_finish.wait()
+            yield _FakeModelResponse(
+                choices=[_FakeChoices(delta={}, finish_reason="stop")]
+            )
+
+        provider._stream_response = fake_stream_response
+        stream = provider._stream_with_retry(
+            client=None,
+            headers={},
+            payload={},
+            model="gpt-5.6-sol",
+            reasoning_compat="think-tags",
+        )
+
+        first = await asyncio.wait_for(anext(stream), timeout=0.1)
+        assert first.choices[0].delta["content"] == "first"
+
+        upstream_can_finish.set()
+        remaining = [chunk async for chunk in stream]
+        assert remaining[0].choices[0].finish_reason == "stop"
+
+    asyncio.run(run_stream())
+
+
+def test_codex_stale_model_cache_returns_immediately_and_refreshes_in_background(
+    monkeypatch,
+):
+    stale = {
+        "base_models": ["gpt-5.6-sol"],
+        "reasoning_efforts": {},
+        "fast_models": set(),
+        "model_limits": {},
+    }
+    refresh_started = []
+    codex_provider._models_cache = stale
+    codex_provider._models_cache_time = 0
+    monkeypatch.setattr(
+        codex_provider, "_start_models_refresh", lambda: refresh_started.append(True)
+    )
+
+    assert codex_provider._get_model_data() is stale
+    assert refresh_started == [True]
+
+
+def test_codex_failed_background_refresh_backs_off(monkeypatch):
+    stale = {
+        "base_models": ["gpt-5.6-sol"],
+        "reasoning_efforts": {},
+        "fast_models": set(),
+        "model_limits": {},
+    }
+    codex_provider._models_cache = stale
+    codex_provider._models_cache_time = 0
+    codex_provider._models_refresh_in_progress = True
+    monkeypatch.setattr(codex_provider, "_fetch_models_from_github", lambda: None)
+
+    before = time.time()
+    codex_provider._refresh_models_cache()
+
+    assert codex_provider._models_cache is stale
+    assert codex_provider._models_cache_time >= before
+    assert codex_provider._models_refresh_in_progress is False
+
+
+def test_codex_uses_model_specific_upstream_instruction():
+    codex_provider._models_cache = {
+        "base_models": ["gpt-5.6-sol"],
+        "reasoning_efforts": {},
+        "fast_models": {"gpt-5.6-sol"},
+        "model_limits": {},
+        "model_instructions": {
+            "gpt-5.6-sol": "You are Codex, an agent based on GPT-5."
+        },
+    }
+    codex_provider._models_cache_time = time.time()
+
+    assert (
+        codex_provider._get_model_instruction("gpt-5.6-sol")
+        == "You are Codex, an agent based on GPT-5."
+    )
+
+
+def test_codex_56_supports_current_reasoning_levels():
+    expected = {"low", "medium", "high", "xhigh", "max", "ultra"}
+
+    assert codex_provider._FALLBACK_REASONING_EFFORTS["gpt-5.6-sol"] == expected
+    assert expected <= codex_provider.REASONING_EFFORTS
+
+
 def test_codex_context_window_comes_from_codex_model_metadata():
     codex_provider._models_cache = {
         "base_models": ["gpt-5.5"],

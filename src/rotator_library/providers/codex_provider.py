@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -93,7 +94,15 @@ else:
     CODEX_RESPONSES_ENDPOINT = f"{CODEX_API_BASE}/responses"
 
 # Reasoning effort levels (superset of all known levels)
-REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
+REASONING_EFFORTS = {
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+}
 
 # =============================================================================
 # DYNAMIC MODEL DISCOVERY
@@ -112,6 +121,7 @@ _FALLBACK_BASE_MODELS = [
     "gpt-5",
     "gpt-5.1",
     "gpt-5.2",
+    "gpt-5.6-sol",
     "gpt-5.5",
     "gpt-5-codex",
     "gpt-5-codex-mini",
@@ -126,6 +136,7 @@ _FALLBACK_REASONING_EFFORTS = {
     "gpt-5": {"minimal", "low", "medium", "high"},
     "gpt-5.1": {"low", "medium", "high"},
     "gpt-5.2": {"low", "medium", "high", "xhigh"},
+    "gpt-5.6-sol": {"low", "medium", "high", "xhigh", "max", "ultra"},
     "gpt-5.5": {"low", "medium", "high", "xhigh"},
     "gpt-5.4": {"low", "medium", "high", "xhigh"},
     "gpt-5-codex": {"low", "medium", "high"},
@@ -136,11 +147,13 @@ _FALLBACK_REASONING_EFFORTS = {
     "gpt-5.2-codex": {"low", "medium", "high", "xhigh"},
     "gpt-5.3-codex": {"low", "medium", "high", "xhigh"},
 }
-_FALLBACK_FAST_MODELS = {"gpt-5.5", "gpt-5.4"}
+_FALLBACK_FAST_MODELS = {"gpt-5.6-sol", "gpt-5.5", "gpt-5.4"}
 
 # Module-level cache for dynamic model data
 _models_cache: Optional[Dict[str, Any]] = None
 _models_cache_time: float = 0.0
+_models_refresh_lock = threading.Lock()
+_models_refresh_in_progress = False
 
 
 def _fetch_models_from_github() -> Optional[Dict[str, Any]]:
@@ -170,6 +183,7 @@ def _fetch_models_from_github() -> Optional[Dict[str, Any]]:
         reasoning_efforts = {}
         fast_models = set()
         model_limits = {}
+        model_instructions = {}
 
         for m in models_list:
             slug = m.get("slug", "")
@@ -191,6 +205,10 @@ def _fetch_models_from_github() -> Optional[Dict[str, Any]]:
             if "fast" in m.get("additional_speed_tiers", []):
                 fast_models.add(slug)
 
+            base_instructions = m.get("base_instructions")
+            if isinstance(base_instructions, str) and base_instructions.strip():
+                model_instructions[slug] = base_instructions
+
             # Extract reasoning effort levels
             levels = m.get("supported_reasoning_levels", [])
             if levels:
@@ -211,6 +229,7 @@ def _fetch_models_from_github() -> Optional[Dict[str, Any]]:
             "reasoning_efforts": reasoning_efforts,
             "fast_models": fast_models,
             "model_limits": model_limits,
+            "model_instructions": model_instructions,
         }
 
     except Exception as e:
@@ -218,12 +237,47 @@ def _fetch_models_from_github() -> Optional[Dict[str, Any]]:
         return None
 
 
+def _refresh_models_cache() -> None:
+    """Refresh model metadata without blocking request handling."""
+    global _models_cache, _models_cache_time, _models_refresh_in_progress
+
+    try:
+        fetched = _fetch_models_from_github()
+        if fetched is not None:
+            _models_cache = fetched
+        elif _models_cache is not None:
+            lib_logger.info("[Codex] Keeping stale model cache after refresh failure")
+    finally:
+        # A failed refresh must still back off. Otherwise every model lookup starts
+        # another network request while GitHub or cluster DNS is unavailable.
+        _models_cache_time = time.time()
+        with _models_refresh_lock:
+            _models_refresh_in_progress = False
+
+
+def _start_models_refresh() -> None:
+    """Start at most one daemon refresh for stale model metadata."""
+    global _models_refresh_in_progress
+
+    with _models_refresh_lock:
+        if _models_refresh_in_progress:
+            return
+        _models_refresh_in_progress = True
+
+    threading.Thread(
+        target=_refresh_models_cache,
+        name="codex-model-metadata-refresh",
+        daemon=True,
+    ).start()
+
+
 def _get_model_data() -> Dict[str, Any]:
     """
     Get current model data, fetching from GitHub if cache is stale.
 
     Returns dict with 'base_models' and 'reasoning_efforts'.
-    Thread-safe via simple time-based cache check.
+    Stale data is returned immediately while a background refresh runs, so a
+    metadata endpoint outage can never add latency to an inference request.
     """
     global _models_cache, _models_cache_time
 
@@ -234,16 +288,17 @@ def _get_model_data() -> Dict[str, Any]:
     ):
         return _models_cache
 
+    if _models_cache is not None:
+        _start_models_refresh()
+        return _models_cache
+
+    # Import-time initialization has no stale value to serve, so fetch once
+    # synchronously and fall back to the built-in catalog if it fails.
     fetched = _fetch_models_from_github()
     if fetched is not None:
         _models_cache = fetched
         _models_cache_time = now
         return fetched
-
-    # If fetch failed but we have stale cache, keep using it
-    if _models_cache is not None:
-        lib_logger.info("[Codex] Using stale model cache after fetch failure")
-        return _models_cache
 
     # Last resort: use hardcoded fallback
     lib_logger.info("[Codex] Using hardcoded fallback model list")
@@ -252,6 +307,7 @@ def _get_model_data() -> Dict[str, Any]:
         "reasoning_efforts": dict(_FALLBACK_REASONING_EFFORTS),
         "fast_models": set(_FALLBACK_FAST_MODELS),
         "model_limits": {},
+        "model_instructions": {},
     }
     _models_cache = fallback
     _models_cache_time = now
@@ -266,6 +322,15 @@ def _get_base_models() -> List[str]:
 def _get_reasoning_model_efforts() -> Dict[str, set]:
     """Get the current mapping of model -> allowed reasoning effort levels."""
     return _get_model_data()["reasoning_efforts"]
+
+
+def _get_model_instruction(model: str) -> str:
+    """Return the current upstream base instruction for a concrete model."""
+    instructions = _get_model_data().get("model_instructions", {})
+    instruction = instructions.get(model)
+    if isinstance(instruction, str) and instruction.strip():
+        return instruction
+    return CODEX_SYSTEM_INSTRUCTION
 
 
 def _build_available_models() -> list:
@@ -1016,7 +1081,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         payload.setdefault("store", False)
         payload.setdefault("stream", bool(kwargs.get("stream", False)))
         if not payload.get("instructions"):
-            payload["instructions"] = CODEX_SYSTEM_INSTRUCTION
+            payload["instructions"] = _get_model_instruction(normalized_model)
 
         auth_headers = await self.get_auth_header(credential_path)
         account_id = await self.get_account_id(credential_path)
@@ -1125,11 +1190,12 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         )
 
         # Use the caller's system prompt as instructions (e.g. openclaw's system prompt)
-        # Fall back to hardcoded CODEX_SYSTEM_INSTRUCTION only if caller didn't send one
+        # Fall back to the model-specific upstream Codex instruction only if the
+        # caller did not provide its own system/developer instruction.
         if caller_instructions:
             instructions = caller_instructions
         elif INJECT_CODEX_INSTRUCTION:
-            instructions = CODEX_SYSTEM_INSTRUCTION
+            instructions = _get_model_instruction(normalized_model)
         else:
             instructions = None
 
@@ -1171,11 +1237,11 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         }
 
         # The Codex Responses API requires the 'instructions' field — it's non-optional.
-        # Always include it; fall back to the Codex system instruction if nothing else.
+        # Always include it; use the current model instruction if nothing else.
         if not instructions:
-            instructions = CODEX_SYSTEM_INSTRUCTION
+            instructions = _get_model_instruction(normalized_model)
             lib_logger.warning(
-                "[Codex] instructions was empty/None after selection, forcing CODEX_SYSTEM_INSTRUCTION fallback"
+                "[Codex] instructions was empty/None after selection, forcing model instruction fallback"
             )
         payload["instructions"] = instructions
 
@@ -1233,100 +1299,40 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         credential_path: str = "",
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
         """
-        Wrapper around _stream_response that retries on garbled tool calls.
+        Pass Responses API chunks through without destroying streaming latency.
 
-        When the Responses API model intermittently emits tool calls as garbled
-        text content (containing markers like +#+# or to=functions.), this
-        wrapper detects the pattern and retries the entire request.
-
-        Uses a buffer-then-flush approach: all chunks are collected first,
-        then checked for the garbled marker. Only if the stream is clean
-        are chunks yielded to the caller. This allows true retry since
-        no chunks have been sent to the HTTP client yet.
-
-        Detection is done both per-chunk (for early abort) AND on the
-        accumulated text after stream completion (to catch markers that
-        are split across multiple SSE chunks).
+        Once any chunk has reached the caller, retrying the whole response is
+        unsafe because it duplicates already-emitted output. Garbled-output
+        retries therefore remain available for non-streaming requests only.
+        Streaming requests log detection and continue; transport failures before
+        output are still retried by the request executor.
         """
-        for attempt in range(GARBLED_TOOL_CALL_MAX_RETRIES):
-            garbled_detected = False
-            buffered_chunks: list = []
-            accumulated_text = ""  # Track all text content across chunks
+        accumulated_tail = ""
+        garbled_logged = False
 
-            try:
-                async for chunk in self._stream_response(
-                    client, headers, payload, model, reasoning_compat, credential_path
-                ):
-                    # Extract content from this chunk for garble detection
-                    # NOTE: delta is a dict (not an object), so use dict access
-                    chunk_content = ""
-                    if hasattr(chunk, "choices") and chunk.choices:
-                        choice = chunk.choices[0]
-                        delta = getattr(choice, "delta", None)
-                        if delta:
-                            if isinstance(delta, dict):
-                                chunk_content = delta.get("content") or ""
-                            else:
-                                chunk_content = getattr(delta, "content", None) or ""
+        async for chunk in self._stream_response(
+            client, headers, payload, model, reasoning_compat, credential_path
+        ):
+            chunk_content = ""
+            if hasattr(chunk, "choices") and chunk.choices:
+                choice = chunk.choices[0]
+                delta = getattr(choice, "delta", None)
+                if delta:
+                    if isinstance(delta, dict):
+                        chunk_content = delta.get("content") or ""
+                    else:
+                        chunk_content = getattr(delta, "content", None) or ""
 
-                    # Accumulate text for cross-chunk detection
-                    if chunk_content:
-                        accumulated_text += chunk_content
-
-                    # Per-chunk check (catches garble within a single chunk)
-                    if chunk_content and _is_garbled_tool_call(chunk_content):
-                        garbled_detected = True
-                        lib_logger.warning(
-                            f"[Codex] Garbled tool call detected (per-chunk) in stream for {model}, "
-                            f"attempt {attempt + 1}/{GARBLED_TOOL_CALL_MAX_RETRIES}. "
-                            f"Content snippet: {chunk_content[:200]!r}"
-                        )
-                        break  # Stop consuming this stream
-
-                    buffered_chunks.append(chunk)
-
-                # Post-stream check: inspect accumulated text for markers split across chunks
-                if not garbled_detected and _is_garbled_tool_call(accumulated_text):
-                    garbled_detected = True
-                    # Find the garbled portion for logging
-                    snippet_start = max(0, len(accumulated_text) - 200)
+            if chunk_content and not garbled_logged:
+                accumulated_tail = (accumulated_tail + chunk_content)[-512:]
+                if _is_garbled_tool_call(accumulated_tail):
+                    garbled_logged = True
                     lib_logger.warning(
-                        f"[Codex] Garbled tool call detected (accumulated) in stream for {model}, "
-                        f"attempt {attempt + 1}/{GARBLED_TOOL_CALL_MAX_RETRIES}. "
-                        f"Tail of accumulated text: {accumulated_text[snippet_start:]!r}"
+                        f"[Codex] Garbled tool call detected in live stream for {model}; "
+                        "cannot retry after output has been emitted"
                     )
 
-                if not garbled_detected:
-                    # Stream was clean — flush all buffered chunks to caller
-                    for chunk in buffered_chunks:
-                        yield chunk
-                    return  # Done
-
-            except Exception:
-                if garbled_detected:
-                    # Exception during stream teardown after garble detected - continue to retry
-                    pass
-                else:
-                    raise  # Non-garble exception - propagate
-
-            # Garbled stream detected — discard buffer and retry if we have attempts left
-            if attempt < GARBLED_TOOL_CALL_MAX_RETRIES - 1:
-                lib_logger.info(
-                    f"[Codex] Retrying request for {model} after garbled tool call "
-                    f"(attempt {attempt + 2}/{GARBLED_TOOL_CALL_MAX_RETRIES}). "
-                    f"Discarding {len(buffered_chunks)} buffered chunks, "
-                    f"{len(accumulated_text)} chars of accumulated text."
-                )
-                await asyncio.sleep(GARBLED_TOOL_CALL_RETRY_DELAY)
-            else:
-                lib_logger.error(
-                    f"[Codex] Garbled tool call persisted after {GARBLED_TOOL_CALL_MAX_RETRIES} "
-                    f"attempts for {model}. Flushing last attempt's buffer."
-                )
-                # Flush the last attempt's buffer (garbled but better than nothing)
-                for chunk in buffered_chunks:
-                    yield chunk
-                return
+            yield chunk
 
     async def _non_stream_with_retry(
         self,
