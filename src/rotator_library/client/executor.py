@@ -542,6 +542,14 @@ class RequestExecutor:
                     self._log_acquired_credential(
                         cred, model, state, quota_group, availability, usage_manager
                     )
+                    trace = getattr(getattr(context, "request", None), "state", None)
+                    trace = getattr(trace, "llm_trace", None)
+                    if trace:
+                        trace.credential_selected(
+                            resolved_model=model,
+                            provider=provider,
+                            credential_id=cred_context.stable_id,
+                        )
 
                     try:
                         # Prepare request kwargs
@@ -615,6 +623,19 @@ class RequestExecutor:
                                 lib_logger.info(
                                     f"Recorded usage from response object for key {mask_credential(cred)}"
                                 )
+
+                                trace_state = getattr(
+                                    getattr(context, "request", None), "state", None
+                                )
+                                trace = getattr(trace_state, "llm_trace", None)
+                                if trace:
+                                    response_data = (
+                                        response.model_dump()
+                                        if hasattr(response, "model_dump")
+                                        else response
+                                    )
+                                    trace.response(response_data)
+                                    trace.completed()
 
                                 # Log response if transaction logging enabled
                                 if context.transaction_logger:
@@ -762,6 +783,14 @@ class RequestExecutor:
                         self._log_acquired_credential(
                             cred, model, state, quota_group, availability, usage_manager
                         )
+                        trace = getattr(getattr(context, "request", None), "state", None)
+                        trace = getattr(trace, "llm_trace", None)
+                        if trace:
+                            trace.credential_selected(
+                                resolved_model=model,
+                                provider=provider,
+                                credential_id=cred_context.stable_id,
+                            )
 
                         try:
                             # Prepare request kwargs
@@ -853,14 +882,19 @@ class RequestExecutor:
                                         "Processing response."
                                     )
 
-                                    # Wrap with transaction logging if enabled
-                                    if context.transaction_logger:
+                                    trace_state = getattr(
+                                        getattr(context, "request", None), "state", None
+                                    )
+                                    llm_trace = getattr(trace_state, "llm_trace", None)
+                                    # Assemble streams once for enabled file and/or SQLite tracing.
+                                    if context.transaction_logger or llm_trace:
                                         async for (
                                             chunk
                                         ) in self._transaction_logging_stream_wrapper(
                                             base_stream,
                                             context.transaction_logger,
                                             context.kwargs,
+                                            llm_trace,
                                         ):
                                             yield chunk
                                     else:
@@ -1437,8 +1471,9 @@ class RequestExecutor:
     async def _transaction_logging_stream_wrapper(
         self,
         stream: AsyncGenerator[str, None],
-        transaction_logger: TransactionLogger,
+        transaction_logger: Optional[TransactionLogger],
         request_kwargs: Dict[str, Any],
+        llm_trace: Optional[Any] = None,
     ) -> AsyncGenerator[str, None]:
         """
         Wrap a stream to log chunks and final response to TransactionLogger.
@@ -1467,7 +1502,8 @@ class RequestExecutor:
                     if content:
                         chunk_data = json.loads(content)
                         chunks.append(chunk_data)
-                        transaction_logger.log_stream_chunk(chunk_data)
+                        if transaction_logger:
+                            transaction_logger.log_stream_chunk(chunk_data)
                 except json.JSONDecodeError:
                     lib_logger.debug(
                         f"Failed to parse chunk for logging: {sse_line[:100]}"
@@ -1477,7 +1513,11 @@ class RequestExecutor:
         if chunks:
             try:
                 final_response = TransactionLogger.assemble_streaming_response(chunks)
-                transaction_logger.log_response(final_response)
+                if transaction_logger:
+                    transaction_logger.log_response(final_response)
+                if llm_trace:
+                    llm_trace.response(final_response)
+                    llm_trace.completed()
             except Exception as e:
                 lib_logger.debug(
                     f"Failed to assemble/log final streaming response: {e}"

@@ -136,6 +136,14 @@ with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from rotator_library.background_refresher import BackgroundRefresher
     from rotator_library.model_info_service import init_model_info_service
     from proxy_app.request_logger import log_request_to_console
+    from proxy_app.proxy_auth import (
+        ProxyIdentity,
+        bearer_token,
+        is_proxy_key_environment,
+        load_proxy_api_keys,
+        resolve_proxy_identity,
+    )
+    from proxy_app.llm_trace import begin_request as begin_llm_trace
     from proxy_app.batch_manager import EmbeddingBatcher
     from proxy_app.detailed_logger import RawIOLogger
     from proxy_app.responses_adapter import (
@@ -366,13 +374,13 @@ if ENABLE_REQUEST_LOGGING:
     )
 if ENABLE_RAW_LOGGING:
     logging.info("Raw I/O logging is enabled (proxy boundary, unmodified HTTP data).")
-PROXY_API_KEY = os.getenv("PROXY_API_KEY")
-# Note: PROXY_API_KEY validation moved to server startup to allow credential tool to run first
+PROXY_API_KEYS = load_proxy_api_keys()
+# Note: proxy API key validation is optional to preserve open-access deployments.
 
 # Discover API keys from environment variables
 api_keys = {}
 for key, value in os.environ.items():
-    if "_API_KEY" in key and key != "PROXY_API_KEY":
+    if "_API_KEY" in key and not is_proxy_key_environment(key):
         provider = key.split("_API_KEY")[0].lower()
         if provider not in api_keys:
             api_keys[provider] = []
@@ -688,14 +696,19 @@ def get_embedding_batcher(request: Request) -> EmbeddingBatcher:
     return request.app.state.embedding_batcher
 
 
-async def verify_api_key(auth: str = Depends(api_key_header)):
+async def verify_api_key(
+    request: Request, auth: str = Depends(api_key_header)
+) -> ProxyIdentity:
     """Dependency to verify the proxy API key."""
-    # If PROXY_API_KEY is not set or empty, skip verification (open access)
-    if not PROXY_API_KEY:
-        return auth
-    if not auth or auth != f"Bearer {PROXY_API_KEY}":
+    if not PROXY_API_KEYS:
+        identity = ProxyIdentity("anonymous")
+        request.state.proxy_identity = identity
+        return identity
+    identity = resolve_proxy_identity(bearer_token(auth), PROXY_API_KEYS)
+    if identity is None:
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
-    return auth
+    request.state.proxy_identity = identity
+    return identity
 
 
 # --- Anthropic API Key Header ---
@@ -703,20 +716,67 @@ anthropic_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
 
 async def verify_anthropic_api_key(
+    request: Request,
     x_api_key: str = Depends(anthropic_api_key_header),
     auth: str = Depends(api_key_header),
-):
+) -> ProxyIdentity:
     """
     Dependency to verify API key for Anthropic endpoints.
     Accepts either x-api-key header (Anthropic style) or Authorization Bearer (OpenAI style).
     """
-    # Check x-api-key first (Anthropic style)
-    if x_api_key and x_api_key == PROXY_API_KEY:
-        return x_api_key
-    # Fall back to Bearer token (OpenAI style)
-    if auth and auth == f"Bearer {PROXY_API_KEY}":
-        return auth
+    if not PROXY_API_KEYS:
+        identity = ProxyIdentity("anonymous")
+        request.state.proxy_identity = identity
+        return identity
+    identity = resolve_proxy_identity(x_api_key, PROXY_API_KEYS)
+    if identity is None:
+        identity = resolve_proxy_identity(bearer_token(auth), PROXY_API_KEYS)
+    if identity is not None:
+        request.state.proxy_identity = identity
+        return identity
     raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+
+
+def start_llm_trace(request: Request, payload: dict):
+    """Create and attach one content trace for an LLM request."""
+    identity = getattr(request.state, "proxy_identity", ProxyIdentity("anonymous"))
+    trace = begin_llm_trace(
+        request_id=request.headers.get("x-request-id"),
+        session_id=request.headers.get("x-llm-session-id"),
+        proxy_user=identity.user,
+        requested_model=str(payload.get("model") or "unknown"),
+        metadata={"path": request.url.path},
+    )
+    trace.request(payload)
+    request.state.llm_trace = trace
+    return trace
+
+
+async def traced_native_response_stream(request: Request, stream):
+    """Pass through a native Responses stream and retain its terminal response."""
+    trace = getattr(request.state, "llm_trace", None)
+    terminal_response = None
+    try:
+        async for chunk in stream:
+            if isinstance(chunk, str) and chunk.startswith("data: "):
+                raw = chunk[6:].strip()
+                if raw and raw != "[DONE]":
+                    try:
+                        event = json.loads(raw)
+                        if event.get("type") == "response.completed":
+                            terminal_response = event.get("response")
+                    except json.JSONDecodeError:
+                        pass
+            yield chunk
+    except Exception as error:
+        if trace:
+            trace.error(error)
+        raise
+    finally:
+        if trace and not getattr(trace, "_finished", False):
+            if terminal_response:
+                trace.response(terminal_response)
+            trace.completed()
 
 
 async def streaming_response_wrapper(
@@ -750,6 +810,9 @@ async def streaming_response_wrapper(
                         pass
     except Exception as e:
         logging.error(f"An error occurred during the response stream: {e}")
+        trace = getattr(request.state, "llm_trace", None)
+        if trace:
+            trace.error(e)
         # Yield a final error message to the client to ensure they are not left hanging.
         error_payload = {
             "error": {
@@ -889,6 +952,11 @@ async def streaming_response_wrapper(
                 headers=None,  # Headers are not available at this stage
                 body=full_response,
             )
+        trace = getattr(request.state, "llm_trace", None)
+        if trace:
+            if full_response:
+                trace.response(full_response)
+            trace.completed()
 
 
 @app.post("/v1/chat/completions")
@@ -909,6 +977,7 @@ async def chat_completions(
             request_data = await request.json()
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
+        start_llm_trace(request, request_data)
 
         # Global temperature=0 override (controlled by .env variable, default: OFF)
         # Low temperature makes models deterministic and prone to following training data
@@ -1047,6 +1116,10 @@ async def chat_completions(
         raise HTTPException(status_code=502, detail=f"Bad Gateway: {str(e)}")
     except Exception as e:
         logging.error(f"Request failed after all retries: {e}")
+        trace = getattr(request.state, "llm_trace", None)
+        if trace:
+            trace.error(e)
+            trace.completed(status="error")
         # Optionally log the failed request
         if ENABLE_REQUEST_LOGGING:
             try:
@@ -1078,6 +1151,7 @@ async def responses(
             request_data = await request.json()
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
+        start_llm_trace(request, request_data)
 
         if raw_logger:
             raw_logger.log_request(headers=request.headers, body=request_data)
@@ -1096,7 +1170,7 @@ async def responses(
         if native_response is not None:
             if request_data.get("stream", False):
                 return StreamingResponse(
-                    native_response,
+                    traced_native_response_stream(request, native_response),
                     media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache",
@@ -1106,6 +1180,10 @@ async def responses(
                 )
             if raw_logger:
                 raw_logger.log_final_response(status_code=200, headers=None, body=native_response)
+            trace = getattr(request.state, "llm_trace", None)
+            if trace and not getattr(trace, "_finished", False):
+                trace.response(native_response)
+                trace.completed()
             return JSONResponse(content=native_response)
 
         chat_request = responses_to_chat_request(request_data)
@@ -1134,6 +1212,10 @@ async def responses(
         response_data = chat_response_to_responses(chat_response_data, request_data)
         if raw_logger:
             raw_logger.log_final_response(status_code=200, headers=None, body=response_data)
+        trace = getattr(request.state, "llm_trace", None)
+        if trace and not getattr(trace, "_finished", False):
+            trace.response(response_data)
+            trace.completed()
         return JSONResponse(content=response_data)
 
     except (
@@ -1148,6 +1230,10 @@ async def responses(
         raise HTTPException(status_code=429, detail=f"Rate Limit Error: {str(e)}")
     except Exception as e:
         logging.error(f"An unexpected error occurred in /v1/responses: {e}", exc_info=True)
+        trace = getattr(request.state, "llm_trace", None)
+        if trace:
+            trace.error(e)
+            trace.completed(status="error")
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
 
@@ -1175,6 +1261,7 @@ async def anthropic_messages(
             headers=dict(request.headers),
             body=body.model_dump(exclude_none=True),
         )
+    trace = start_llm_trace(request, body.model_dump(exclude_none=True))
 
     try:
         # Log the request to console
@@ -1226,8 +1313,18 @@ async def anthropic_messages(
 
         if body.stream:
             # Streaming response
+            async def traced_anthropic_stream():
+                try:
+                    async for chunk in result:
+                        yield chunk
+                except Exception as stream_error:
+                    trace.error(stream_error)
+                    raise
+                finally:
+                    trace.completed()
+
             return StreamingResponse(
-                result,
+                traced_anthropic_stream(),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -1243,6 +1340,9 @@ async def anthropic_messages(
                     headers=None,
                     body=result,
                 )
+            if not getattr(trace, "_finished", False):
+                trace.response(result)
+                trace.completed()
             return JSONResponse(content=result)
 
     except (
@@ -1281,6 +1381,10 @@ async def anthropic_messages(
         raise HTTPException(status_code=504, detail=error_response)
     except Exception as e:
         logging.error(f"Anthropic messages endpoint error: {e}")
+        trace = getattr(request.state, "llm_trace", None)
+        if trace:
+            trace.error(e)
+            trace.completed(status="error")
         if logger:
             logger.log_final_response(
                 status_code=500,
@@ -1874,8 +1978,8 @@ if __name__ == "__main__":
 
             # After credential tool exits, reload and re-check
             load_dotenv(ENV_FILE, override=True)
-            # Re-read PROXY_API_KEY from environment
-            PROXY_API_KEY = os.getenv("PROXY_API_KEY")
+            # Re-read inbound proxy keys from the updated environment.
+            PROXY_API_KEYS = load_proxy_api_keys()
 
             # Verify onboarding is complete
             if needs_onboarding():
