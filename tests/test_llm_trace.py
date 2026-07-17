@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
-from proxy_app.llm_trace import LLMTraceRecorder
+from proxy_app.llm_trace import LLMTraceRecorder, infer_session_id, normalize_request
 from llm_tail import iter_rows, render_human
 
 
@@ -93,3 +93,26 @@ def test_recorder_is_enabled_by_default_under_usage(monkeypatch, tmp_path):
     recorder.close()
 
     assert (tmp_path / "usage" / "llm-requests.sqlite3").is_file()
+
+
+def test_infers_stable_session_and_emits_only_latest_turn():
+    first = {
+        "model": "alias/gpt",
+        "messages": [{"role": "user", "content": "first question"}],
+    }
+    next_turn = {
+        "model": "alias/gpt",
+        "messages": [
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "tool", "content": "fresh tool result"},
+            {"role": "user", "content": "follow up"},
+        ],
+    }
+
+    assert infer_session_id(first, "alice") == infer_session_id(next_turn, "alice")
+    assert infer_session_id(first, "alice") != infer_session_id(first, "bob")
+    assert [event["content_text"] for event in normalize_request(next_turn)] == [
+        "fresh tool result",
+        "follow up",
+    ]

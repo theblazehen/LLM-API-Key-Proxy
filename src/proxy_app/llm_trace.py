@@ -18,6 +18,7 @@ keys. Message bodies and tool arguments are retained verbatim by design.
 from __future__ import annotations
 
 import atexit
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
@@ -156,14 +157,35 @@ def _event(role: str, event_type: str, content: Any, *, status: str | None = Non
 
 
 def normalize_request(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Normalize OpenAI or Anthropic request bodies into trace event mappings."""
+    """Normalize only the newly submitted tail of a chat request.
+
+    Chat clients normally resend the complete history on every turn. Emitting
+    only messages after the last assistant message avoids replaying old turns
+    in the live tail while retaining new user and tool results.
+    """
     events: list[dict[str, Any]] = []
     system = payload.get("system")
     if system is not None:
         events.append(_event("system", "message", system))
     messages = payload.get("messages")
     if isinstance(messages, list):
-        for message in messages:
+        last_assistant = max(
+            (
+                index
+                for index, message in enumerate(messages)
+                if isinstance(message, Mapping) and message.get("role") == "assistant"
+            ),
+            default=-1,
+        )
+        new_messages = messages[last_assistant + 1 :]
+        # On a fresh request, system instructions are context rather than a turn.
+        if last_assistant < 0:
+            new_messages = [
+                message
+                for message in new_messages
+                if not isinstance(message, Mapping) or message.get("role") != "system"
+            ]
+        for message in new_messages:
             if not isinstance(message, Mapping):
                 events.append(_event("unknown", "message", message))
                 continue
@@ -190,6 +212,39 @@ def normalize_request(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         else:
             events.append(_event("user", "input", input_value))
     return events
+
+
+def infer_session_id(payload: Mapping[str, Any], proxy_user: str | None = None) -> str:
+    """Derive a best-effort stable session ID for stateless chat clients.
+
+    The first user message normally remains unchanged as clients resend chat
+    history. An explicit client session ID should always take precedence.
+    """
+
+    anchor: Any = None
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if isinstance(message, Mapping) and message.get("role") == "user":
+                anchor = message.get("content")
+                break
+    if anchor is None and "input" in payload:
+        input_value = payload.get("input")
+        if isinstance(input_value, list):
+            for item in input_value:
+                if isinstance(item, Mapping) and item.get("role") == "user":
+                    anchor = item.get("content")
+                    break
+        if anchor is None:
+            anchor = input_value
+    material = _json(
+        {
+            "user": proxy_user or "anonymous",
+            "model": payload.get("model"),
+            "anchor": anchor,
+        }
+    ) or ""
+    return "auto-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
 def normalize_response(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -446,5 +501,5 @@ atexit.register(close_recorder)
 
 __all__ = [
     "LLMTraceContext", "LLMTraceRecorder", "begin_request", "close_recorder",
-    "get_recorder", "normalize_request", "normalize_response",
+    "get_recorder", "infer_session_id", "normalize_request", "normalize_response",
 ]

@@ -143,7 +143,10 @@ with _console.status("[dim]Initializing proxy core...", spinner="dots"):
         load_proxy_api_keys,
         resolve_proxy_identity,
     )
-    from proxy_app.llm_trace import begin_request as begin_llm_trace
+    from proxy_app.llm_trace import (
+        begin_request as begin_llm_trace,
+        infer_session_id,
+    )
     from proxy_app.batch_manager import EmbeddingBatcher
     from proxy_app.detailed_logger import RawIOLogger
     from proxy_app.responses_adapter import (
@@ -742,7 +745,8 @@ def start_llm_trace(request: Request, payload: dict):
     identity = getattr(request.state, "proxy_identity", ProxyIdentity("anonymous"))
     trace = begin_llm_trace(
         request_id=request.headers.get("x-request-id"),
-        session_id=request.headers.get("x-llm-session-id"),
+        session_id=request.headers.get("x-llm-session-id")
+        or infer_session_id(payload, identity.user),
         proxy_user=identity.user,
         requested_model=str(payload.get("model") or "unknown"),
         metadata={"path": request.url.path},
