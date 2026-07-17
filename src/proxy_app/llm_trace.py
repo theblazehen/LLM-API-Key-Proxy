@@ -71,6 +71,17 @@ CREATE INDEX IF NOT EXISTS llm_events_request_id ON llm_events(request_id, id);
 CREATE INDEX IF NOT EXISTS llm_events_session_id ON llm_events(session_id, id);
 CREATE INDEX IF NOT EXISTS llm_events_user_id ON llm_events(proxy_user, id);
 CREATE INDEX IF NOT EXISTS llm_events_model_id ON llm_events(resolved_model, requested_model, id);
+CREATE TABLE IF NOT EXISTS llm_session_prefixes (
+    proxy_user TEXT NOT NULL,
+    requested_model TEXT NOT NULL,
+    prefix_hash TEXT NOT NULL,
+    prefix_length INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (proxy_user, requested_model, prefix_hash)
+);
+CREATE INDEX IF NOT EXISTS llm_session_prefixes_updated
+    ON llm_session_prefixes(updated_at DESC);
 """
 _COLUMNS = (
     "request_id", "session_id", "timestamp", "proxy_user", "requested_model",
@@ -78,9 +89,16 @@ _COLUMNS = (
     "content_text", "content_json", "status", "metadata_json",
 )
 _INSERT = f"INSERT INTO llm_events ({','.join(_COLUMNS)}) VALUES ({','.join('?' for _ in _COLUMNS)})"
+_UPSERT_PREFIX = """
+INSERT INTO llm_session_prefixes
+    (proxy_user, requested_model, prefix_hash, prefix_length, session_id, updated_at)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(proxy_user, requested_model, prefix_hash) DO UPDATE SET
+    session_id=excluded.session_id,
+    prefix_length=excluded.prefix_length,
+    updated_at=excluded.updated_at
+"""
 _STOP = object()
-_session_chain_lock = threading.Lock()
-_session_chain: dict[tuple[str, str, str], str] = {}
 
 
 def _utc_now() -> str:
@@ -219,60 +237,39 @@ def normalize_request(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     return events
 
 
-def infer_session_id(payload: Mapping[str, Any], proxy_user: str | None = None) -> str:
-    """Derive a best-effort stable session ID for stateless chat clients.
-
-    The first user message normally remains unchanged as clients resend chat
-    history. An explicit client session ID should always take precedence.
-    """
-
-    user_messages: list[Any] = []
+def _conversation_prefixes(payload: Mapping[str, Any]) -> list[str]:
+    """Return cumulative hashes of canonical ordered conversation messages."""
+    canonical_messages: list[Any] = []
     messages = payload.get("messages")
     if isinstance(messages, list):
         for message in messages:
-            if isinstance(message, Mapping) and message.get("role") == "user":
-                user_messages.append(message.get("content"))
-    if not user_messages and "input" in payload:
+            if isinstance(message, Mapping):
+                if message.get("role") == "system":
+                    continue
+                canonical_messages.append(
+                    {
+                        key: _sanitize(message.get(key))
+                        for key in ("role", "content", "tool_calls", "tool_call_id", "name")
+                        if message.get(key) is not None
+                    }
+                )
+            else:
+                canonical_messages.append(_sanitize(message))
+    elif "input" in payload:
         input_value = payload.get("input")
         if isinstance(input_value, list):
-            for item in input_value:
-                if isinstance(item, Mapping) and item.get("role") == "user":
-                    user_messages.append(item.get("content"))
-        if not user_messages:
-            user_messages.append(input_value)
+            canonical_messages.extend(_sanitize(input_value))
+        else:
+            canonical_messages.append(_sanitize(input_value))
 
-    user = proxy_user or "anonymous"
-    model = str(payload.get("model") or "unknown")
-
-    def content_hash(content: Any) -> str:
-        encoded = (_json(content) or "").encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
-
-    # If history was truncated, the first message is no longer a stable anchor.
-    # Chain from the second-last user message to the session recorded when that
-    # message was the latest turn. This is an in-memory O(1) lookup—never SQLite.
-    session_id: str | None = None
-    if len(user_messages) >= 2:
-        previous_key = (user, model, content_hash(user_messages[-2]))
-        with _session_chain_lock:
-            session_id = _session_chain.get(previous_key)
-
-    anchor = user_messages[0] if user_messages else None
-    material = _json(
-        {
-            "user": user,
-            "model": model,
-            "anchor": anchor,
-        }
-    ) or ""
-    if session_id is None:
-        session_id = "auto-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
-
-    if user_messages:
-        latest_key = (user, model, content_hash(user_messages[-1]))
-        with _session_chain_lock:
-            _session_chain[latest_key] = session_id
-    return session_id
+    digest = hashlib.sha256()
+    prefixes: list[str] = []
+    for message in canonical_messages:
+        encoded = (_json(message) or "null").encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+        prefixes.append(digest.hexdigest())
+    return prefixes
 
 
 def normalize_response(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -342,11 +339,38 @@ class LLMTraceRecorder:
         self._queue: queue.Queue[object] = queue.Queue(maxsize=max(1, queue_size))
         self._closed = False
         self._dropped = 0
+        self._prefix_lock = threading.Lock()
+        self._prefix_sessions: dict[tuple[str, str, str], str] = {}
         self._thread: threading.Thread | None = None
         if self.enabled:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             self._thread = threading.Thread(target=self._writer, name="llm-trace-writer", daemon=True)
             self._thread.start()
+
+    def infer_session_id(
+        self, payload: Mapping[str, Any], proxy_user: str | None = None
+    ) -> str:
+        """Resolve the longest known non-system prefix using memory only."""
+        user = proxy_user or "anonymous"
+        model = str(payload.get("model") or "unknown")
+        prefixes = _conversation_prefixes(payload)
+        session_id = None
+        with self._prefix_lock:
+            for prefix_hash in reversed(prefixes):
+                session_id = self._prefix_sessions.get((user, model, prefix_hash))
+                if session_id is not None:
+                    break
+        if session_id is None:
+            seed = prefixes[0] if prefixes else uuid.uuid4().hex
+            material = f"{user}\0{model}\0{seed}".encode("utf-8")
+            session_id = "auto-" + hashlib.sha256(material).hexdigest()[:16]
+
+        if prefixes:
+            with self._prefix_lock:
+                for prefix_hash in prefixes:
+                    self._prefix_sessions[(user, model, prefix_hash)] = session_id
+            self._put(("prefixes", user, model, session_id, tuple(prefixes)))
+        return session_id
 
     @property
     def dropped_events(self) -> int:
@@ -406,13 +430,20 @@ class LLMTraceRecorder:
             connection.execute("PRAGMA synchronous=NORMAL")
             connection.execute("PRAGMA busy_timeout=5000")
             connection.executescript(_SCHEMA)
+            rows = connection.execute(
+                "SELECT proxy_user, requested_model, prefix_hash, session_id "
+                "FROM llm_session_prefixes ORDER BY prefix_length"
+            )
+            with self._prefix_lock:
+                for user, model, prefix_hash, session_id in rows:
+                    self._prefix_sessions[(user, model, prefix_hash)] = session_id
             connection.commit()
             while True:
                 item = self._queue.get()
                 try:
                     if item is _STOP:
                         break
-                    connection.execute(_INSERT, item)  # type: ignore[arg-type]
+                    self._write_item(connection, item)
                     # Drain a batch to reduce fsync/lock churn.
                     while True:
                         try:
@@ -423,7 +454,7 @@ class LLMTraceRecorder:
                             self._queue.task_done()
                             connection.commit()
                             return
-                        connection.execute(_INSERT, extra)  # type: ignore[arg-type]
+                        self._write_item(connection, extra)
                         self._queue.task_done()
                     connection.commit()
                 finally:
@@ -431,6 +462,21 @@ class LLMTraceRecorder:
         finally:
             connection.commit()
             connection.close()
+
+    @staticmethod
+    def _write_item(connection: sqlite3.Connection, item: object) -> None:
+        if isinstance(item, tuple) and item and item[0] == "prefixes":
+            _, user, model, session_id, prefixes = item
+            timestamp = _utc_now()
+            connection.executemany(
+                _UPSERT_PREFIX,
+                (
+                    (user, model, prefix_hash, length, session_id, timestamp)
+                    for length, prefix_hash in enumerate(prefixes, start=1)
+                ),
+            )
+            return
+        connection.execute(_INSERT, item)  # type: ignore[arg-type]
 
 
 @dataclass(slots=True)
@@ -529,5 +575,5 @@ atexit.register(close_recorder)
 
 __all__ = [
     "LLMTraceContext", "LLMTraceRecorder", "begin_request", "close_recorder",
-    "get_recorder", "infer_session_id", "normalize_request", "normalize_response",
+    "get_recorder", "normalize_request", "normalize_response",
 ]

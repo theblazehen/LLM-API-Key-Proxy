@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
-from proxy_app.llm_trace import LLMTraceRecorder, infer_session_id, normalize_request
+from proxy_app.llm_trace import LLMTraceRecorder, normalize_request
 from llm_tail import iter_rows, render_human
 
 
@@ -95,7 +95,7 @@ def test_recorder_is_enabled_by_default_under_usage(monkeypatch, tmp_path):
     assert (tmp_path / "usage" / "llm-requests.sqlite3").is_file()
 
 
-def test_infers_stable_session_and_emits_only_latest_turn():
+def test_emits_only_latest_turn():
     first = {
         "model": "alias/gpt",
         "messages": [{"role": "user", "content": "first question"}],
@@ -110,8 +110,6 @@ def test_infers_stable_session_and_emits_only_latest_turn():
         ],
     }
 
-    assert infer_session_id(first, "alice") == infer_session_id(next_turn, "alice")
-    assert infer_session_id(first, "alice") != infer_session_id(first, "bob")
     assert [event["content_text"] for event in normalize_request(next_turn)] == [
         "fresh tool result",
         "follow up",
@@ -141,11 +139,16 @@ def test_anthropic_system_prompt_is_not_replayed_after_first_turn():
     ]
 
 
-def test_session_chain_survives_truncated_early_history():
-    model = "chain-test-model"
+def test_longest_prefix_links_forks_and_persists_across_restart(tmp_path):
+    model = "prefix-test-model"
+    db = tmp_path / "prefixes.sqlite3"
+    recorder = LLMTraceRecorder(db, enabled=True)
     first = {
         "model": model,
-        "messages": [{"role": "user", "content": "original anchor"}],
+        "messages": [
+            {"role": "system", "content": "shared coding-agent prompt"},
+            {"role": "user", "content": "original anchor"},
+        ],
     }
     second = {
         "model": model,
@@ -155,15 +158,34 @@ def test_session_chain_survives_truncated_early_history():
             {"role": "user", "content": "second user turn"},
         ],
     }
-    truncated_third = {
+    fork = {
         "model": model,
         "messages": [
-            {"role": "user", "content": "second user turn"},
-            {"role": "assistant", "content": "another answer"},
-            {"role": "user", "content": "third user turn"},
+            {"role": "system", "content": "shared coding-agent prompt"},
+            {"role": "user", "content": "original anchor"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "forked user turn"},
         ],
     }
 
-    session_id = infer_session_id(first, "chain-user")
-    assert infer_session_id(second, "chain-user") == session_id
-    assert infer_session_id(truncated_third, "chain-user") == session_id
+    session_id = recorder.infer_session_id(first, "prefix-user")
+    assert recorder.infer_session_id(second, "prefix-user") == session_id
+    assert recorder.infer_session_id(fork, "prefix-user") == session_id
+    assert recorder.flush()
+    recorder.close()
+
+    restarted = LLMTraceRecorder(db, enabled=True)
+    deadline = __import__("time").monotonic() + 2
+    while not restarted._prefix_sessions and __import__("time").monotonic() < deadline:
+        __import__("time").sleep(0.01)
+    assert restarted.infer_session_id(second, "prefix-user") == session_id
+
+    unrelated = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "shared coding-agent prompt"},
+            {"role": "user", "content": "different chat"},
+        ],
+    }
+    assert restarted.infer_session_id(unrelated, "prefix-user") != session_id
+    restarted.close()
