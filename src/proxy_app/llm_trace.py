@@ -79,6 +79,8 @@ _COLUMNS = (
 )
 _INSERT = f"INSERT INTO llm_events ({','.join(_COLUMNS)}) VALUES ({','.join('?' for _ in _COLUMNS)})"
 _STOP = object()
+_session_chain_lock = threading.Lock()
+_session_chain: dict[tuple[str, str, str], str] = {}
 
 
 def _utc_now() -> str:
@@ -224,30 +226,53 @@ def infer_session_id(payload: Mapping[str, Any], proxy_user: str | None = None) 
     history. An explicit client session ID should always take precedence.
     """
 
-    anchor: Any = None
+    user_messages: list[Any] = []
     messages = payload.get("messages")
     if isinstance(messages, list):
         for message in messages:
             if isinstance(message, Mapping) and message.get("role") == "user":
-                anchor = message.get("content")
-                break
-    if anchor is None and "input" in payload:
+                user_messages.append(message.get("content"))
+    if not user_messages and "input" in payload:
         input_value = payload.get("input")
         if isinstance(input_value, list):
             for item in input_value:
                 if isinstance(item, Mapping) and item.get("role") == "user":
-                    anchor = item.get("content")
-                    break
-        if anchor is None:
-            anchor = input_value
+                    user_messages.append(item.get("content"))
+        if not user_messages:
+            user_messages.append(input_value)
+
+    user = proxy_user or "anonymous"
+    model = str(payload.get("model") or "unknown")
+
+    def content_hash(content: Any) -> str:
+        encoded = (_json(content) or "").encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    # If history was truncated, the first message is no longer a stable anchor.
+    # Chain from the second-last user message to the session recorded when that
+    # message was the latest turn. This is an in-memory O(1) lookup—never SQLite.
+    session_id: str | None = None
+    if len(user_messages) >= 2:
+        previous_key = (user, model, content_hash(user_messages[-2]))
+        with _session_chain_lock:
+            session_id = _session_chain.get(previous_key)
+
+    anchor = user_messages[0] if user_messages else None
     material = _json(
         {
-            "user": proxy_user or "anonymous",
-            "model": payload.get("model"),
+            "user": user,
+            "model": model,
             "anchor": anchor,
         }
     ) or ""
-    return "auto-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+    if session_id is None:
+        session_id = "auto-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+    if user_messages:
+        latest_key = (user, model, content_hash(user_messages[-1]))
+        with _session_chain_lock:
+            _session_chain[latest_key] = session_id
+    return session_id
 
 
 def normalize_response(payload: Mapping[str, Any]) -> list[dict[str, Any]]:

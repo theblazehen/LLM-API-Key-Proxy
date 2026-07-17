@@ -139,3 +139,31 @@ def test_anthropic_system_prompt_is_not_replayed_after_first_turn():
     assert [event["content_text"] for event in normalize_request(next_turn)] == [
         "follow up"
     ]
+
+
+def test_session_chain_survives_truncated_early_history():
+    model = "chain-test-model"
+    first = {
+        "model": model,
+        "messages": [{"role": "user", "content": "original anchor"}],
+    }
+    second = {
+        "model": model,
+        "messages": [
+            {"role": "user", "content": "original anchor"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "second user turn"},
+        ],
+    }
+    truncated_third = {
+        "model": model,
+        "messages": [
+            {"role": "user", "content": "second user turn"},
+            {"role": "assistant", "content": "another answer"},
+            {"role": "user", "content": "third user turn"},
+        ],
+    }
+
+    session_id = infer_session_id(first, "chain-user")
+    assert infer_session_id(second, "chain-user") == session_id
+    assert infer_session_id(truncated_third, "chain-user") == session_id
