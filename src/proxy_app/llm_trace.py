@@ -164,9 +164,6 @@ def normalize_request(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     in the live tail while retaining new user and tool results.
     """
     events: list[dict[str, Any]] = []
-    system = payload.get("system")
-    if system is not None:
-        events.append(_event("system", "message", system))
     messages = payload.get("messages")
     if isinstance(messages, list):
         last_assistant = max(
@@ -177,6 +174,12 @@ def normalize_request(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
             ),
             default=-1,
         )
+        # Anthropic sends its top-level system prompt again with every turn.
+        # Emit it only before any assistant history exists to avoid replaying
+        # large or sensitive instructions in the live tail.
+        system = payload.get("system")
+        if system is not None and last_assistant < 0:
+            events.append(_event("system", "message", system))
         new_messages = messages[last_assistant + 1 :]
         # On a fresh request, system instructions are context rather than a turn.
         if last_assistant < 0:

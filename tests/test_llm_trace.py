@@ -116,3 +116,26 @@ def test_infers_stable_session_and_emits_only_latest_turn():
         "fresh tool result",
         "follow up",
     ]
+
+
+def test_anthropic_system_prompt_is_not_replayed_after_first_turn():
+    first_turn = {
+        "system": "large private instructions",
+        "messages": [{"role": "user", "content": "first question"}],
+    }
+    next_turn = {
+        "system": "large private instructions",
+        "messages": [
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "follow up"},
+        ],
+    }
+
+    assert [event["content_text"] for event in normalize_request(first_turn)] == [
+        "large private instructions",
+        "first question",
+    ]
+    assert [event["content_text"] for event in normalize_request(next_turn)] == [
+        "follow up"
+    ]
