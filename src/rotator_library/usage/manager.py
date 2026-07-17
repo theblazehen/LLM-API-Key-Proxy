@@ -1803,6 +1803,49 @@ class UsageManager:
 
         return False
 
+    async def clear_quota_group_state(
+        self,
+        accessor: str,
+        quota_group: str,
+        *,
+        remove_usage: bool = True,
+    ) -> bool:
+        """Clear provider-authoritative state for a quota group.
+
+        Quota APIs may stop returning a previously advertised window.  In that
+        case retaining its snapshot, cooldown, or fair-cycle exhaustion makes
+        the credential look limited after the upstream limit has disappeared.
+        """
+        stable_id = self._registry.get_stable_id(accessor, self.provider)
+        state = self._states.get(stable_id)
+        if not state:
+            return False
+
+        changed = False
+        async with self._lock:
+            if remove_usage and quota_group in state.group_usage:
+                del state.group_usage[quota_group]
+                changed = True
+            if quota_group in state.cooldowns:
+                del state.cooldowns[quota_group]
+                changed = True
+            fair_cycle = state.fair_cycle.get(quota_group)
+            if fair_cycle and (
+                fair_cycle.exhausted
+                or fair_cycle.exhausted_at is not None
+                or fair_cycle.exhausted_reason is not None
+                or fair_cycle.cycle_request_count
+            ):
+                fair_cycle.exhausted = False
+                fair_cycle.exhausted_at = None
+                fair_cycle.exhausted_reason = None
+                fair_cycle.cycle_request_count = 0
+                changed = True
+
+        if changed:
+            await self._save_if_needed()
+        return changed
+
     def _apply_quota_update(
         self,
         window: WindowStats,

@@ -529,3 +529,55 @@ def test_codex_percent_quota_snapshots_are_exposed_in_group_stats_without_reques
         )
         assert {field: window[field] for field in expected} == expected
         assert window["request_count"] == 0
+
+
+def test_codex_weekly_primary_replaces_removed_short_window_and_resets_stale_state():
+    credential = "/credentials/codex-account.json"
+    weekly_reset = 1_800_604_800
+
+    async def refresh_and_get_stats():
+        manager = UsageManager(provider="codex")
+        await manager.initialize([credential])
+        provider = CodexProvider()
+
+        state = next(iter(manager._states.values()))
+        state.get_group_stats("5h-limit")
+        state.get_group_stats("weekly-limit")
+        from rotator_library.usage.types import FairCycleState
+
+        global_cycle = FairCycleState(model_or_group="codex-global")
+        state.fair_cycle["codex-global"] = global_cycle
+        global_cycle.exhausted = True
+        global_cycle.exhausted_reason = "quota_exceeded"
+
+        stored = await provider._store_baselines_to_usage_manager(
+            {
+                credential: {
+                    "status": "success",
+                    "primary": {
+                        "used_percent": 47.0,
+                        "remaining_percent": 53.0,
+                        "remaining_fraction": 0.53,
+                        "window_minutes": 10_080,
+                        "reset_at": weekly_reset,
+                        "is_exhausted": False,
+                    },
+                    "secondary": None,
+                }
+            },
+            manager,
+            force=True,
+        )
+        return stored, await manager.get_stats_for_endpoint()
+
+    stored, stats = asyncio.run(refresh_and_get_stats())
+
+    assert stored == 1
+    credential_stats = next(iter(stats["credentials"].values()))
+    assert "5h-limit" not in credential_stats["group_usage"]
+    weekly = next(
+        iter(credential_stats["group_usage"]["weekly-limit"]["windows"].values())
+    )
+    assert weekly["window_minutes"] == 10_080
+    assert weekly["used_percent"] == 47.0
+    assert credential_stats["fair_cycle"]["codex-global"]["exhausted"] is False

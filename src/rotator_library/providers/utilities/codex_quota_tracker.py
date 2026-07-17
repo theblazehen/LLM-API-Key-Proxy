@@ -8,8 +8,8 @@ Provides quota tracking functionality for the Codex provider by:
 3. Storing quota baselines in UsageManager
 
 Rate Limit Structure (from Codex API):
-- Primary window: Short-term rate limit (e.g., 5 hours)
-- Secondary window: Long-term rate limit (e.g., weekly/monthly)
+- Primary/secondary are positional fields, not stable window identities.
+- Window duration determines whether a limit is short-term or weekly.
 - Credits: Account credit balance info
 
 Required from provider:
@@ -81,6 +81,10 @@ DEFAULT_QUOTA_REFRESH_INTERVAL = 300
 
 # Stale threshold - quota data older than this is considered stale (15 minutes)
 QUOTA_STALE_THRESHOLD_SECONDS = 900
+
+# Upstream currently uses a seven-day window for the weekly account limit.
+# It may appear in either the primary or secondary payload position.
+WEEKLY_WINDOW_MINUTES = 7 * 24 * 60
 
 
 # =============================================================================
@@ -154,6 +158,22 @@ def _window_to_dict(window: RateLimitWindow) -> Dict[str, Any]:
         "reset_in_seconds": window.seconds_until_reset(),
         "is_exhausted": window.is_exhausted,
     }
+
+
+def _classify_quota_windows(*windows: Any) -> Dict[str, Any]:
+    """Classify positional upstream windows by their advertised duration."""
+    classified: Dict[str, Any] = {}
+    for window in windows:
+        if not window:
+            continue
+        minutes = (
+            window.get("window_minutes")
+            if isinstance(window, dict)
+            else window.window_minutes
+        )
+        group = "weekly-limit" if minutes == WEEKLY_WINDOW_MINUTES else "5h-limit"
+        classified[group] = window
+    return classified
 
 
 def _credits_to_dict(credits: CreditsInfo) -> Dict[str, Any]:
@@ -518,6 +538,7 @@ class CodexQuotaTracker:
         """
         if not self._usage_manager:
             return
+        usage_manager = self._usage_manager
 
         provider_prefix = getattr(self, "provider_env_name", "codex")
 
@@ -537,55 +558,55 @@ class CodexQuotaTracker:
                 # to block credentials once local request_count crosses 100.
                 # Exhaustion is signalled via apply_exhaustion=is_exhausted,
                 # which applies a cooldown until reset_at.
-                if snapshot.primary:
-                    await self._usage_manager.update_quota_baseline(
-                        accessor=credential_path,
-                        model=f"{provider_prefix}/_5h_window",
-                        quota_reset_ts=snapshot.primary.reset_at,
-                        quota_group="5h-limit",
-                        force=True,
-                        apply_exhaustion=snapshot.primary.is_exhausted,
-                        quota_used_percent=snapshot.primary.used_percent,
-                        quota_remaining_percent=snapshot.primary.remaining_percent,
-                        quota_window_minutes=snapshot.primary.window_minutes,
-                        quota_source="codex",
-                    )
-                    await self._usage_manager.update_quota_baseline(
-                        accessor=credential_path,
-                        model=f"{provider_prefix}/_global_quota",
-                        quota_reset_ts=snapshot.primary.reset_at,
-                        quota_group="codex-global",
-                        force=True,
-                        apply_exhaustion=False,  # Exhaustion handled by 5h-limit
-                    )
-                    if not snapshot.primary.is_exhausted:
-                        await self._usage_manager.clear_cooldown_if_exists(
-                            accessor=credential_path,
-                            model_or_group="5h-limit",
-                        )
-                        await self._usage_manager.clear_cooldown_if_exists(
-                            accessor=credential_path,
-                            model_or_group="codex-global",
-                        )
+                windows = _classify_quota_windows(snapshot.primary, snapshot.secondary)
+                short_window = windows.get("5h-limit")
+                weekly_window = windows.get("weekly-limit")
 
-                if snapshot.secondary:
-                    await self._usage_manager.update_quota_baseline(
-                        accessor=credential_path,
-                        model=f"{provider_prefix}/_weekly_window",
-                        quota_reset_ts=snapshot.secondary.reset_at,
-                        quota_group="weekly-limit",
-                        force=True,
-                        apply_exhaustion=snapshot.secondary.is_exhausted,
-                        quota_used_percent=snapshot.secondary.used_percent,
-                        quota_remaining_percent=snapshot.secondary.remaining_percent,
-                        quota_window_minutes=snapshot.secondary.window_minutes,
-                        quota_source="codex",
-                    )
-                    if not snapshot.secondary.is_exhausted:
-                        await self._usage_manager.clear_cooldown_if_exists(
-                            accessor=credential_path,
-                            model_or_group="weekly-limit",
-                        )
+                if short_window:
+                    await usage_manager.update_quota_baseline(accessor=credential_path,
+                    model=f"{provider_prefix}/_5h_window",
+                    quota_reset_ts=short_window.reset_at,
+                    quota_group="5h-limit",
+                    force=True,
+                    apply_exhaustion=short_window.is_exhausted,
+                    quota_used_percent=short_window.used_percent,
+                    quota_remaining_percent=short_window.remaining_percent,
+                    quota_window_minutes=short_window.window_minutes,
+                    quota_source="codex",)
+                    if not short_window.is_exhausted:
+                        await usage_manager.clear_cooldown_if_exists(accessor=credential_path,
+                        model_or_group="5h-limit",)
+                else:
+                    await usage_manager.clear_quota_group_state(credential_path, "5h-limit")
+
+                if weekly_window:
+                    await usage_manager.update_quota_baseline(accessor=credential_path,
+                    model=f"{provider_prefix}/_weekly_window",
+                    quota_reset_ts=weekly_window.reset_at,
+                    quota_group="weekly-limit",
+                    force=True,
+                    apply_exhaustion=weekly_window.is_exhausted,
+                    quota_used_percent=weekly_window.used_percent,
+                    quota_remaining_percent=weekly_window.remaining_percent,
+                    quota_window_minutes=weekly_window.window_minutes,
+                    quota_source="codex",)
+                    if not weekly_window.is_exhausted:
+                        await usage_manager.clear_cooldown_if_exists(accessor=credential_path,
+                        model_or_group="weekly-limit",)
+                else:
+                    await usage_manager.clear_quota_group_state(credential_path, "weekly-limit")
+
+                authoritative_window = short_window or weekly_window
+                if authoritative_window:
+                    await usage_manager.update_quota_baseline(accessor=credential_path,
+                    model=f"{provider_prefix}/_global_quota",
+                    quota_reset_ts=authoritative_window.reset_at,
+                    quota_group="codex-global",
+                    force=True,
+                    apply_exhaustion=False,)
+                    await usage_manager.clear_cooldown_if_exists(accessor=credential_path,
+                    model_or_group="codex-global",)
+                    await usage_manager.clear_quota_group_state(credential_path, "codex-global", remove_usage=False)
             except Exception as e:
                 lib_logger.debug(f"Failed to push Codex quota to UsageManager: {e}")
 
@@ -898,9 +919,14 @@ class CodexQuotaTracker:
             if quota_data.get("status") != "success":
                 continue
 
-            # Get remaining fraction from primary and secondary windows
+            # Upstream field positions are not stable identities. During the
+            # temporary removal of the 5-hour restriction, the weekly window
+            # moved into primary and secondary became null.
             primary = quota_data.get("primary")
             secondary = quota_data.get("secondary")
+            windows = _classify_quota_windows(primary, secondary)
+            short_window = windows.get("5h-limit")
+            weekly_window = windows.get("weekly-limit")
 
             # Short credential name for logging
             if cred_path.startswith("env://"):
@@ -912,10 +938,10 @@ class CodexQuotaTracker:
             # We only store reset_at + apply_exhaustion so the UsageManager
             # can cooldown an exhausted window without treating the 0-100
             # percent scale as a literal request cap.
-            if primary:
-                primary_remaining = primary.get("remaining_fraction", 1.0)
-                primary_reset = primary.get("reset_at")
-                is_exhausted = primary.get("is_exhausted", False)
+            if short_window:
+                primary_remaining = short_window.get("remaining_fraction", 1.0)
+                primary_reset = short_window.get("reset_at")
+                is_exhausted = short_window.get("is_exhausted", False)
                 try:
                     await usage_manager.update_quota_baseline(
                         accessor=cred_path,
@@ -924,27 +950,15 @@ class CodexQuotaTracker:
                         quota_group="5h-limit",
                         force=force,
                         apply_exhaustion=is_exhausted and is_initial_fetch,
-                        quota_used_percent=primary.get("used_percent"),
-                        quota_remaining_percent=primary.get("remaining_percent"),
-                        quota_window_minutes=primary.get("window_minutes"),
+                        quota_used_percent=short_window.get("used_percent"),
+                        quota_remaining_percent=short_window.get("remaining_percent"),
+                        quota_window_minutes=short_window.get("window_minutes"),
                         quota_source="codex",
-                    )
-                    await usage_manager.update_quota_baseline(
-                        accessor=cred_path,
-                        model=f"{provider_prefix}/_global_quota",
-                        quota_reset_ts=primary_reset,
-                        quota_group="codex-global",
-                        force=force,
-                        apply_exhaustion=False,  # Exhaustion handled by 5h-limit
                     )
                     if not is_exhausted:
                         await usage_manager.clear_cooldown_if_exists(
                             accessor=cred_path,
                             model_or_group="5h-limit",
-                        )
-                        await usage_manager.clear_cooldown_if_exists(
-                            accessor=cred_path,
-                            model_or_group="codex-global",
                         )
                     stored_count += 1
                     lib_logger.debug(
@@ -955,11 +969,13 @@ class CodexQuotaTracker:
                     lib_logger.warning(
                         f"Failed to store Codex 5h baseline for {short_cred}: {e}"
                     )
+            else:
+                await usage_manager.clear_quota_group_state(cred_path, "5h-limit")
 
-            if secondary:
-                secondary_remaining = secondary.get("remaining_fraction", 1.0)
-                secondary_reset = secondary.get("reset_at")
-                is_exhausted = secondary.get("is_exhausted", False)
+            if weekly_window:
+                secondary_remaining = weekly_window.get("remaining_fraction", 1.0)
+                secondary_reset = weekly_window.get("reset_at")
+                is_exhausted = weekly_window.get("is_exhausted", False)
                 try:
                     await usage_manager.update_quota_baseline(
                         accessor=cred_path,
@@ -968,9 +984,9 @@ class CodexQuotaTracker:
                         quota_group="weekly-limit",
                         force=force,
                         apply_exhaustion=is_exhausted and is_initial_fetch,
-                        quota_used_percent=secondary.get("used_percent"),
-                        quota_remaining_percent=secondary.get("remaining_percent"),
-                        quota_window_minutes=secondary.get("window_minutes"),
+                        quota_used_percent=weekly_window.get("used_percent"),
+                        quota_remaining_percent=weekly_window.get("remaining_percent"),
+                        quota_window_minutes=weekly_window.get("window_minutes"),
                         quota_source="codex",
                     )
                     if not is_exhausted:
@@ -987,6 +1003,25 @@ class CodexQuotaTracker:
                     lib_logger.warning(
                         f"Failed to store Codex weekly baseline for {short_cred}: {e}"
                     )
+            else:
+                await usage_manager.clear_quota_group_state(cred_path, "weekly-limit")
+
+            authoritative_window = short_window or weekly_window
+            if authoritative_window:
+                await usage_manager.update_quota_baseline(
+                    accessor=cred_path,
+                    model=f"{provider_prefix}/_global_quota",
+                    quota_reset_ts=authoritative_window.get("reset_at"),
+                    quota_group="codex-global",
+                    force=force,
+                    apply_exhaustion=False,
+                )
+                await usage_manager.clear_cooldown_if_exists(
+                    accessor=cred_path, model_or_group="codex-global"
+                )
+                await usage_manager.clear_quota_group_state(
+                    cred_path, "codex-global", remove_usage=False
+                )
 
         return stored_count
 

@@ -930,8 +930,8 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
     # across all models, since they share the same per-account rate limits.
     # NOTE: codex-global is populated dynamically in __init__ to pick up latest models.
     model_quota_groups: QuotaGroupMap = {
-        "5h-limit": ["_5h_window"],  # Primary window (5 hour rolling)
-        "weekly-limit": ["_weekly_window"],  # Secondary window (weekly)
+        "5h-limit": ["_5h_window"],  # Present only when upstream advertises it
+        "weekly-limit": ["_weekly_window"],
         "codex-global": list(
             AVAILABLE_MODELS
         ),  # Populated at import, refreshed in __init__
