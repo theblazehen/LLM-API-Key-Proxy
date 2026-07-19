@@ -51,6 +51,7 @@ console = Console()
 # OpenAI OAuth endpoints
 OPENAI_AUTH_URL = "https://auth.openai.com/oauth/authorize"
 OPENAI_TOKEN_URL = "https://auth.openai.com/oauth/token"
+OPENAI_ISSUER_URL = "https://auth.openai.com"
 
 # Default OAuth callback port for local redirect server
 DEFAULT_OAUTH_CALLBACK_PORT: int = 1455
@@ -176,6 +177,21 @@ class OpenAIOAuthBase:
     REFRESH_EXPIRY_BUFFER_SECONDS: int = DEFAULT_REFRESH_EXPIRY_BUFFER
 
     @property
+    def oauth_login_method(self) -> str:
+        """Select browser or device-code login for interactive authentication."""
+        value = os.getenv(f"{self.ENV_PREFIX}_OAUTH_LOGIN_METHOD", "auto").strip().lower()
+        if value not in {"auto", "browser", "device"}:
+            lib_logger.warning(
+                "Invalid %s_OAUTH_LOGIN_METHOD=%r; using auto",
+                self.ENV_PREFIX,
+                value,
+            )
+            value = "auto"
+        if value == "auto":
+            return "device" if is_headless_environment() else "browser"
+        return value
+
+    @property
     def callback_port(self) -> int:
         """
         Get the OAuth callback port, checking environment variable first.
@@ -209,7 +225,9 @@ class OpenAIOAuthBase:
         # Tracking sets
         self._queued_credentials: set = set()
         self._unavailable_credentials: Dict[str, float] = {}
-        self._unavailable_ttl_seconds: int = 360
+        # Device authorization can legitimately take up to 15 minutes. Keep a
+        # credential out of rotation for longer than that while re-auth runs.
+        self._unavailable_ttl_seconds: int = 20 * 60
         self._queue_tracking_lock = asyncio.Lock()
         self._queue_retry_count: Dict[str, int] = {}
 
@@ -217,7 +235,7 @@ class OpenAIOAuthBase:
         self._refresh_timeout_seconds: int = 15
         self._refresh_interval_seconds: int = 30
         self._refresh_max_retries: int = 3
-        self._reauth_timeout_seconds: int = 300
+        self._reauth_timeout_seconds: int = 16 * 60
 
     def _parse_env_credential_path(self, path: str) -> Optional[str]:
         """Parse a virtual env:// path and return the credential index."""
@@ -675,12 +693,13 @@ class OpenAIOAuthBase:
                     lib_logger.info(f"Starting re-auth for '{Path(path).name}'...")
                     await self.initialize_token(path, force_interactive=True)
                     lib_logger.info(f"Re-auth SUCCESS for '{Path(path).name}'")
+                    async with self._queue_tracking_lock:
+                        self._unavailable_credentials.pop(path, None)
                 except Exception as e:
                     lib_logger.error(f"Re-auth FAILED for '{Path(path).name}': {e}")
                 finally:
                     async with self._queue_tracking_lock:
                         self._queued_credentials.discard(path)
-                        self._unavailable_credentials.pop(path, None)
                     self._reauth_queue.task_done()
 
             except asyncio.CancelledError:
@@ -703,6 +722,9 @@ class OpenAIOAuthBase:
         Perform interactive OAuth flow (browser-based authentication).
         Uses PKCE flow for OpenAI.
         """
+        if self.oauth_login_method == "device":
+            return await self._perform_device_code_oauth(path, display_name)
+
         is_headless = is_headless_environment()
 
         # Generate PKCE codes
@@ -898,6 +920,138 @@ class OpenAIOAuthBase:
 
             return new_creds
 
+    async def _perform_device_code_oauth(
+        self, path: str, display_name: str
+    ) -> Dict[str, Any]:
+        """Authenticate with the device-code flow used by the Codex CLI."""
+        issuer = OPENAI_ISSUER_URL.rstrip("/")
+        accounts_url = f"{issuer}/api/accounts"
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{accounts_url}/deviceauth/usercode",
+                json={"client_id": self.CLIENT_ID},
+                timeout=30.0,
+            )
+            if response.status_code == 404:
+                raise ValueError(
+                    "Device-code login is not enabled by the OpenAI authentication server"
+                )
+            response.raise_for_status()
+            device_data = response.json()
+
+            device_auth_id = device_data.get("device_auth_id")
+            user_code = device_data.get("user_code") or device_data.get("usercode")
+            if not device_auth_id or not user_code:
+                raise ValueError("Device-code response omitted the device ID or user code")
+            try:
+                interval = max(1, int(str(device_data.get("interval", "5")).strip()))
+            except ValueError:
+                interval = 5
+
+            verification_url = f"{issuer}/codex/device"
+            console.print(
+                Panel(
+                    "Open the link below, sign in, and enter the one-time code.\n\n"
+                    f"[bold]URL:[/bold] [link={verification_url}]"
+                    f"{rich_escape(verification_url)}[/link]\n"
+                    f"[bold]Code:[/bold] [cyan]{rich_escape(str(user_code))}[/cyan]\n\n"
+                    "Only continue if you started this login from the proxy.",
+                    title=f"{self.ENV_PREFIX} Device Login for [bold yellow]{display_name}[/bold yellow]",
+                    style="bold blue",
+                )
+            )
+
+            deadline = time.monotonic() + 15 * 60
+            code_data: Optional[Dict[str, Any]] = None
+            while time.monotonic() < deadline:
+                poll = await client.post(
+                    f"{accounts_url}/deviceauth/token",
+                    json={
+                        "device_auth_id": device_auth_id,
+                        "user_code": user_code,
+                    },
+                    timeout=30.0,
+                )
+                if poll.is_success:
+                    code_data = poll.json()
+                    break
+                if poll.status_code not in (403, 404):
+                    poll.raise_for_status()
+                await asyncio.sleep(min(interval, max(0, deadline - time.monotonic())))
+
+            if code_data is None:
+                raise TimeoutError("Device-code authentication timed out after 15 minutes")
+
+            authorization_code = code_data.get("authorization_code")
+            code_verifier = code_data.get("code_verifier")
+            if not authorization_code or not code_verifier:
+                raise ValueError("Device-code authorization response was incomplete")
+
+            token_response = await client.post(
+                self.TOKEN_URL,
+                data={
+                    "grant_type": "authorization_code",
+                    "code": authorization_code,
+                    "client_id": self.CLIENT_ID,
+                    "code_verifier": code_verifier,
+                    "redirect_uri": f"{issuer}/deviceauth/callback",
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=30.0,
+            )
+            token_response.raise_for_status()
+            token_data = token_response.json()
+
+            id_token_claims = _parse_jwt_claims(token_data.get("id_token", "")) or {}
+            access_token_claims = (
+                _parse_jwt_claims(token_data.get("access_token", "")) or {}
+            )
+            auth_claims = _extract_openai_auth_claims(id_token_claims)
+            account_id = auth_claims.get("chatgpt_account_id", "")
+            email = id_token_claims.get("email", "")
+            plan_type = _extract_chatgpt_plan_type(access_token_claims, id_token_claims)
+            new_creds = {
+                "access_token": token_data.get("access_token"),
+                "refresh_token": token_data.get("refresh_token"),
+                "id_token": token_data.get("id_token"),
+                "expiry_date": time.time() + token_data.get("expires_in", 3600),
+                "account_id": account_id,
+                "_proxy_metadata": {
+                    "email": email,
+                    "account_id": account_id,
+                    "plan_type": plan_type,
+                    "last_check_timestamp": time.time(),
+                },
+            }
+            if not new_creds["access_token"] or not new_creds["refresh_token"]:
+                raise ValueError("Token exchange omitted required OAuth tokens")
+            if path:
+                await self._save_credentials(path, new_creds)
+            lib_logger.info(
+                "%s device-code OAuth initialized successfully for '%s'.",
+                self.ENV_PREFIX,
+                display_name,
+            )
+            return new_creds
+
+    async def refresh_auth_header_after_unauthorized(
+        self, credential_path: str
+    ) -> Dict[str, str]:
+        """Force-refresh an OAuth credential after an upstream 401 response."""
+        creds = await self._load_credentials(credential_path)
+        try:
+            creds = await self._refresh_token(credential_path, creds, force=True)
+        except Exception:
+            await self._queue_refresh(
+                credential_path, force=True, needs_reauth=True
+            )
+            raise
+        token = creds.get("api_key") or creds.get("access_token")
+        if not token:
+            raise CredentialNeedsReauthError(credential_path=credential_path)
+        return {"Authorization": f"Bearer {token}"}
+
     async def _exchange_for_api_key(
         self, client: httpx.AsyncClient, id_token: str
     ) -> Optional[str]:
@@ -995,7 +1149,7 @@ class OpenAIOAuthBase:
                     credential_path=path or display_name,
                     provider_name=self.ENV_PREFIX,
                     reauth_func=_do_interactive_oauth,
-                    timeout=300.0,
+                    timeout=float(self._reauth_timeout_seconds),
                 )
 
             lib_logger.info(

@@ -1,9 +1,12 @@
 import json
 import asyncio
+import base64
 import sys
 import time
 import types
 from pathlib import Path
+
+import httpx
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
@@ -136,6 +139,7 @@ import pytest
 
 from rotator_library.error_handler import EmptyResponseError
 from rotator_library.providers import codex_provider
+from rotator_library.providers import openai_oauth_base
 from rotator_library.providers.codex_provider import CodexProvider
 from rotator_library.providers.ollama_cloud_provider import OllamaCloudProvider
 from rotator_library.usage.manager import UsageManager
@@ -171,6 +175,139 @@ class FakeStreamClient:
 
     def stream(self, *args, **kwargs):
         return FakeStreamResponse(self._events)
+
+
+def _jwt(claims):
+    encoded = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    return f"e30.{encoded}.signature"
+
+
+def test_codex_device_login_uses_cli_flow_and_persists_tokens(monkeypatch, tmp_path):
+    requests = []
+    id_token = _jwt(
+        {
+            "email": "device@example.com",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "account-device"
+            },
+        }
+    )
+    access_token = _jwt(
+        {"https://api.openai.com/auth": {"chatgpt_plan_type": "pro"}}
+    )
+
+    class Response:
+        def __init__(self, status_code, data):
+            self.status_code = status_code
+            self._data = data
+
+        @property
+        def is_success(self):
+            return 200 <= self.status_code < 300
+
+        def json(self):
+            return self._data
+
+        def raise_for_status(self):
+            if not self.is_success:
+                request = httpx.Request("POST", "https://auth.openai.com")
+                response = httpx.Response(self.status_code, request=request)
+                raise httpx.HTTPStatusError("failed", request=request, response=response)
+
+    responses = iter(
+        [
+            Response(
+                200,
+                {
+                    "device_auth_id": "device-id",
+                    "user_code": "ABCD-EFGH",
+                    "interval": "1",
+                },
+            ),
+            Response(403, {}),
+            Response(
+                200,
+                {
+                    "authorization_code": "authorization-code",
+                    "code_challenge": "challenge",
+                    "code_verifier": "verifier",
+                },
+            ),
+            Response(
+                200,
+                {
+                    "access_token": access_token,
+                    "refresh_token": "refresh-token",
+                    "id_token": id_token,
+                    "expires_in": 3600,
+                },
+            ),
+        ]
+    )
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, **kwargs):
+            requests.append((url, kwargs))
+            return next(responses)
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(openai_oauth_base.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(openai_oauth_base.asyncio, "sleep", no_sleep)
+    provider = CodexProvider()
+    path = tmp_path / "codex_oauth_1.json"
+
+    credentials = asyncio.run(
+        provider._perform_device_code_oauth(str(path), path.name)
+    )
+
+    assert credentials["account_id"] == "account-device"
+    assert credentials["_proxy_metadata"]["email"] == "device@example.com"
+    assert json.loads(path.read_text())["refresh_token"] == "refresh-token"
+    assert [request[0] for request in requests] == [
+        "https://auth.openai.com/api/accounts/deviceauth/usercode",
+        "https://auth.openai.com/api/accounts/deviceauth/token",
+        "https://auth.openai.com/api/accounts/deviceauth/token",
+        "https://auth.openai.com/oauth/token",
+    ]
+    assert requests[-1][1]["data"]["redirect_uri"] == (
+        "https://auth.openai.com/deviceauth/callback"
+    )
+
+
+def test_codex_unauthorized_forces_refresh(monkeypatch):
+    provider = CodexProvider()
+    calls = []
+
+    async def refresh(path):
+        calls.append(path)
+        return {"Authorization": "Bearer refreshed"}
+
+    monkeypatch.setattr(provider, "refresh_auth_header_after_unauthorized", refresh)
+
+    asyncio.run(provider._recover_unauthorized_credential("codex_oauth_2.json", 401))
+
+    assert calls == ["codex_oauth_2.json"]
+
+
+def test_codex_non_auth_error_does_not_refresh(monkeypatch):
+    provider = CodexProvider()
+
+    async def unexpected_refresh(_):
+        raise AssertionError("refresh should not run")
+
+    monkeypatch.setattr(
+        provider, "refresh_auth_header_after_unauthorized", unexpected_refresh
+    )
+
+    asyncio.run(provider._recover_unauthorized_credential("codex_oauth_2.json", 429))
 
 
 @pytest.mark.parametrize(

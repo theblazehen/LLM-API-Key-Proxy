@@ -43,7 +43,11 @@ from .openai_oauth_base import OpenAIOAuthBase
 from .utilities.codex_quota_tracker import CodexQuotaTracker
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
-from ..error_handler import EmptyResponseError, TransientQuotaError
+from ..error_handler import (
+    CredentialNeedsReauthError,
+    EmptyResponseError,
+    TransientQuotaError,
+)
 from ..core.errors import StreamedAPIError
 
 if TYPE_CHECKING:
@@ -1065,6 +1069,32 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
     def supports_responses_api(self) -> bool:
         return True
 
+    async def _recover_unauthorized_credential(
+        self, credential_path: str, status_code: int
+    ) -> None:
+        """Refresh or quarantine a Codex OAuth credential after an upstream 401."""
+        if status_code != 401 or not credential_path:
+            return
+        try:
+            await self.refresh_auth_header_after_unauthorized(credential_path)
+            lib_logger.info(
+                "Refreshed invalidated Codex token for %s; the request will rotate and retry.",
+                Path(credential_path).name,
+            )
+        except Exception as exc:
+            lib_logger.warning(
+                "Codex credential %s requires device login after token invalidation: %s",
+                Path(credential_path).name,
+                exc,
+            )
+            raise CredentialNeedsReauthError(
+                credential_path=credential_path,
+                message=(
+                    f"Codex credential '{Path(credential_path).name}' was invalidated; "
+                    "device-code re-authentication was queued."
+                ),
+            ) from exc
+
     async def aresponses(
         self, client: httpx.AsyncClient, **kwargs
     ) -> Union[Dict[str, Any], AsyncGenerator[bytes, None]]:
@@ -1111,6 +1141,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                 credential_path, {k.lower(): v for k, v in response.headers.items()}
             )
         if response.status_code >= 400:
+            await self._recover_unauthorized_credential(
+                credential_path, response.status_code
+            )
             raise ValueError(f"Codex Responses error {response.status_code}: {response.text}")
         return response.json()
 
@@ -1134,6 +1167,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                 )
             if response.status_code >= 400:
                 body = await response.aread()
+                await self._recover_unauthorized_credential(
+                    credential_path, response.status_code
+                )
                 error = {
                     "type": "error",
                     "message": f"Codex Responses error {response.status_code}: {body.decode('utf-8', errors='replace')}",
@@ -1417,6 +1453,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                 error_text = error_body.decode("utf-8", errors="ignore")
                 lib_logger.error(
                     f"Codex API error {response.status_code}: {error_text[:500]}"
+                )
+                await self._recover_unauthorized_credential(
+                    credential_path, response.status_code
                 )
                 raise httpx.HTTPStatusError(
                     f"Codex API error: {response.status_code}",
@@ -1725,6 +1764,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                 error_text = error_body.decode("utf-8", errors="ignore")
                 lib_logger.error(
                     f"Codex API error {response.status_code}: {error_text[:500]}"
+                )
+                await self._recover_unauthorized_credential(
+                    credential_path, response.status_code
                 )
                 raise httpx.HTTPStatusError(
                     f"Codex API error: {response.status_code}",
