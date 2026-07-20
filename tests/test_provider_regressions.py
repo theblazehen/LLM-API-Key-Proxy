@@ -630,6 +630,62 @@ def test_codex_non_stream_completed_without_output_raises_empty_response_error()
         asyncio.run(run_response())
 
 
+def test_codex_default_reasoning_is_separate_from_visible_content():
+    message = {"role": "assistant", "content": "visible output"}
+
+    result = codex_provider._apply_reasoning_to_message(
+        message,
+        "internal summary",
+        "",
+        codex_provider.DEFAULT_REASONING_COMPAT,
+    )
+
+    assert result["content"] == "visible output"
+    assert result["reasoning_summary"] == "internal summary"
+    assert "<think>" not in result["content"]
+
+
+def test_codex_non_stream_response_keeps_reasoning_out_of_visible_content():
+    async def run_response():
+        provider = CodexProvider()
+        client = FakeStreamClient(
+            [
+                {"type": "response.created", "response": {"id": "resp-reasoning"}},
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "delta": "internal summary",
+                },
+                {"type": "response.output_text.delta", "delta": "visible output"},
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp-reasoning",
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 2,
+                            "total_tokens": 3,
+                        },
+                    },
+                },
+            ]
+        )
+
+        return await provider._non_stream_response(
+            client=client,
+            headers={},
+            payload={},
+            model="gpt-5.6-sol",
+            reasoning_compat=codex_provider.DEFAULT_REASONING_COMPAT,
+        )
+
+    response = asyncio.run(run_response())
+    message = response.choices[0]["message"]
+
+    assert message["content"] == "visible output"
+    assert message["reasoning_summary"] == "internal summary"
+    assert "<think>" not in message["content"]
+
+
 def test_codex_stream_wrapper_yields_before_upstream_completes():
     async def run_stream():
         provider = CodexProvider()

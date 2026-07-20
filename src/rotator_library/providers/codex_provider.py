@@ -369,7 +369,7 @@ AVAILABLE_MODELS = _build_available_models()
 # Default reasoning configuration
 DEFAULT_REASONING_EFFORT = os.getenv("CODEX_REASONING_EFFORT", "medium")
 DEFAULT_REASONING_SUMMARY = os.getenv("CODEX_REASONING_SUMMARY", "auto")
-DEFAULT_REASONING_COMPAT = os.getenv("CODEX_REASONING_COMPAT", "think-tags")
+DEFAULT_REASONING_COMPAT = os.getenv("CODEX_REASONING_COMPAT", "current")
 CODEX_CLIENT_METADATA = env_bool("CODEX_CLIENT_METADATA", True)
 
 # Empty response retry configuration
@@ -819,9 +819,9 @@ def _apply_reasoning_to_message(
 ) -> Dict[str, Any]:
     """Apply reasoning output to message based on compatibility mode."""
     try:
-        compat = (compat or "think-tags").strip().lower()
+        compat = (compat or "current").strip().lower()
     except Exception:
-        compat = "think-tags"
+        compat = "current"
 
     if compat == "o3":
         # OpenAI o3 format with reasoning object
