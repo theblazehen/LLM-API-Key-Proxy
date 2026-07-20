@@ -22,8 +22,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
+import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -64,6 +67,10 @@ def _seconds_to_minutes(seconds: Optional[int]) -> Optional[int]:
 # - Otherwise: use /api/codex/usage (CodexApi style)
 # Since we use chatgpt.com/backend-api, we need /wham/usage
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+CODEX_RESET_CREDITS_URL = (
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+)
+CODEX_RESET_CONSUME_URL = f"{CODEX_RESET_CREDITS_URL}/consume"
 
 # Rate limit header names (from Codex API)
 HEADER_PRIMARY_USED_PERCENT = "x-codex-primary-used-percent"
@@ -85,6 +92,15 @@ QUOTA_STALE_THRESHOLD_SECONDS = 900
 # Upstream currently uses a seven-day window for the weekly account limit.
 # It may appear in either the primary or secondary payload position.
 WEEKLY_WINDOW_MINUTES = 7 * 24 * 60
+RESET_CREDITS_STALE_SECONDS = 15 * 60
+RESET_AUTO_MODE = os.getenv("CODEX_RESET_MODE", "observe").strip().lower()
+RESET_NATURAL_GUARD_SECONDS = int(
+    float(os.getenv("CODEX_RESET_NATURAL_GUARD_HOURS", "24")) * 3600
+)
+RESET_AUTO_WAIT_SECONDS = int(os.getenv("CODEX_RESET_AUTO_WAIT_SECONDS", "900"))
+RESET_DRAIN_LEAD_SECONDS = int(
+    float(os.getenv("CODEX_RESET_DRAIN_LEAD_HOURS", "24")) * 3600
+)
 
 
 # =============================================================================
@@ -145,6 +161,56 @@ class CodexQuotaSnapshot:
     def is_stale(self) -> bool:
         """Check if this snapshot is stale."""
         return time.time() - self.fetched_at > QUOTA_STALE_THRESHOLD_SECONDS
+
+
+@dataclass(frozen=True)
+class ResetCredit:
+    id: str
+    reset_type: str
+    status: str
+    granted_at: Optional[float]
+    expires_at: Optional[float]
+    title: Optional[str]
+    description: Optional[str]
+
+
+@dataclass(frozen=True)
+class ResetCreditsSnapshot:
+    available_count: int
+    credits: tuple[ResetCredit, ...]
+    fetched_at: float
+    status: str
+    error: Optional[str] = None
+    policy_action: str = "observe"
+    policy_reason: str = "not evaluated"
+    last_outcome: Optional[str] = None
+    last_redeemed_at: Optional[float] = None
+
+    @property
+    def is_stale(self) -> bool:
+        return time.time() - self.fetched_at > RESET_CREDITS_STALE_SECONDS
+
+    @property
+    def next_auto_redeem_at(self) -> Optional[float]:
+        return min(
+            (
+                credit.expires_at
+                for credit in self.credits
+                if credit.status == "available" and credit.expires_at is not None
+            ),
+            default=None,
+        )
+
+
+def _parse_credit_timestamp(value: Any) -> Optional[float]:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 def _window_to_dict(window: RateLimitWindow) -> Dict[str, Any]:
@@ -317,12 +383,22 @@ class CodexQuotaTracker:
     _quota_cache: Dict[str, CodexQuotaSnapshot]
     _quota_refresh_interval: int
 
+    async def get_auth_header(self, credential_path: str) -> Dict[str, str]:
+        """Provider mixin contract."""
+        raise NotImplementedError
+
+    async def get_account_id(self, credential_path: str) -> Optional[str]:
+        """Provider mixin contract."""
+        raise NotImplementedError
+
     def _init_quota_tracker(self):
         """Initialize quota tracker state. Call from provider's __init__."""
         self._quota_cache: Dict[str, CodexQuotaSnapshot] = {}
         self._quota_refresh_interval: int = DEFAULT_QUOTA_REFRESH_INTERVAL
         self._usage_manager: Optional["UsageManager"] = None
         self._initial_baselines_fetched: bool = False
+        self._reset_credits_cache: Dict[str, ResetCreditsSnapshot] = {}
+        self._reset_locks: Dict[str, asyncio.Lock] = {}
 
     def set_usage_manager(self, usage_manager: "UsageManager") -> None:
         """Set the UsageManager reference for pushing quota updates."""
@@ -331,6 +407,281 @@ class CodexQuotaTracker:
     # =========================================================================
     # QUOTA API FETCHING
     # =========================================================================
+
+    async def _account_headers(self, credential_path: str) -> Dict[str, str]:
+        headers = {
+            **(await self.get_auth_header(credential_path)),
+            "Content-Type": "application/json",
+            "User-Agent": "codex-cli",
+        }
+        account_id = await self.get_account_id(credential_path)
+        if account_id:
+            headers["ChatGPT-Account-Id"] = account_id
+        return headers
+
+    async def fetch_reset_credits(
+        self, credential_path: str
+    ) -> ResetCreditsSnapshot:
+        """Refresh one account's reset-credit list outside request routing."""
+        previous = self._reset_credits_cache.get(credential_path)
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    CODEX_RESET_CREDITS_URL,
+                    headers=await self._account_headers(credential_path),
+                    timeout=30,
+                )
+                response.raise_for_status()
+                payload = response.json()
+            credits = []
+            for item in payload.get("credits") or []:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                credits.append(
+                    ResetCredit(
+                        id=str(item["id"]),
+                        reset_type=str(item.get("reset_type") or "unknown"),
+                        status=str(item.get("status") or "unknown").lower(),
+                        granted_at=_parse_credit_timestamp(item.get("granted_at")),
+                        expires_at=_parse_credit_timestamp(item.get("expires_at")),
+                        title=item.get("title"),
+                        description=item.get("description"),
+                    )
+                )
+            credits.sort(
+                key=lambda credit: credit.expires_at
+                if credit.expires_at is not None
+                else float("inf")
+            )
+            snapshot = ResetCreditsSnapshot(
+                available_count=max(0, int(payload.get("available_count") or 0)),
+                credits=tuple(credits),
+                fetched_at=time.time(),
+                status="success",
+                last_outcome=previous.last_outcome if previous else None,
+                last_redeemed_at=previous.last_redeemed_at if previous else None,
+            )
+        except Exception as exc:
+            snapshot = ResetCreditsSnapshot(
+                available_count=previous.available_count if previous else 0,
+                credits=previous.credits if previous else (),
+                fetched_at=time.time(),
+                status="error",
+                error=str(exc),
+                last_outcome=previous.last_outcome if previous else None,
+                last_redeemed_at=previous.last_redeemed_at if previous else None,
+                policy_reason="reset-credit refresh failed",
+            )
+        self._reset_credits_cache[credential_path] = snapshot
+        return snapshot
+
+    async def redeem_reset_credit(
+        self,
+        credential_path: str,
+        credit_id: Optional[str] = None,
+        redeem_request_id: Optional[str] = None,
+        policy_credentials: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Redeem explicitly, serialized per account and reconciled afterward."""
+        lock = self._reset_locks.setdefault(credential_path, asyncio.Lock())
+        async with lock:
+            quota = await self.fetch_quota_from_api(credential_path)
+            credits = await self.fetch_reset_credits(credential_path)
+            if quota.status != "success" or credits.status != "success":
+                raise RuntimeError("fresh quota and reset-credit state are required")
+            if credit_id:
+                matching = [
+                    credit
+                    for credit in credits.credits
+                    if credit.id == credit_id and credit.status == "available"
+                ]
+                if not matching:
+                    raise ValueError("reset credit is not available")
+            if policy_credentials is not None:
+                # Automatic redemption must still be justified by fresh state
+                # after acquiring the account lock. Manual redemption is an
+                # explicit operator override and does not pass this argument.
+                await asyncio.gather(
+                    *(
+                        self.fetch_quota_from_api(path)
+                        for path in policy_credentials
+                        if path != credential_path
+                    ),
+                    return_exceptions=True,
+                )
+                action, reason, fresh_credit_id = self._reset_policy(
+                    credential_path, policy_credentials
+                )
+                if action != "redeem" or fresh_credit_id != credit_id:
+                    raise RuntimeError(
+                        f"automatic redemption no longer eligible: {reason}"
+                    )
+            body: Dict[str, str] = {
+                "redeem_request_id": redeem_request_id or str(uuid.uuid4())
+            }
+            if credit_id:
+                body["credit_id"] = credit_id
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    CODEX_RESET_CONSUME_URL,
+                    headers=await self._account_headers(credential_path),
+                    json=body,
+                    timeout=30,
+                )
+                response.raise_for_status()
+                outcome = response.json()
+            await self.fetch_quota_from_api(credential_path)
+            refreshed = await self.fetch_reset_credits(credential_path)
+            outcome_name = str(outcome.get("code") or outcome.get("status") or "unknown")
+            self._reset_credits_cache[credential_path] = ResetCreditsSnapshot(
+                **{
+                    **refreshed.__dict__,
+                    "last_outcome": outcome_name,
+                    "last_redeemed_at": time.time(),
+                }
+            )
+            return {**outcome, "redeem_request_id": body["redeem_request_id"]}
+
+    def get_reset_credit_info(self, credential_path: str) -> Optional[Dict[str, Any]]:
+        snapshot = self._reset_credits_cache.get(credential_path)
+        if snapshot is None:
+            return None
+        return {
+            "available_count": snapshot.available_count,
+            "status": snapshot.status,
+            "error": snapshot.error,
+            "fetched_at": snapshot.fetched_at,
+            "stale": snapshot.is_stale,
+            "details_complete": len(snapshot.credits) >= snapshot.available_count,
+            "next_auto_redeem_at": snapshot.next_auto_redeem_at,
+            "policy": {
+                "action": snapshot.policy_action,
+                "reason": snapshot.policy_reason,
+            },
+            "last_outcome": snapshot.last_outcome,
+            "last_redeemed_at": snapshot.last_redeemed_at,
+            "credits": [
+                {
+                    "id": credit.id,
+                    "reset_type": credit.reset_type,
+                    "status": credit.status,
+                    "granted_at": credit.granted_at,
+                    "expires_at": credit.expires_at,
+                    "auto_redeems_at": credit.expires_at,
+                    "title": credit.title,
+                    "description": credit.description,
+                }
+                for credit in snapshot.credits
+            ],
+        }
+
+    def _reset_policy(
+        self, credential_path: str, all_credentials: List[str]
+    ) -> tuple[str, str, Optional[str]]:
+        """Evaluate cached state only; safe to call from routing/status paths."""
+        reset = self._reset_credits_cache.get(credential_path)
+        quota = self._quota_cache.get(credential_path)
+        if not reset or reset.status != "success" or reset.is_stale:
+            return "observe", "reset-credit state unavailable or stale", None
+        if not quota or quota.status != "success" or quota.is_stale:
+            return "observe", "quota state unavailable or stale", None
+        available = [c for c in reset.credits if c.status == "available"]
+        if reset.available_count <= 0:
+            return "observe", "no reset credits available", None
+        if not available:
+            return "manual", "credit details unavailable", None
+
+        windows = [w for w in (quota.primary, quota.secondary) if w is not None]
+        if not windows:
+            return "observe", "quota windows unavailable", None
+        if not any(window.is_exhausted for window in windows):
+            return "drain", "preserve reset while quota remains", available[0].id
+
+        now = time.time()
+        natural_resets = [w.reset_at for w in windows if w.is_exhausted and w.reset_at]
+        natural_reset = min(natural_resets) if natural_resets else None
+        alternative_available = False
+        for other_path in all_credentials:
+            if other_path == credential_path:
+                continue
+            other = self._quota_cache.get(other_path)
+            if not other or other.status != "success" or other.is_stale:
+                continue
+            other_windows = [w for w in (other.primary, other.secondary) if w]
+            if other_windows and not any(w.is_exhausted for w in other_windows):
+                alternative_available = True
+                break
+        if natural_reset and natural_reset - now <= RESET_AUTO_WAIT_SECONDS:
+            return "wait", "natural reset is imminent", available[0].id
+        if (
+            reset.next_auto_redeem_at
+            and reset.next_auto_redeem_at - now <= RESET_AUTO_WAIT_SECONDS
+        ):
+            return "wait", "credit auto-redemption is imminent", available[0].id
+        if (
+            alternative_available
+            and natural_reset
+            and natural_reset - now <= RESET_NATURAL_GUARD_SECONDS
+        ):
+            return "wait", "alternative capacity covers a near natural reset", available[0].id
+        if alternative_available:
+            return "wait", "another account has usable capacity", available[0].id
+        if RESET_AUTO_MODE != "automatic":
+            return "manual", "blocked demand warrants redemption", available[0].id
+        return "redeem", "all accounts are quota-blocked", available[0].id
+
+    async def _refresh_and_evaluate_resets(self, credentials: List[str]) -> None:
+        """Background-only refresh and optional redemption; never request-path awaited."""
+        await asyncio.gather(
+            *(self.fetch_reset_credits(path) for path in credentials),
+            return_exceptions=True,
+        )
+        for path in credentials:
+            snapshot = self._reset_credits_cache.get(path)
+            if snapshot is None:
+                continue
+            action, reason, credit_id = self._reset_policy(path, credentials)
+            self._reset_credits_cache[path] = ResetCreditsSnapshot(
+                **{
+                    **snapshot.__dict__,
+                    "policy_action": action,
+                    "policy_reason": reason,
+                }
+            )
+            if action != "redeem" or not credit_id:
+                continue
+            try:
+                await self.redeem_reset_credit(
+                    path,
+                    credit_id=credit_id,
+                    policy_credentials=credentials,
+                )
+            except Exception as exc:
+                current = self._reset_credits_cache[path]
+                self._reset_credits_cache[path] = ResetCreditsSnapshot(
+                    **{
+                        **current.__dict__,
+                        "policy_action": "error",
+                        "policy_reason": f"automatic redemption failed: {exc}",
+                    }
+                )
+                lib_logger.error(
+                    "Codex automatic reset failed for %s: %s",
+                    _get_credential_identifier(path),
+                    exc,
+                )
+            break
+
+    def _publish_reset_routing_hints(self, usage_manager: "UsageManager") -> None:
+        """Publish immutable scalar hints consumed synchronously by routing."""
+        for state in usage_manager._states.values():
+            snapshot = self._reset_credits_cache.get(state.accessor)
+            if snapshot is None or snapshot.status != "success" or snapshot.is_stale:
+                state.reset_credit_count = 0
+                state.reset_auto_redeem_at = None
+                continue
+            state.reset_credit_count = snapshot.available_count
+            state.reset_auto_redeem_at = snapshot.next_auto_redeem_at
 
     async def fetch_quota_from_api(
         self,
@@ -815,6 +1166,8 @@ class CodexQuotaTracker:
                     lib_logger.info(
                         f"Codex startup: {stored} baselines stored, no exhausted credentials"
                     )
+                await self._refresh_and_evaluate_resets(credentials)
+                self._publish_reset_routing_hints(usage_manager)
             except Exception as e:
                 lib_logger.error(f"Codex startup baseline fetch failed: {e}")
             return
@@ -876,6 +1229,8 @@ class CodexQuotaTracker:
             force=True,
         )
         success_count = len(quota_results)
+        await self._refresh_and_evaluate_resets(active_credentials)
+        self._publish_reset_routing_hints(usage_manager)
 
         lib_logger.debug(
             f"Codex quota refresh complete: {success_count}/{len(active_credentials)} "

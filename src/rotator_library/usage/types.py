@@ -339,6 +339,10 @@ class CredentialState:
     active_requests: int = 0
     max_concurrent: Optional[int] = None
 
+    # Transient provider hints, refreshed outside the request path.
+    reset_credit_count: int = 0
+    reset_auto_redeem_at: Optional[float] = None
+
     # Metadata
     created_at: Optional[float] = None
     last_updated: Optional[float] = None

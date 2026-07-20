@@ -713,6 +713,12 @@ class RotatingClient:
 
             stats = await manager.get_stats_for_endpoint()
 
+            plugin = self._get_provider_instance(provider)
+            if provider == "codex" and plugin and hasattr(
+                plugin, "get_reset_credit_info"
+            ):
+                self._attach_codex_reset_stats(stats, plugin)
+
             # Skip providers with no activity (filters out invalid/unused providers)
             if stats.get("total_requests", 0) == 0:
                 continue
@@ -1020,6 +1026,11 @@ class RotatingClient:
                         creds_to_refresh
                     )
 
+                    if hasattr(provider_instance, "_refresh_and_evaluate_resets"):
+                        await provider_instance._refresh_and_evaluate_resets(
+                            creds_to_refresh
+                        )
+
                     # Store baselines in usage manager
                     usage_manager = self._usage_managers.get(prov)
                     if usage_manager and hasattr(
@@ -1050,6 +1061,54 @@ class RotatingClient:
 
         result["duration_ms"] = int((time.time() - start_time) * 1000)
         return result
+
+    @staticmethod
+    def _attach_codex_reset_stats(stats: Dict[str, Any], plugin: Any) -> None:
+        """Attach cached reset details without any provider network access."""
+        total_resets = 0
+        next_auto_redeem_at = None
+        for credential_stats in stats.get("credentials", {}).values():
+            info = plugin.get_reset_credit_info(credential_stats.get("full_path", ""))
+            credential_stats["reset_credits"] = info
+            if not info:
+                continue
+            total_resets += info.get("available_count", 0)
+            candidate = info.get("next_auto_redeem_at")
+            if candidate and (
+                next_auto_redeem_at is None or candidate < next_auto_redeem_at
+            ):
+                next_auto_redeem_at = candidate
+        stats["reset_credits"] = {
+            "mode": os.getenv("CODEX_RESET_MODE", "observe"),
+            "available_count": total_resets,
+            "next_auto_redeem_at": next_auto_redeem_at,
+        }
+
+    async def redeem_codex_reset_credit(
+        self,
+        credential: str,
+        credit_id: Optional[str],
+        redeem_request_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """Explicit administrative reset operation; never used by routing."""
+        plugin = self._get_provider_instance("codex")
+        if not plugin or not hasattr(plugin, "redeem_reset_credit"):
+            raise RuntimeError("Codex reset redemption is unavailable")
+        credential_path = next(
+            (
+                path
+                for path in self.all_credentials.get("codex", [])
+                if path == credential or Path(path).name == credential
+            ),
+            None,
+        )
+        if credential_path is None:
+            raise ValueError("unknown Codex credential")
+        return await plugin.redeem_reset_credit(
+            credential_path,
+            credit_id=credit_id,
+            redeem_request_id=redeem_request_id,
+        )
 
     # =========================================================================
     # ANTHROPIC API COMPATIBILITY METHODS

@@ -3,6 +3,7 @@
 
 import time
 import uuid
+import secrets
 
 # Phase 1: Minimal imports for arg parsing and TUI
 import asyncio
@@ -710,6 +711,24 @@ async def verify_api_key(
     identity = resolve_proxy_identity(bearer_token(auth), PROXY_API_KEYS)
     if identity is None:
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+    request.state.proxy_identity = identity
+    return identity
+
+
+async def verify_reset_admin_key(
+    request: Request, auth: str = Depends(api_key_header)
+) -> ProxyIdentity:
+    """Require a separate secret for destructive reset-credit operations."""
+    configured = os.getenv("CODEX_RESET_ADMIN_KEY")
+    if not configured:
+        raise HTTPException(
+            status_code=503,
+            detail="Codex reset administration is not configured",
+        )
+    token = bearer_token(auth)
+    if not token or not secrets.compare_digest(token, configured):
+        raise HTTPException(status_code=403, detail="Reset administrator key required")
+    identity = ProxyIdentity("reset-admin")
     request.state.proxy_identity = identity
     return identity
 
@@ -1766,6 +1785,42 @@ async def refresh_quota_stats(
     except Exception as e:
         logging.error(f"Failed to refresh quota stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/quota-stats/codex/reset-credits/redeem")
+async def redeem_codex_reset_credit(
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_reset_admin_key),
+):
+    """Explicitly redeem one Codex reset credit and reconcile cached state."""
+    try:
+        data = await request.json()
+        credential = data.get("credential")
+        credit_id = data.get("credit_id")
+        generic = data.get("generic", False)
+        if not credential:
+            raise HTTPException(status_code=400, detail="credential is required")
+        if bool(credit_id) == bool(generic):
+            raise HTTPException(
+                status_code=400,
+                detail="provide exactly one of credit_id or generic=true",
+            )
+        outcome = await client.redeem_codex_reset_credit(
+            credential=credential,
+            credit_id=credit_id,
+            redeem_request_id=request.headers.get("Idempotency-Key"),
+        )
+        return {"success": True, "outcome": outcome}
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        logging.error(f"Failed to redeem Codex reset credit: {exc}")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/v1/token-count")

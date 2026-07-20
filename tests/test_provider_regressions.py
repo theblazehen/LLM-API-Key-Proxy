@@ -140,6 +140,7 @@ import pytest
 from rotator_library.error_handler import EmptyResponseError
 from rotator_library.providers import codex_provider
 from rotator_library.providers import openai_oauth_base
+from rotator_library.providers.utilities import codex_quota_tracker
 from rotator_library.providers.codex_provider import CodexProvider
 from rotator_library.providers.ollama_cloud_provider import OllamaCloudProvider
 from rotator_library.usage.manager import UsageManager
@@ -167,6 +168,41 @@ class FakeStreamResponse:
 
     async def aread(self):
         return b""
+
+
+class FakeHTTPResponse:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = json.dumps(payload)
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                "request failed",
+                request=httpx.Request("GET", "https://example.invalid"),
+                response=httpx.Response(self.status_code),
+            )
+
+
+class FakeHTTPClient:
+    def __init__(self, responses):
+        self.responses = responses
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def get(self, *args, **kwargs):
+        return self.responses.pop(0)
+
+    async def post(self, *args, **kwargs):
+        return self.responses.pop(0)
 
 
 class FakeStreamClient:
@@ -308,6 +344,183 @@ def test_codex_non_auth_error_does_not_refresh(monkeypatch):
     )
 
     asyncio.run(provider._recover_unauthorized_credential("codex_oauth_2.json", 429))
+
+
+def _codex_quota(path, remaining, reset_at, fetched_at):
+    return codex_quota_tracker.CodexQuotaSnapshot(
+        credential_path=path,
+        identifier=path,
+        plan_type="pro",
+        primary=codex_quota_tracker.RateLimitWindow(
+            used_percent=100 - remaining,
+            remaining_percent=remaining,
+            window_minutes=10_080,
+            reset_at=reset_at,
+        ),
+        secondary=None,
+        credits=None,
+        fetched_at=fetched_at,
+        status="success",
+        error=None,
+    )
+
+
+def _codex_resets(now, expires_in=86400):
+    return codex_quota_tracker.ResetCreditsSnapshot(
+        available_count=1,
+        credits=(
+            codex_quota_tracker.ResetCredit(
+                id="reset-1",
+                reset_type="codex_rate_limits",
+                status="available",
+                granted_at=now - 100,
+                expires_at=now + expires_in,
+                title="Reset",
+                description=None,
+            ),
+        ),
+        fetched_at=now,
+        status="success",
+    )
+
+
+def test_codex_reset_policy_never_redeems_while_quota_remains(monkeypatch):
+    now = 1_000_000.0
+    monkeypatch.setattr(codex_quota_tracker.time, "time", lambda: now)
+    provider = CodexProvider()
+    provider._quota_cache["a"] = _codex_quota("a", 20, now + 4 * 86400, now)
+    provider._reset_credits_cache["a"] = _codex_resets(now)
+
+    action, reason, _ = provider._reset_policy("a", ["a"])
+
+    assert action == "drain"
+    assert "quota remains" in reason
+
+
+def test_codex_reset_policy_preserves_credit_when_alternative_is_available(monkeypatch):
+    now = 1_000_000.0
+    monkeypatch.setattr(codex_quota_tracker.time, "time", lambda: now)
+    provider = CodexProvider()
+    provider._quota_cache["a"] = _codex_quota("a", 0, now + 4 * 86400, now)
+    provider._quota_cache["b"] = _codex_quota("b", 50, now + 4 * 86400, now)
+    provider._reset_credits_cache["a"] = _codex_resets(now)
+
+    action, reason, _ = provider._reset_policy("a", ["a", "b"])
+
+    assert action == "wait"
+    assert "another account" in reason
+
+
+def test_codex_reset_policy_redeems_only_when_fleet_blocked(monkeypatch):
+    now = 1_000_000.0
+    monkeypatch.setattr(codex_quota_tracker.time, "time", lambda: now)
+    monkeypatch.setattr(codex_quota_tracker, "RESET_AUTO_MODE", "automatic")
+    provider = CodexProvider()
+    provider._quota_cache["a"] = _codex_quota("a", 0, now + 4 * 86400, now)
+    provider._quota_cache["b"] = _codex_quota("b", 0, now + 4 * 86400, now)
+    provider._reset_credits_cache["a"] = _codex_resets(now)
+
+    action, reason, credit_id = provider._reset_policy("a", ["a", "b"])
+
+    assert action == "redeem"
+    assert "all accounts" in reason
+    assert credit_id == "reset-1"
+
+
+def test_codex_reset_policy_waits_for_imminent_auto_redemption(monkeypatch):
+    now = 1_000_000.0
+    monkeypatch.setattr(codex_quota_tracker.time, "time", lambda: now)
+    monkeypatch.setattr(codex_quota_tracker, "RESET_AUTO_MODE", "automatic")
+    provider = CodexProvider()
+    provider._quota_cache["a"] = _codex_quota("a", 0, now + 4 * 86400, now)
+    provider._reset_credits_cache["a"] = _codex_resets(now, expires_in=60)
+
+    action, reason, _ = provider._reset_policy("a", ["a"])
+
+    assert action == "wait"
+    assert "auto-redemption" in reason
+
+
+def test_codex_fetch_reset_credits_sorts_available_details(monkeypatch):
+    provider = CodexProvider()
+
+    async def headers(_):
+        return {"Authorization": "Bearer token"}
+
+    responses = [
+        FakeHTTPResponse(
+            200,
+            {
+                "available_count": 2,
+                "credits": [
+                    {
+                        "id": "later",
+                        "reset_type": "codex_rate_limits",
+                        "status": "Available",
+                        "expires_at": "2026-07-22T00:00:00Z",
+                    },
+                    {
+                        "id": "earlier",
+                        "reset_type": "codex_rate_limits",
+                        "status": "Available",
+                        "expires_at": "2026-07-21T00:00:00Z",
+                    },
+                ],
+            },
+        )
+    ]
+    monkeypatch.setattr(provider, "_account_headers", headers)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: FakeHTTPClient(responses))
+
+    snapshot = asyncio.run(provider.fetch_reset_credits("credential.json"))
+
+    assert snapshot.status == "success"
+    assert snapshot.available_count == 2
+    assert [credit.id for credit in snapshot.credits] == ["earlier", "later"]
+    assert snapshot.next_auto_redeem_at == pytest.approx(1784592000.0)
+
+
+def test_codex_redeem_reset_credit_uses_requested_id_and_idempotency(monkeypatch):
+    provider = CodexProvider()
+    now = time.time()
+    provider._reset_credits_cache["credential.json"] = _codex_resets(now)
+    requests = []
+
+    async def quota(_):
+        return _codex_quota("credential.json", 0, now + 86400, now)
+
+    async def resets(_):
+        snapshot = provider._reset_credits_cache["credential.json"]
+        return snapshot
+
+    async def headers(_):
+        return {"Authorization": "Bearer token"}
+
+    class Client(FakeHTTPClient):
+        async def post(self, *args, **kwargs):
+            requests.append(kwargs["json"])
+            return FakeHTTPResponse(200, {"code": "Reset"})
+
+    monkeypatch.setattr(provider, "fetch_quota_from_api", quota)
+    monkeypatch.setattr(provider, "fetch_reset_credits", resets)
+    monkeypatch.setattr(provider, "_account_headers", headers)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: Client([]))
+
+    result = asyncio.run(
+        provider.redeem_reset_credit(
+            "credential.json",
+            credit_id="reset-1",
+            redeem_request_id="request-1",
+        )
+    )
+
+    assert requests == [
+        {"redeem_request_id": "request-1", "credit_id": "reset-1"}
+    ]
+    assert result["code"] == "Reset"
+    assert result["redeem_request_id"] == "request-1"
+
+
 
 
 @pytest.mark.parametrize(
