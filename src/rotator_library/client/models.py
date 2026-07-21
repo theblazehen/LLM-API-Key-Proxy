@@ -75,12 +75,17 @@ MODEL_ALIAS_MAP: Dict[str, List[str]] = {
 
 ROULETTE_ALIAS = "alias/roulette"
 ROULETTE_GLM_ALIAS = "alias/roulette-glm"
+REVIEWER_ALIAS = "alias/reviewer"
 DEFAULT_ROULETTE_WEIGHTS = "alias/gpt=70,alias/glm=30"
 DEFAULT_ROULETTE_GLM_WEIGHTS = "alias/glm=70,alias/gpt=30"
+DEFAULT_REVIEWER_WEIGHTS = "alias/deepseek-flash=50,alias/gemma-reviewer=50"
+
+MODEL_ALIAS_MAP["alias/gemma-reviewer"] = ["ollama_cloud/gemma4:31b-cloud"]
 
 ROULETTE_ALIASES: Dict[str, Tuple[str, str]] = {
     ROULETTE_ALIAS: ("ALIAS_ROULETTE_WEIGHTS", DEFAULT_ROULETTE_WEIGHTS),
     ROULETTE_GLM_ALIAS: ("ALIAS_ROULETTE_GLM_WEIGHTS", DEFAULT_ROULETTE_GLM_WEIGHTS),
+    REVIEWER_ALIAS: ("ALIAS_REVIEWER_WEIGHTS", DEFAULT_REVIEWER_WEIGHTS),
 }
 
 

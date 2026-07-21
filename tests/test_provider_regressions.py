@@ -872,6 +872,33 @@ def test_completion_context_uses_concrete_model_resolved_from_alias():
     assert resolver.resolve_model_id("alias/glm", "ollama_cloud") == "ollama_cloud/glm-5.2"
 
 
+def test_reviewer_alias_exposes_and_selects_both_review_models(monkeypatch):
+    resolver = ModelResolver(provider_plugins={})
+    selections = iter(["alias/gemma-reviewer", "alias/deepseek-flash"])
+    monkeypatch.setattr(
+        "rotator_library.client.models.random.choices",
+        lambda choices, weights, k: [next(selections)],
+    )
+
+    assert "alias/reviewer" in resolver.get_alias_models()
+    assert resolver.resolve_model_chain("alias/reviewer") == [
+        "ollama_cloud/gemma4:31b-cloud"
+    ]
+    assert resolver.resolve_model_chain("alias/reviewer") == [
+        "ollama_cloud/deepseek-v4-flash",
+        "opencode_go/deepseek-v4-flash",
+    ]
+
+
+def test_reviewer_alias_weights_are_configurable(monkeypatch):
+    resolver = ModelResolver(provider_plugins={})
+    monkeypatch.setenv("ALIAS_REVIEWER_WEIGHTS", "alias/gemma-reviewer=100")
+
+    assert resolver.resolve_model_chain("alias/reviewer") == [
+        "ollama_cloud/gemma4:31b-cloud"
+    ]
+
+
 def test_codex_percent_quota_snapshots_are_exposed_in_group_stats_without_requests():
     credential = "/credentials/codex-account.json"
     primary_reset = 1_800_000_000
