@@ -94,6 +94,19 @@ class _ErrorClient:
         return self.response
 
 
+class _NonStreamingErrorClient:
+    def __init__(self, status_code, body):
+        self.response = httpx.Response(
+            status_code,
+            content=body,
+            headers={"content-type": "application/json"},
+            request=httpx.Request("POST", "https://example.invalid/responses"),
+        )
+
+    async def post(self, *_args, **_kwargs):
+        return self.response
+
+
 def _fragmented_native_stream(chunks):
     async def stream():
         for chunk in chunks:
@@ -186,3 +199,61 @@ def test_native_responses_http_failures_raise_classifiable_exceptions(
 
     assert caught.value.response.status_code == status_code
     assert classify_error(caught.value, "codex").error_type == expected_error_type
+
+
+def test_native_non_streaming_error_retains_safe_status_and_category(monkeypatch):
+    provider = CodexProvider()
+    raw_message = "distinctive raw upstream message"
+    bearer_secret = "Bearer secret-token-that-must-not-leak"
+    account_id = "acct-sensitive-identifier"
+    body = json.dumps(
+        {
+            "error": {
+                "type": "invalid_request/error with spaces",
+                "message": raw_message,
+                "authorization": bearer_secret,
+                "account_id": account_id,
+            }
+        }
+    ).encode()
+
+    async def auth_header(_credential):
+        return {"Authorization": bearer_secret}
+
+    async def get_account_id(_credential):
+        return account_id
+
+    async def no_credential_recovery(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(provider, "get_auth_header", auth_header)
+    monkeypatch.setattr(provider, "get_account_id", get_account_id)
+    monkeypatch.setattr(provider, "_recover_unauthorized_credential", no_credential_recovery)
+
+    with pytest.raises(httpx.HTTPStatusError) as caught:
+        asyncio.run(
+            provider.aresponses(
+                _NonStreamingErrorClient(422, body),
+                credential_identifier="credential.json",
+                model="codex/gpt-5.6-sol",
+                input="safe fixed input",
+                stream=False,
+            )
+        )
+
+    error = caught.value
+    rendered = f"{error!s}\n{error!r}"
+    assert error.response.status_code == 422
+    assert error.upstream_status_code == 422
+    assert error.upstream_error_category == "invalid_request_error_with_spaces"
+    assert "status=422" in rendered
+    assert "category=invalid_request_error_with_spaces" in rendered
+    assert raw_message not in rendered
+    assert bearer_secret not in rendered
+    assert account_id not in rendered
+    assert raw_message not in error.args
+    assert bearer_secret not in error.args
+    assert account_id not in error.args
+    assert raw_message not in error.__dict__.values()
+    assert bearer_secret not in error.__dict__.values()
+    assert account_id not in error.__dict__.values()

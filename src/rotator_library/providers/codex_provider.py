@@ -1069,6 +1069,29 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
     def supports_responses_api(self) -> bool:
         return True
 
+    @staticmethod
+    def _native_response_error_category(response: httpx.Response) -> str:
+        """Return a bounded structural upstream error category without body text."""
+        try:
+            body = response.json()
+        except (json.JSONDecodeError, ValueError):
+            return "upstream_http_error"
+
+        if not isinstance(body, dict):
+            return "upstream_http_error"
+
+        error = body.get("error")
+        containers = (error, body) if isinstance(error, dict) else (body,)
+        for container in containers:
+            for field in ("type", "code", "category"):
+                value = container.get(field)
+                if not isinstance(value, str):
+                    continue
+                category = re.sub(r"[^A-Za-z0-9_.:-]+", "_", value.strip())[:64]
+                if category:
+                    return category
+        return "upstream_http_error"
+
     async def _recover_unauthorized_credential(
         self, credential_path: str, status_code: int
     ) -> None:
@@ -1144,7 +1167,18 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             await self._recover_unauthorized_credential(
                 credential_path, response.status_code
             )
-            raise ValueError(f"Codex Responses error {response.status_code}: {response.text}")
+            category = self._native_response_error_category(response)
+            error = httpx.HTTPStatusError(
+                (
+                    f"Codex Responses upstream error "
+                    f"status={response.status_code} category={category}"
+                ),
+                request=response.request,
+                response=response,
+            )
+            error.upstream_status_code = response.status_code
+            error.upstream_error_category = category
+            raise error
         return response.json()
 
     async def _stream_native_responses(
