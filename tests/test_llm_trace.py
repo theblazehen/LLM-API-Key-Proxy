@@ -1,4 +1,5 @@
 import hashlib
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -155,14 +156,16 @@ def test_records_routing_user_messages_and_response(tmp_path):
     rows = list(iter_rows(connection))
     connection.close()
 
-    assert [row["role"] for row in rows] == [
-        "request",
-        "user",
-        "tool",
-        "proxy",
-        "assistant",
-        "assistant",
-        "proxy",
+    assert [(row["role"], row["event_type"]) for row in rows] == [
+        ("request", "begin"),
+        ("request", "request_payload"),
+        ("user", "message"),
+        ("tool", "message"),
+        ("proxy", "credential_selected"),
+        ("proxy", "response_payload"),
+        ("assistant", "response"),
+        ("assistant", "tool_call"),
+        ("proxy", "completed"),
     ]
     assistant = next(row for row in rows if row["content_text"] == "done")
     assert assistant["proxy_user"] == "alice"
@@ -174,6 +177,244 @@ def test_records_routing_user_messages_and_response(tmp_path):
         "[codex_oauth_1.json] [alice] assistant: done"
     )
     assert all("\n" not in render_human(dict(row)) for row in rows)
+
+
+def test_raw_request_payload_round_trips_full_body_and_keeps_normalized_tail(tmp_path):
+    db = tmp_path / "raw-request.sqlite3"
+    body_secret = "raw-body-secret-value"
+    metadata_secret = "Bearer metadata-secret-value"
+    payload = {
+        "model": "codex/gpt-5.6-sol",
+        "system": "top-level system instructions",
+        "messages": [
+            {"role": "system", "content": "full system prompt"},
+            {"role": "developer", "content": "full developer prompt"},
+            {"role": "user", "content": "earlier user turn"},
+            {
+                "role": "assistant",
+                "content": "earlier assistant turn",
+                "tool_calls": [
+                    {
+                        "id": "call-old",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": '{"path":"old"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-old", "content": "old result"},
+            {"role": "user", "content": "new user tail"},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "write exact content",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["path", "content"],
+                    },
+                },
+            }
+        ],
+        "prompt_cache_key": "complete-cache-key",
+        "prompt_cache_options": {"mode": "implicit", "retention": "24h"},
+        "reasoning_effort": "high",
+        "temperature": 0.25,
+        "parallel_tool_calls": True,
+        "authorization": body_secret,
+        "nested": {"api_key": body_secret, "token": body_secret},
+    }
+    recorder = LLMTraceRecorder(db, enabled=True)
+    trace = recorder.begin_request(
+        request_id="raw-request",
+        session_id="raw-session",
+        proxy_user="alice",
+    )
+    trace.request(
+        payload,
+        metadata={
+            "authorization": metadata_secret,
+            "nested": {"access_token": metadata_secret},
+            "safe_label": "raw-request-test",
+        },
+    )
+    assert recorder.flush()
+    recorder.close()
+
+    connection = sqlite3.connect(db)
+    connection.row_factory = sqlite3.Row
+    archive_rows = connection.execute(
+        """
+        SELECT * FROM llm_events
+        WHERE request_id = ? AND role = ? AND event_type = ?
+        """,
+        ("raw-request", "request", "request_payload"),
+    ).fetchall()
+    assert len(archive_rows) == 1
+    archive = archive_rows[0]
+    assert archive["request_id"] == "raw-request"
+    assert archive["session_id"] == "raw-session"
+    assert json.loads(archive["content_json"]) == payload
+    assert body_secret in archive["content_json"]
+    assert metadata_secret not in (archive["metadata_json"] or "")
+    assert "authorization" not in (archive["metadata_json"] or "")
+    assert "access_token" not in (archive["metadata_json"] or "")
+    assert json.loads(archive["metadata_json"]) == {"safe_label": "raw-request-test"}
+
+    normalized = connection.execute(
+        """
+        SELECT role, event_type, content_text FROM llm_events
+        WHERE request_id = ? AND event_type != 'request_payload'
+        ORDER BY id
+        """,
+        ("raw-request",),
+    ).fetchall()
+    assert [(row["role"], row["event_type"], row["content_text"]) for row in normalized] == [
+        ("request", "begin", None),
+        ("tool", "message", "old result"),
+        ("user", "message", "new user tail"),
+    ]
+    connection.close()
+
+
+def test_raw_response_payload_round_trips_envelope_and_keeps_normalized_events(tmp_path):
+    db = tmp_path / "raw-response.sqlite3"
+    payload = {
+        "id": "chatcmpl-full-envelope",
+        "object": "chat.completion",
+        "created": 1785744000,
+        "model": "gpt-5.6-sol",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "response text",
+                    "tool_calls": [
+                        {
+                            "id": "call-new",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": '{"path":"new"}'},
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 120,
+            "completion_tokens": 20,
+            "total_tokens": 140,
+            "prompt_tokens_details": {"cached_tokens": 96},
+        },
+        "service_tier": "default",
+        "system_fingerprint": "fp-complete",
+        "api_key": "raw-response-body-secret",
+    }
+    recorder = LLMTraceRecorder(db, enabled=True)
+    trace = recorder.begin_request(
+        request_id="raw-response",
+        session_id="raw-session",
+        requested_model="codex/gpt-5.6-sol",
+    )
+    trace.response(payload, status="completed")
+    assert recorder.flush()
+    recorder.close()
+
+    connection = sqlite3.connect(db)
+    connection.row_factory = sqlite3.Row
+    archive_rows = connection.execute(
+        """
+        SELECT * FROM llm_events
+        WHERE request_id = ? AND role = ? AND event_type = ?
+        """,
+        ("raw-response", "proxy", "response_payload"),
+    ).fetchall()
+    assert len(archive_rows) == 1
+    archive = archive_rows[0]
+    assert archive["request_id"] == "raw-response"
+    assert archive["session_id"] == "raw-session"
+    assert archive["status"] == "completed"
+    assert json.loads(archive["content_json"]) == payload
+    assert archive["metadata_json"] is None
+
+    normalized = connection.execute(
+        """
+        SELECT role, event_type, content_text, content_json, status
+        FROM llm_events
+        WHERE request_id = ? AND role = 'assistant'
+        ORDER BY id
+        """,
+        ("raw-response",),
+    ).fetchall()
+    assert [(row["role"], row["event_type"], row["status"]) for row in normalized] == [
+        ("assistant", "response", "completed"),
+        ("assistant", "tool_call", "completed"),
+    ]
+    assert normalized[0]["content_text"] == "response text"
+    assert json.loads(normalized[1]["content_json"]) == payload["choices"][0]["message"]["tool_calls"][0]
+    connection.close()
+
+
+def test_scalar_response_payload_is_archived_once_as_text_per_invocation(tmp_path):
+    db = tmp_path / "scalar-response.sqlite3"
+    recorder = LLMTraceRecorder(db, enabled=True)
+    trace = recorder.begin_request(
+        request_id="scalar-response",
+        session_id="scalar-session",
+        requested_model="m",
+    )
+    trace.response("first scalar response")
+    trace.response("second scalar response")
+    assert recorder.flush()
+    recorder.close()
+
+    connection = sqlite3.connect(db)
+    connection.row_factory = sqlite3.Row
+    archive_rows = connection.execute(
+        """
+        SELECT request_id, session_id, role, event_type, content_text, content_json
+        FROM llm_events
+        WHERE request_id = ? AND role = ? AND event_type = ?
+        ORDER BY id
+        """,
+        ("scalar-response", "proxy", "response_payload"),
+    ).fetchall()
+    assert [dict(row) for row in archive_rows] == [
+        {
+            "request_id": "scalar-response",
+            "session_id": "scalar-session",
+            "role": "proxy",
+            "event_type": "response_payload",
+            "content_text": "first scalar response",
+            "content_json": None,
+        },
+        {
+            "request_id": "scalar-response",
+            "session_id": "scalar-session",
+            "role": "proxy",
+            "event_type": "response_payload",
+            "content_text": "second scalar response",
+            "content_json": None,
+        },
+    ]
+    normalized = connection.execute(
+        """
+        SELECT role, event_type, content_text FROM llm_events
+        WHERE request_id = ? AND role = 'assistant' ORDER BY id
+        """,
+        ("scalar-response",),
+    ).fetchall()
+    assert [tuple(row) for row in normalized] == [
+        ("assistant", "response", "first scalar response"),
+        ("assistant", "response", "second scalar response"),
+    ]
+    connection.close()
 
 
 def test_recorder_is_enabled_by_default_under_usage(monkeypatch, tmp_path):

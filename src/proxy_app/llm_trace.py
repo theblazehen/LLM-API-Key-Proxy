@@ -888,12 +888,13 @@ class LLMTraceContext:
         ))
 
     def request(self, payload: Mapping[str, Any], *, metadata: Mapping[str, Any] | None = None) -> None:
-        """Record normalized OpenAI/Anthropic input messages (never headers)."""
+        """Record the raw body and normalized input messages (never headers)."""
         if self.requested_model is None and payload.get("model") is not None:
             self.requested_model = str(payload["model"])
         if metadata:
             self._request_metadata = _sanitize(metadata, drop_private_fields=True)
         request_metadata = self._request_metadata
+        self._emit("request", "request_payload", payload, metadata=metadata)
         self._diagnostics.update(_request_diagnostics(payload, request_metadata))
         self._queue_diagnostics()
         for event in normalize_request(payload):
@@ -919,9 +920,9 @@ class LLMTraceContext:
         self._queue_diagnostics()
         self._emit("proxy", "credential_selected", None, metadata=metadata)
 
-    def response(self, payload: Mapping[str, Any] | str, *, status: str | None = None,
+    def response(self, payload: Any, *, status: str | None = None,
                  metadata: Mapping[str, Any] | None = None) -> None:
-        """Record a final response; streaming callers pass the assembled result once."""
+        """Record the raw body and normalized final response once."""
         if isinstance(payload, Mapping):
             diagnostics = _response_diagnostics(payload)
             response_model = diagnostics.pop("response_model", None)
@@ -929,6 +930,7 @@ class LLMTraceContext:
                 self.resolved_model = response_model
             self._diagnostics.update(diagnostics)
             self._queue_diagnostics()
+        self._emit("proxy", "response_payload", payload, status=status, metadata=metadata)
         events = normalize_response(payload) if isinstance(payload, Mapping) else [_event("assistant", "response", payload)]
         for event in events:
             content = json.loads(event["content_json"]) if event["content_json"] else event["content_text"]
