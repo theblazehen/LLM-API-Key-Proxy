@@ -1023,7 +1023,10 @@ async def streaming_response_wrapper(
                 body=full_response,
             )
         trace = getattr(request.state, "llm_trace", None)
-        if trace:
+        # The executor's transaction-logging stream wrapper owns tracing when it
+        # assembled the same terminal response first.  Keep this outer wrapper
+        # as the fallback for streams that do not trace below this layer.
+        if trace and not getattr(trace, "_finished", False):
             if full_response:
                 trace.response(full_response)
             trace.completed()

@@ -1,8 +1,10 @@
+import asyncio
 import hashlib
 import json
 import sqlite3
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
@@ -358,6 +360,136 @@ def test_raw_response_payload_round_trips_envelope_and_keeps_normalized_events(t
     ]
     assert normalized[0]["content_text"] == "response text"
     assert json.loads(normalized[1]["content_json"]) == payload["choices"][0]["message"]["tool_calls"][0]
+    connection.close()
+
+
+def test_outer_stream_wrapper_does_not_rearchive_executor_owned_response(tmp_path):
+    from proxy_app.main import streaming_response_wrapper
+
+    db = tmp_path / "stream-response-owner.sqlite3"
+    recorder = LLMTraceRecorder(db, enabled=True)
+    trace = recorder.begin_request(
+        request_id="stream-response-owner",
+        session_id="stream-session",
+        requested_model="codex/gpt-5.6-sol",
+    )
+    chunks = [
+        {
+            "id": "chatcmpl-stream-owner",
+            "object": "chat.completion.chunk",
+            "created": 1785744000,
+            "model": "gpt-5.6-sol",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "done"},
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl-stream-owner",
+            "object": "chat.completion.chunk",
+            "created": 1785744000,
+            "model": "gpt-5.6-sol",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 8,
+                "prompt_tokens_details": {"cached_tokens": 96},
+            },
+        },
+    ]
+    assembled = {
+        "id": "chatcmpl-stream-owner",
+        "object": "chat.completion",
+        "created": 1785744000,
+        "model": "gpt-5.6-sol",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "done",
+                    "tool_calls": None,
+                    "function_call": None,
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 120,
+            "completion_tokens": 8,
+            "prompt_tokens_details": {"cached_tokens": 96},
+        },
+    }
+
+    class Request:
+        state = SimpleNamespace(llm_trace=trace)
+
+        async def is_disconnected(self):
+            return False
+
+    async def executor_owned_stream():
+        for chunk in chunks:
+            yield f"data: {json.dumps(chunk)}\n\n"
+        # RequestExecutor._transaction_logging_stream_wrapper records and
+        # completes the trace before this outer wrapper's finally block runs.
+        trace.response(assembled)
+        trace.completed()
+        yield "data: [DONE]\n\n"
+
+    async def collect():
+        return [
+            chunk
+            async for chunk in streaming_response_wrapper(
+                Request(), {}, executor_owned_stream()
+            )
+        ]
+
+    output = asyncio.run(collect())
+    assert output[-1] == "data: [DONE]\n\n"
+    assert recorder.flush()
+    recorder.close()
+
+    connection = sqlite3.connect(db)
+    connection.row_factory = sqlite3.Row
+    event_counts = dict(
+        connection.execute(
+            """
+            SELECT event_type, COUNT(*)
+            FROM llm_events
+            WHERE request_id = ?
+            GROUP BY event_type
+            """,
+            ("stream-response-owner",),
+        )
+    )
+    assert event_counts["response_payload"] == 1
+    assert event_counts["response"] == 1
+    assert event_counts["completed"] == 1
+    archived = connection.execute(
+        """
+        SELECT content_json FROM llm_events
+        WHERE request_id = ? AND event_type = 'response_payload'
+        """,
+        ("stream-response-owner",),
+    ).fetchone()
+    assert json.loads(archived["content_json"]) == assembled
+    diagnostic = _diagnostic_row(connection, "stream-response-owner")
+    assert diagnostic["resolved_model"] == "gpt-5.6-sol"
+    assert diagnostic["input_tokens"] == 120
+    assert diagnostic["cache_read_tokens"] == 96
+    assert diagnostic["output_tokens"] == 8
+    assert diagnostic["response_id_hash"] == hashlib.sha256(
+        b"chatcmpl-stream-owner"
+    ).hexdigest()
     connection.close()
 
 
