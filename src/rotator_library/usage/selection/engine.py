@@ -8,9 +8,12 @@ Central component that orchestrates limit checking, modifiers,
 and rotation strategies to select the best credential.
 """
 
-import time
+from __future__ import annotations
+
 import logging
-from typing import Any, Dict, List, Optional, Set, Union
+import time
+from collections import OrderedDict
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Union
 
 from ..types import (
     CredentialState,
@@ -18,13 +21,20 @@ from ..types import (
     RotationMode,
     LimitCheckResult,
 )
-from ..config import ProviderUsageConfig
-from ..limits.engine import LimitEngine
-from ..tracking.windows import WindowManager
 from .strategies.balanced import BalancedStrategy
 from .strategies.sequential import SequentialStrategy
 
+if TYPE_CHECKING:
+    from ..config import ProviderUsageConfig
+    from ..limits.engine import LimitEngine
+    from ..tracking.windows import WindowManager
+
 lib_logger = logging.getLogger("rotator_library")
+
+
+_PROMPT_CACHE_AFFINITY_TTL_SECONDS = 30 * 60
+_PROMPT_CACHE_AFFINITY_MAX_ENTRIES = 4096
+_PROMPT_CACHE_AFFINITY_MAX_KEY_LENGTH = 256
 
 
 class SelectionEngine:
@@ -42,6 +52,10 @@ class SelectionEngine:
         config: ProviderUsageConfig,
         limit_engine: LimitEngine,
         window_manager: WindowManager,
+        *,
+        prompt_cache_affinity_ttl_seconds: float = _PROMPT_CACHE_AFFINITY_TTL_SECONDS,
+        prompt_cache_affinity_max_entries: int = _PROMPT_CACHE_AFFINITY_MAX_ENTRIES,
+        clock: Callable[[], float] = time.monotonic,
     ):
         """
         Initialize selection engine.
@@ -53,6 +67,14 @@ class SelectionEngine:
         self._config = config
         self._limits = limit_engine
         self._windows = window_manager
+        self._prompt_cache_affinity: OrderedDict[str, tuple[str, float]] = OrderedDict()
+        self._prompt_cache_affinity_ttl_seconds = max(
+            0.0, prompt_cache_affinity_ttl_seconds
+        )
+        self._prompt_cache_affinity_max_entries = max(
+            0, prompt_cache_affinity_max_entries
+        )
+        self._clock = clock
 
         # Initialize strategies
         self._balanced = BalancedStrategy(config.rotation_tolerance)
@@ -73,6 +95,7 @@ class SelectionEngine:
         exclude: Optional[Set[str]] = None,
         priorities: Optional[Dict[str, int]] = None,
         deadline: float = 0.0,
+        prompt_cache_key: Optional[str] = None,
     ) -> Optional[str]:
         """
         Select the best available credential.
@@ -85,6 +108,7 @@ class SelectionEngine:
             exclude: Set of stable_ids to exclude
             priorities: Override priorities (stable_id -> priority)
             deadline: Request deadline timestamp
+            prompt_cache_key: Stable Codex conversation key for credential affinity
 
         Returns:
             Selected stable_id, or None if none available
@@ -105,6 +129,18 @@ class SelectionEngine:
             if result.allowed:
                 available.append(stable_id)
 
+        affinity_credential = self._get_prompt_cache_affinity(
+            provider, prompt_cache_key
+        )
+        if affinity_credential is not None:
+            if affinity_credential in available:
+                lib_logger.debug(
+                    f"Reusing eligible credential {affinity_credential} for {provider}/{model} "
+                    "prompt-cache affinity"
+                )
+                return affinity_credential
+            self._discard_prompt_cache_affinity(provider, prompt_cache_key)
+
         if not available:
             # Check if we should reset fair cycle
             if self._config.fair_cycle.enabled:
@@ -119,13 +155,14 @@ class SelectionEngine:
                 if reset_performed:
                     # Retry selection after reset
                     return self.select(
-                        provider,
-                        model,
-                        states,
-                        quota_group,
-                        exclude,
-                        priorities,
-                        deadline,
+                        provider=provider,
+                        model=model,
+                        states=states,
+                        quota_group=quota_group,
+                        exclude=exclude,
+                        priorities=priorities,
+                        deadline=deadline,
+                        prompt_cache_key=prompt_cache_key,
                     )
 
             lib_logger.debug(
@@ -162,7 +199,15 @@ class SelectionEngine:
         # Step 4: Apply rotation strategy
         selected = self._strategy.select(context, states)
 
+        if selected is not None and selected not in available:
+            lib_logger.error(
+                f"Selection strategy returned unavailable credential {selected} "
+                f"for {provider}/{model}"
+            )
+            return None
+
         if selected:
+            self._set_prompt_cache_affinity(provider, prompt_cache_key, selected)
             lib_logger.debug(
                 f"Selected credential {selected} for {provider}/{model} "
                 f"(from {len(available)} available)"
@@ -179,6 +224,7 @@ class SelectionEngine:
         tried: Optional[Set[str]] = None,
         priorities: Optional[Dict[str, int]] = None,
         deadline: float = 0.0,
+        prompt_cache_key: Optional[str] = None,
     ) -> Optional[str]:
         """
         Select a credential for retry, excluding already-tried ones.
@@ -193,6 +239,7 @@ class SelectionEngine:
             tried: Set of already-tried stable_ids
             priorities: Override priorities
             deadline: Request deadline timestamp
+            prompt_cache_key: Stable Codex conversation key for credential affinity
 
         Returns:
             Selected stable_id, or None if none available
@@ -205,6 +252,83 @@ class SelectionEngine:
             exclude=tried,
             priorities=priorities,
             deadline=deadline,
+            prompt_cache_key=prompt_cache_key,
+        )
+
+    def _get_prompt_cache_affinity(
+        self,
+        provider: str,
+        prompt_cache_key: Optional[str],
+    ) -> Optional[str]:
+        """Return the live Codex affinity target and refresh its idle TTL."""
+        if not self._uses_prompt_cache_affinity(provider, prompt_cache_key):
+            return None
+
+        now = self._clock()
+        self._cleanup_prompt_cache_affinity(now)
+        entry = self._prompt_cache_affinity.get(prompt_cache_key)
+        if entry is None:
+            return None
+
+        stable_id, _last_used_at = entry
+        self._prompt_cache_affinity[prompt_cache_key] = (stable_id, now)
+        self._prompt_cache_affinity.move_to_end(prompt_cache_key)
+        return stable_id
+
+    def _set_prompt_cache_affinity(
+        self,
+        provider: str,
+        prompt_cache_key: Optional[str],
+        stable_id: str,
+    ) -> None:
+        """Bind a Codex cache key to a credential, with LRU and idle-TTL bounds."""
+        if not self._uses_prompt_cache_affinity(provider, prompt_cache_key):
+            return
+
+        now = self._clock()
+        self._cleanup_prompt_cache_affinity(now)
+        self._prompt_cache_affinity[prompt_cache_key] = (stable_id, now)
+        self._prompt_cache_affinity.move_to_end(prompt_cache_key)
+
+        while len(self._prompt_cache_affinity) > self._prompt_cache_affinity_max_entries:
+            self._prompt_cache_affinity.popitem(last=False)
+
+    def _discard_prompt_cache_affinity(
+        self,
+        provider: str,
+        prompt_cache_key: Optional[str],
+    ) -> None:
+        """Forget a Codex affinity that is no longer eligible."""
+        if self._uses_prompt_cache_affinity(provider, prompt_cache_key):
+            self._prompt_cache_affinity.pop(prompt_cache_key, None)
+
+    def _cleanup_prompt_cache_affinity(self, now: float) -> None:
+        """Evict least-recently-used entries that passed their idle TTL."""
+        if self._prompt_cache_affinity_ttl_seconds <= 0:
+            self._prompt_cache_affinity.clear()
+            return
+
+        while self._prompt_cache_affinity:
+            _key, (_stable_id, last_used_at) = next(
+                iter(self._prompt_cache_affinity.items())
+            )
+            if now - last_used_at < self._prompt_cache_affinity_ttl_seconds:
+                break
+            self._prompt_cache_affinity.popitem(last=False)
+
+    def _uses_prompt_cache_affinity(
+        self,
+        provider: str,
+        prompt_cache_key: Optional[str],
+    ) -> bool:
+        """Keep affinity scoped to opaque, non-empty Codex cache keys."""
+        return (
+            provider == "codex"
+            and isinstance(prompt_cache_key, str)
+            and bool(prompt_cache_key)
+            and len(prompt_cache_key) <= _PROMPT_CACHE_AFFINITY_MAX_KEY_LENGTH
+            and self._prompt_cache_affinity_max_entries > 0
+            and self._prompt_cache_affinity_ttl_seconds > 0
         )
 
     def get_availability_stats(

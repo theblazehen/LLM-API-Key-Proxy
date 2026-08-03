@@ -30,9 +30,12 @@ fake_error_handler.mask_credential = lambda credential, style="default": credent
 sys.modules.setdefault("rotator_library.error_handler", fake_error_handler)
 
 from rotator_library.usage.selection.strategies.sequential import SequentialStrategy
+from rotator_library.usage.selection.engine import SelectionEngine
 from rotator_library.usage.types import (
     CredentialState,
     GroupStats,
+    LimitCheckResult,
+    LimitResult,
     RotationMode,
     SelectionContext,
     WindowStats,
@@ -71,6 +74,55 @@ def context(*accounts, provider="codex", group="codex-global", priorities=None, 
         rotation_mode=RotationMode.SEQUENTIAL,
         rotation_tolerance=3.0,
         deadline=time.time() + 30,
+    )
+
+
+class _FakeLimits:
+    def __init__(self, blocked=None):
+        self.blocked = blocked or set()
+
+    def check_all(self, state, _model, _quota_group):
+        if state.stable_id in self.blocked:
+            return LimitCheckResult.blocked(
+                self.blocked[state.stable_id]
+                if isinstance(self.blocked, dict)
+                else LimitResult.BLOCKED_COOLDOWN,
+                "test-unavailable",
+            )
+        return LimitCheckResult.ok()
+
+
+class _FakeWindows:
+    @staticmethod
+    def get_primary_definition():
+        return None
+
+
+def affinity_engine(*, limits=None, clock=None, ttl=30, capacity=8):
+    config = types.SimpleNamespace(
+        rotation_mode=RotationMode.SEQUENTIAL,
+        rotation_tolerance=3.0,
+        sequential_fallback_multiplier=1,
+        fair_cycle=types.SimpleNamespace(enabled=False),
+    )
+    return SelectionEngine(
+        config,
+        limits or _FakeLimits(),
+        _FakeWindows(),
+        prompt_cache_affinity_ttl_seconds=ttl,
+        prompt_cache_affinity_max_entries=capacity,
+        clock=clock or (lambda: 0.0),
+    )
+
+
+def select_with_affinity(engine, states, key, *, exclude=None):
+    return engine.select(
+        provider="codex",
+        model="gpt-5-codex",
+        states=states,
+        quota_group="test-group",
+        exclude=exclude,
+        prompt_cache_key=key,
     )
 
 
@@ -202,3 +254,83 @@ def test_non_codex_selection_keeps_existing_sequential_behavior():
     )
 
     assert selected == "primary"
+
+
+def test_codex_prompt_cache_key_reuses_eligible_credential_over_normal_selection():
+    states = {
+        "bound": credential("bound", priority=2),
+        "normal": credential("normal", priority=1),
+    }
+    engine = affinity_engine()
+
+    assert select_with_affinity(engine, states, "conversation-1") == "normal"
+
+    # A different key establishes an otherwise eligible lower-priority binding.
+    assert select_with_affinity(engine, {"bound": states["bound"]}, "conversation-2") == "bound"
+    assert select_with_affinity(engine, states, "conversation-2") == "bound"
+
+
+def test_ineligible_affinity_falls_back_normally_and_remaps_key():
+    states = {
+        "bound": credential("bound", priority=1),
+        "fallback": credential("fallback", priority=2),
+    }
+    limits = _FakeLimits()
+    engine = affinity_engine(limits=limits)
+
+    assert select_with_affinity(engine, states, "conversation") == "bound"
+    limits.blocked.add("bound")
+
+    assert select_with_affinity(engine, states, "conversation") == "fallback"
+    assert engine._prompt_cache_affinity["conversation"][0] == "fallback"
+
+
+def test_excluded_affinity_is_never_returned():
+    states = {
+        "bound": credential("bound", priority=1),
+        "fallback": credential("fallback", priority=2),
+    }
+    engine = affinity_engine()
+
+    assert select_with_affinity(engine, states, "conversation") == "bound"
+    assert select_with_affinity(
+        engine, states, "conversation", exclude={"bound"}
+    ) == "fallback"
+
+
+def test_cooldown_quota_or_concurrency_ineligible_affinity_never_returns_bound_key():
+    states = {
+        "bound": credential("bound", priority=1),
+        "fallback": credential("fallback", priority=2),
+    }
+
+    for blocked_by in (
+        LimitResult.BLOCKED_COOLDOWN,
+        LimitResult.BLOCKED_WINDOW,
+        LimitResult.BLOCKED_CONCURRENT,
+    ):
+        limits = _FakeLimits()
+        engine = affinity_engine(limits=limits)
+        assert select_with_affinity(engine, states, f"conversation-{blocked_by}") == "bound"
+
+        limits.blocked = {"bound": blocked_by}
+        assert (
+            select_with_affinity(engine, states, f"conversation-{blocked_by}")
+            == "fallback"
+        )
+
+
+def test_affinity_cache_expires_and_evicts_least_recently_used_entries():
+    now = [0.0]
+    states = {"only": credential("only")}
+    engine = affinity_engine(clock=lambda: now[0], ttl=10, capacity=2)
+
+    for key in ("old", "middle", "new"):
+        assert select_with_affinity(engine, states, key) == "only"
+        now[0] += 1
+
+    assert list(engine._prompt_cache_affinity) == ["middle", "new"]
+
+    now[0] = 13.0
+    assert select_with_affinity(engine, states, "fresh") == "only"
+    assert list(engine._prompt_cache_affinity) == ["fresh"]

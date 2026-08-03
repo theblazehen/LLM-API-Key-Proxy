@@ -343,6 +343,7 @@ class UsageManager:
         candidates: Optional[List[str]] = None,
         priorities: Optional[Dict[str, int]] = None,
         deadline: float = 0.0,
+        prompt_cache_key: Optional[str] = None,
     ) -> CredentialContext:
         """
         Acquire a credential for a request.
@@ -362,6 +363,7 @@ class UsageManager:
             priorities: Optional priority overrides (accessor -> priority).
                        If provided, overrides the stored priorities.
             deadline: Request deadline timestamp
+            prompt_cache_key: Stable Codex conversation key for credential affinity.
 
         Returns:
             CredentialContext for use with async with
@@ -420,6 +422,7 @@ class UsageManager:
                 exclude=exclude_ids,
                 priorities=priority_overrides,
                 deadline=deadline,
+                prompt_cache_key=prompt_cache_key,
             )
 
             if stable_id is not None:
@@ -566,6 +569,7 @@ class UsageManager:
         quota_group: Optional[str] = None,
         exclude: Optional[Set[str]] = None,
         deadline: float = 0.0,
+        prompt_cache_key: Optional[str] = None,
     ) -> Optional[str]:
         """
         Get the best available credential without acquiring.
@@ -577,6 +581,7 @@ class UsageManager:
             quota_group: Optional quota group
             exclude: Set of accessors to exclude
             deadline: Request deadline
+            prompt_cache_key: Stable Codex conversation key for credential affinity
 
         Returns:
             Credential accessor, or None if none available
@@ -598,6 +603,7 @@ class UsageManager:
             quota_group=quota_group,
             exclude=exclude_ids,
             deadline=deadline,
+            prompt_cache_key=prompt_cache_key,
         )
 
         if stable_id is None:

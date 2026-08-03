@@ -13,6 +13,7 @@ with streaming vs non-streaming handled as a parameter.
 """
 
 import asyncio
+import codecs
 import json
 import logging
 import os
@@ -532,6 +533,7 @@ class RequestExecutor:
                     candidates=untried,
                     priorities=filter_result.priorities,
                     deadline=deadline,
+                    prompt_cache_key=context.kwargs.get("prompt_cache_key"),
                 ) as cred_context:
                     cred = cred_context.credential
                     retry_state.record_attempt(cred)
@@ -773,6 +775,7 @@ class RequestExecutor:
                         candidates=untried,
                         priorities=filter_result.priorities,
                         deadline=deadline,
+                        prompt_cache_key=context.kwargs.get("prompt_cache_key"),
                     ) as cred_context:
                         cred = cred_context.credential
                         retry_state.record_attempt(cred)
@@ -852,11 +855,21 @@ class RequestExecutor:
                                         stream = await litellm.acompletion(**kwargs)
 
                                     if use_responses:
-                                        cred_context.mark_success(response=None)
                                         lib_logger.info(
                                             f"Native Responses stream established for credential {mask_credential(cred)}."
                                         )
-                                        async for chunk in stream:
+                                        trace_state = getattr(
+                                            getattr(context, "request", None), "state", None
+                                        )
+                                        llm_trace = getattr(trace_state, "llm_trace", None)
+                                        async for chunk in self._native_responses_stream_wrapper(
+                                            stream,
+                                            provider=provider,
+                                            model=model,
+                                            cred_context=cred_context,
+                                            transaction_logger=context.transaction_logger,
+                                            llm_trace=llm_trace,
+                                        ):
                                             yield chunk
                                         return
 
@@ -1467,6 +1480,213 @@ class RequestExecutor:
         except Exception as exc:
             lib_logger.debug(f"Cost calculation failed for {model}: {exc}")
             return 0.0
+
+    @staticmethod
+    def _native_responses_usage_tokens(
+        terminal_response: Dict[str, Any],
+    ) -> tuple[int, int, int, int, int]:
+        """Return normalized usage counters from a native Responses terminal item."""
+        usage = terminal_response.get("usage")
+        if not isinstance(usage, dict):
+            return 0, 0, 0, 0, 0
+
+        def token(value: Any) -> int:
+            return value if isinstance(value, int) and value > 0 else 0
+
+        input_tokens = token(usage.get("input_tokens", usage.get("prompt_tokens")))
+        output_tokens = token(
+            usage.get("output_tokens", usage.get("completion_tokens"))
+        )
+        input_details = usage.get("input_tokens_details")
+        if not isinstance(input_details, dict):
+            input_details = usage.get("prompt_tokens_details")
+        if not isinstance(input_details, dict):
+            input_details = {}
+        output_details = usage.get("output_tokens_details")
+        if not isinstance(output_details, dict):
+            output_details = usage.get("completion_tokens_details")
+        if not isinstance(output_details, dict):
+            output_details = {}
+
+        cache_read_tokens = token(
+            input_details.get("cached_tokens", usage.get("cache_read_tokens"))
+        )
+        cache_write_tokens = token(
+            input_details.get(
+                "cache_creation_tokens",
+                input_details.get(
+                    "cache_write_tokens",
+                    usage.get("cache_creation_tokens", usage.get("cache_write_tokens")),
+                ),
+            )
+        )
+        thinking_tokens = token(
+            output_details.get("reasoning_tokens", usage.get("reasoning_tokens"))
+        )
+        return (
+            max(0, input_tokens - cache_read_tokens),
+            max(0, output_tokens - thinking_tokens),
+            cache_read_tokens,
+            cache_write_tokens,
+            thinking_tokens,
+        )
+
+    def _calculate_native_responses_cost(
+        self,
+        provider: str,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        cache_read_tokens: int,
+        cache_write_tokens: int,
+        thinking_tokens: int,
+    ) -> float:
+        """Calculate the equivalent cost when native Responses supplies raw usage."""
+        # Some focused consumers construct the executor without __init__; native
+        # stream accounting must still work even when cost estimation is absent.
+        if not hasattr(self, "_plugin_instances"):
+            return 0.0
+
+        plugin = self._get_plugin_instance(provider)
+        if not plugin or not getattr(plugin, "calculate_api_equivalent_cost", False):
+            return 0.0
+
+        try:
+            from ..model_info_service import get_model_info_service
+
+            pricing_model = model
+            equivalent_model = getattr(plugin, "get_api_equivalent_model", None)
+            if equivalent_model:
+                pricing_model = equivalent_model(model)
+            cost = get_model_info_service().compute_cost(
+                pricing_model,
+                prompt_tokens,
+                completion_tokens + thinking_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            )
+            return float(cost) if cost is not None else 0.0
+        except Exception as exc:
+            lib_logger.debug(
+                f"Native Responses cost calculation failed for {model}: {exc}"
+            )
+            return 0.0
+
+    async def _native_responses_stream_wrapper(
+        self,
+        stream: AsyncGenerator[Any, None],
+        *,
+        provider: str,
+        model: str,
+        cred_context: Any,
+        transaction_logger: Optional[TransactionLogger],
+        llm_trace: Optional[Any],
+    ) -> AsyncGenerator[Any, None]:
+        """Pass through a native Responses stream and account its terminal usage.
+
+        Native Responses usage arrives in ``response.completed`` rather than in a
+        final Chat Completions chunk.  Do not mark the credential successful until
+        that terminal event has been assembled; otherwise a broken stream records a
+        false success and loses cache-read/cache-write accounting.
+        """
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        pending = ""
+        terminal_response: Optional[Dict[str, Any]] = None
+
+        def consume_records() -> None:
+            nonlocal pending, terminal_response
+            while "\n\n" in pending:
+                record, pending = pending.split("\n\n", 1)
+                event_name: Optional[str] = None
+                data_lines: List[str] = []
+                for line in record.splitlines():
+                    if line.startswith("event:"):
+                        event_name = line[6:].strip()
+                    elif line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+                if not data_lines:
+                    continue
+                raw = "\n".join(data_lines).strip()
+                if not raw or raw == "[DONE]":
+                    continue
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                event_type = event.get("type") or event_name
+                if event_type == "response.completed":
+                    response = event.get("response")
+                    if not isinstance(response, dict) and event.get("object") == "response":
+                        response = event
+                    if isinstance(response, dict):
+                        terminal_response = response
+                elif event_type in {"response.failed", "error"}:
+                    error = event.get("error")
+                    if not isinstance(error, dict):
+                        response = event.get("response")
+                        error = response.get("error") if isinstance(response, dict) else None
+                    message = (
+                        error.get("message", "Native Responses stream failed")
+                        if isinstance(error, dict)
+                        else "Native Responses stream failed"
+                    )
+                    raise StreamedAPIError(message, data=event)
+
+        async for chunk in stream:
+            if isinstance(chunk, (bytes, bytearray)):
+                text = decoder.decode(bytes(chunk), final=False)
+            else:
+                text = str(chunk)
+            pending += text.replace("\r\n", "\n")
+            consume_records()
+            yield chunk
+
+        pending += decoder.decode(b"", final=True).replace("\r\n", "\n")
+        consume_records()
+        if terminal_response is None:
+            raise StreamedAPIError(
+                "Native Responses stream ended without response.completed"
+            )
+
+        (
+            prompt_tokens,
+            completion_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            thinking_tokens,
+        ) = self._native_responses_usage_tokens(terminal_response)
+        approx_cost = self._calculate_native_responses_cost(
+            provider,
+            model,
+            prompt_tokens,
+            completion_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            thinking_tokens,
+        )
+        cred_context.mark_success(
+            response=terminal_response,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            thinking_tokens=thinking_tokens,
+            prompt_tokens_cache_read=cache_read_tokens,
+            prompt_tokens_cache_write=cache_write_tokens,
+            approx_cost=approx_cost,
+        )
+
+        if transaction_logger:
+            try:
+                transaction_logger.log_response(terminal_response)
+            except Exception as exc:
+                lib_logger.debug(f"Failed to log native Responses terminal item: {exc}")
+        if llm_trace:
+            try:
+                llm_trace.response(terminal_response)
+                llm_trace.completed()
+            except Exception as exc:
+                lib_logger.debug(f"Failed to trace native Responses terminal item: {exc}")
 
     async def _transaction_logging_stream_wrapper(
         self,

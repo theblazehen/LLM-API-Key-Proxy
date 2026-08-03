@@ -49,6 +49,22 @@ _SECRET_KEYS = frozenset(
         "x-api-key",
     }
 )
+_PRIVATE_METADATA_KEYS = frozenset(
+    {
+        "prompt_cache_key",
+        "previous_response_id",
+        "response_id",
+        "instructions",
+        "system",
+        "messages",
+        "input",
+        "output",
+        "tools",
+    }
+)
+_TRANSPORT_MODES = frozenset(
+    {"chat_completions", "responses", "anthropic_messages"}
+)
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS llm_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,6 +87,29 @@ CREATE INDEX IF NOT EXISTS llm_events_request_id ON llm_events(request_id, id);
 CREATE INDEX IF NOT EXISTS llm_events_session_id ON llm_events(session_id, id);
 CREATE INDEX IF NOT EXISTS llm_events_user_id ON llm_events(proxy_user, id);
 CREATE INDEX IF NOT EXISTS llm_events_model_id ON llm_events(resolved_model, requested_model, id);
+CREATE TABLE IF NOT EXISTS llm_request_diagnostics (
+    request_id TEXT PRIMARY KEY,
+    session_id TEXT,
+    requested_model TEXT,
+    resolved_model TEXT,
+    provider TEXT,
+    credential_id TEXT,
+    prompt_cache_key_hash TEXT,
+    system_instructions_hash TEXT,
+    tools_schema_hash TEXT,
+    reasoning_effort TEXT,
+    input_tokens INTEGER,
+    cache_read_tokens INTEGER,
+    cache_write_tokens INTEGER,
+    output_tokens INTEGER,
+    cache_breakpoint_mode TEXT,
+    cache_breakpoint_location TEXT,
+    previous_response_id_present INTEGER NOT NULL DEFAULT 0,
+    response_id_hash TEXT,
+    transport_mode TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS llm_session_prefixes (
     proxy_user TEXT NOT NULL,
     requested_model TEXT NOT NULL,
@@ -89,6 +128,60 @@ _COLUMNS = (
     "content_text", "content_json", "status", "metadata_json",
 )
 _INSERT = f"INSERT INTO llm_events ({','.join(_COLUMNS)}) VALUES ({','.join('?' for _ in _COLUMNS)})"
+_DIAGNOSTIC_COLUMNS = (
+    "request_id", "session_id", "requested_model", "resolved_model", "provider",
+    "credential_id", "prompt_cache_key_hash", "system_instructions_hash",
+    "tools_schema_hash", "reasoning_effort", "input_tokens", "cache_read_tokens",
+    "cache_write_tokens", "output_tokens", "cache_breakpoint_mode",
+    "cache_breakpoint_location", "previous_response_id_present", "response_id_hash",
+    "transport_mode", "created_at", "updated_at",
+)
+_DIAGNOSTIC_MIGRATIONS = {
+    "session_id": "TEXT",
+    "requested_model": "TEXT",
+    "resolved_model": "TEXT",
+    "provider": "TEXT",
+    "credential_id": "TEXT",
+    "prompt_cache_key_hash": "TEXT",
+    "system_instructions_hash": "TEXT",
+    "tools_schema_hash": "TEXT",
+    "reasoning_effort": "TEXT",
+    "input_tokens": "INTEGER",
+    "cache_read_tokens": "INTEGER",
+    "cache_write_tokens": "INTEGER",
+    "output_tokens": "INTEGER",
+    "cache_breakpoint_mode": "TEXT",
+    "cache_breakpoint_location": "TEXT",
+    "previous_response_id_present": "INTEGER NOT NULL DEFAULT 0",
+    "response_id_hash": "TEXT",
+    "transport_mode": "TEXT",
+    "created_at": "TEXT",
+    "updated_at": "TEXT",
+}
+_UPSERT_DIAGNOSTICS = f"""
+INSERT INTO llm_request_diagnostics ({','.join(_DIAGNOSTIC_COLUMNS)})
+VALUES ({','.join('?' for _ in _DIAGNOSTIC_COLUMNS)})
+ON CONFLICT(request_id) DO UPDATE SET
+    session_id=excluded.session_id,
+    requested_model=excluded.requested_model,
+    resolved_model=excluded.resolved_model,
+    provider=excluded.provider,
+    credential_id=excluded.credential_id,
+    prompt_cache_key_hash=excluded.prompt_cache_key_hash,
+    system_instructions_hash=excluded.system_instructions_hash,
+    tools_schema_hash=excluded.tools_schema_hash,
+    reasoning_effort=excluded.reasoning_effort,
+    input_tokens=excluded.input_tokens,
+    cache_read_tokens=excluded.cache_read_tokens,
+    cache_write_tokens=excluded.cache_write_tokens,
+    output_tokens=excluded.output_tokens,
+    cache_breakpoint_mode=excluded.cache_breakpoint_mode,
+    cache_breakpoint_location=excluded.cache_breakpoint_location,
+    previous_response_id_present=excluded.previous_response_id_present,
+    response_id_hash=excluded.response_id_hash,
+    transport_mode=excluded.transport_mode,
+    updated_at=excluded.updated_at
+"""
 _UPSERT_PREFIX = """
 INSERT INTO llm_session_prefixes
     (proxy_user, requested_model, prefix_hash, prefix_length, session_id, updated_at)
@@ -111,13 +204,17 @@ def _enabled_from_env() -> bool:
     }
 
 
-def _sanitize(value: Any) -> Any:
-    """Make metadata JSON-safe while removing keys likely to contain secrets."""
+def _sanitize(value: Any, *, drop_private_fields: bool = False) -> Any:
+    """Make values JSON-safe while removing secrets and optional private fields."""
     if isinstance(value, Mapping):
         return {
-            str(key): _sanitize(item)
+            str(key): _sanitize(item, drop_private_fields=drop_private_fields)
             for key, item in value.items()
             if str(key).strip().lower() not in _SECRET_KEYS
+            and (
+                not drop_private_fields
+                or str(key).strip().lower() not in _PRIVATE_METADATA_KEYS
+            )
             and not any(
                 marker in str(key).strip().lower()
                 for marker in ("authorization", "authentication", "password", "secret", "token", "cookie")
@@ -125,7 +222,7 @@ def _sanitize(value: Any) -> Any:
             and not str(key).strip().lower().endswith(("-key", "_key"))
         }
     if isinstance(value, (list, tuple)):
-        return [_sanitize(item) for item in value]
+        return [_sanitize(item, drop_private_fields=drop_private_fields) for item in value]
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return str(value)
@@ -135,6 +232,219 @@ def _json(value: Any) -> str | None:
     if value is None:
         return None
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _hash_text(value: Any) -> str | None:
+    """Return a deterministic digest without retaining an opaque identifier."""
+    if not isinstance(value, str) or not value:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _hash_structure(value: Any) -> str | None:
+    """Return a stable digest of safe structured request material."""
+    if value is None:
+        return None
+    encoded = json.dumps(
+        _sanitize(value),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _transport_mode(
+    payload: Mapping[str, Any], metadata: Mapping[str, Any] | None = None
+) -> str | None:
+    """Identify the protocol without retaining request routing metadata."""
+    explicit = metadata.get("transport_mode") if metadata else None
+    if isinstance(explicit, str) and explicit in _TRANSPORT_MODES:
+        return explicit
+    path = metadata.get("path") if metadata else None
+    if path == "/v1/chat/completions":
+        return "chat_completions"
+    if path == "/v1/responses":
+        return "responses"
+    if path == "/v1/messages":
+        return "anthropic_messages"
+    if "input" in payload and "messages" not in payload:
+        return "responses"
+    if "messages" in payload:
+        return "chat_completions"
+    return None
+
+
+def _system_instruction_material(payload: Mapping[str, Any]) -> list[Any]:
+    """Extract only system/developer instruction structure for a one-way digest."""
+    material: list[Any] = []
+    for key in ("instructions", "system"):
+        if payload.get(key) is not None:
+            material.append({key: payload[key]})
+
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if isinstance(message, Mapping) and message.get("role") in {"system", "developer"}:
+                material.append(
+                    {
+                        "role": message.get("role"),
+                        "content": message.get("content"),
+                    }
+                )
+
+    input_items = payload.get("input")
+    if isinstance(input_items, list):
+        for item in input_items:
+            if isinstance(item, Mapping) and item.get("role") in {"system", "developer"}:
+                material.append(
+                    {
+                        "type": item.get("type"),
+                        "role": item.get("role"),
+                        "content": item.get("content"),
+                    }
+                )
+    return material
+
+
+def _reasoning_effort(payload: Mapping[str, Any]) -> str | None:
+    """Normalize the common Chat Completions and Responses effort forms."""
+    effort = payload.get("reasoning_effort")
+    if effort is None:
+        reasoning = payload.get("reasoning")
+        if isinstance(reasoning, Mapping):
+            effort = reasoning.get("effort")
+    if effort is None:
+        generation_config = payload.get("generation_config")
+        if isinstance(generation_config, Mapping):
+            effort = generation_config.get("reasoning_effort")
+    if isinstance(effort, str):
+        normalized = effort.strip()
+        return normalized or None
+    return None
+
+
+def _breakpoint_diagnostics(payload: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """Extract only a public cache-control mode and scalar location."""
+    breakpoint = payload.get("prompt_cache_breakpoint")
+    if isinstance(breakpoint, Mapping):
+        mode = breakpoint.get("mode", breakpoint.get("type"))
+        location = breakpoint.get(
+            "location", breakpoint.get("index", breakpoint.get("position"))
+        )
+        return (
+            str(mode) if isinstance(mode, (str, int, float)) else None,
+            str(location) if isinstance(location, (str, int, float)) else None,
+        )
+    if isinstance(breakpoint, (str, int, float)):
+        return str(breakpoint), None
+
+    options = payload.get("prompt_cache_options")
+    if isinstance(options, Mapping):
+        mode = options.get("mode")
+        if isinstance(mode, (str, int, float)):
+            return str(mode), None
+    return None, None
+
+
+def _token_count(value: Any) -> int | None:
+    """Normalize a non-negative token counter while preserving explicit zero."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _first_token(usage: Mapping[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        if key in usage:
+            return _token_count(usage.get(key))
+    return None
+
+
+def _usage_diagnostics(payload: Mapping[str, Any]) -> dict[str, int | None]:
+    """Read OpenAI Chat/Responses and Anthropic usage without inventing values."""
+    usage = payload.get("usage")
+    if not isinstance(usage, Mapping):
+        return {}
+
+    prompt_details = usage.get("prompt_tokens_details")
+    input_details = usage.get("input_tokens_details")
+    details = prompt_details if isinstance(prompt_details, Mapping) else input_details
+    if not isinstance(details, Mapping):
+        details = {}
+
+    return {
+        "input_tokens": _first_token(usage, "input_tokens", "prompt_tokens"),
+        "output_tokens": _first_token(usage, "output_tokens", "completion_tokens"),
+        "cache_read_tokens": _first_token(
+            usage, "cache_read_tokens", "cached_tokens", "cache_read_input_tokens"
+        )
+        if any(
+            key in usage
+            for key in ("cache_read_tokens", "cached_tokens", "cache_read_input_tokens")
+        )
+        else _first_token(details, "cached_tokens", "cache_read_tokens"),
+        "cache_write_tokens": _first_token(
+            usage,
+            "cache_write_tokens",
+            "cache_creation_tokens",
+            "cache_creation_input_tokens",
+        )
+        if any(
+            key in usage
+            for key in (
+                "cache_write_tokens",
+                "cache_creation_tokens",
+                "cache_creation_input_tokens",
+            )
+        )
+        else _first_token(details, "cache_creation_tokens", "cache_write_tokens"),
+    }
+
+
+def _request_diagnostics(
+    payload: Mapping[str, Any], metadata: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    breakpoint_mode, breakpoint_location = _breakpoint_diagnostics(payload)
+    previous_response_id = payload.get("previous_response_id")
+    system_instruction_material = _system_instruction_material(payload)
+    return {
+        "requested_model": str(payload["model"]) if payload.get("model") is not None else None,
+        "prompt_cache_key_hash": _hash_text(payload.get("prompt_cache_key")),
+        "system_instructions_hash": _hash_structure(system_instruction_material)
+        if system_instruction_material
+        else None,
+        "tools_schema_hash": _hash_structure(payload["tools"]) if "tools" in payload else None,
+        "reasoning_effort": _reasoning_effort(payload),
+        "cache_breakpoint_mode": breakpoint_mode,
+        "cache_breakpoint_location": breakpoint_location,
+        "previous_response_id_present": int(
+            isinstance(previous_response_id, str) and bool(previous_response_id.strip())
+        ),
+        "transport_mode": _transport_mode(payload, metadata),
+    }
+
+
+def _response_diagnostics(payload: Mapping[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "response_id_hash": _hash_text(payload.get("id")),
+    }
+    model = payload.get("model")
+    if model is not None:
+        result["response_model"] = str(model)
+    result.update(
+        {
+            key: value
+            for key, value in _usage_diagnostics(payload).items()
+            if value is not None
+        }
+    )
+    return result
 
 
 def _text_content(content: Any) -> str | None:
@@ -172,7 +482,7 @@ def _event(role: str, event_type: str, content: Any, *, status: str | None = Non
         "content_text": _text_content(content),
         "content_json": _json(structured),
         "status": status,
-        "metadata_json": _json(_sanitize(metadata)) if metadata else None,
+        "metadata_json": _json(_sanitize(metadata, drop_private_fields=True)) if metadata else None,
     }
 
 
@@ -388,6 +698,9 @@ class LLMTraceRecorder:
             proxy_user=proxy_user,
             requested_model=requested_model,
         )
+        context._request_metadata = (
+            _sanitize(metadata, drop_private_fields=True) if metadata else None
+        )
         context._emit("request", "begin", None, metadata=metadata)
         return context
 
@@ -430,6 +743,7 @@ class LLMTraceRecorder:
             connection.execute("PRAGMA synchronous=NORMAL")
             connection.execute("PRAGMA busy_timeout=5000")
             connection.executescript(_SCHEMA)
+            self._migrate_diagnostics_schema(connection)
             rows = connection.execute(
                 "SELECT proxy_user, requested_model, prefix_hash, session_id "
                 "FROM llm_session_prefixes ORDER BY prefix_length"
@@ -464,6 +778,27 @@ class LLMTraceRecorder:
             connection.close()
 
     @staticmethod
+    def _migrate_diagnostics_schema(connection: sqlite3.Connection) -> None:
+        """Bring an early or manually-created diagnostics table forward safely."""
+        existing = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(llm_request_diagnostics)")
+        }
+        for name, declaration in _DIAGNOSTIC_MIGRATIONS.items():
+            if name not in existing:
+                connection.execute(
+                    f"ALTER TABLE llm_request_diagnostics ADD COLUMN {name} {declaration}"
+                )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS llm_request_diagnostics_session "
+            "ON llm_request_diagnostics(session_id, updated_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS llm_request_diagnostics_model "
+            "ON llm_request_diagnostics(resolved_model, requested_model, updated_at DESC)"
+        )
+
+    @staticmethod
     def _write_item(connection: sqlite3.Connection, item: object) -> None:
         if isinstance(item, tuple) and item and item[0] == "prefixes":
             _, user, model, session_id, prefixes = item
@@ -475,6 +810,9 @@ class LLMTraceRecorder:
                     for length, prefix_hash in enumerate(prefixes, start=1)
                 ),
             )
+            return
+        if isinstance(item, tuple) and item and item[0] == "diagnostics":
+            connection.execute(_UPSERT_DIAGNOSTICS, item[1])
             return
         connection.execute(_INSERT, item)  # type: ignore[arg-type]
 
@@ -491,7 +829,53 @@ class LLMTraceContext:
     resolved_model: str | None = None
     provider: str | None = None
     credential_id: str | None = None
+    _request_metadata: Mapping[str, Any] | None = field(default=None, init=False, repr=False)
+    _diagnostics: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+    _diagnostic_created_at: str = field(default_factory=_utc_now, init=False, repr=False)
     _finished: bool = field(default=False, init=False, repr=False)
+
+    def _queue_diagnostics(self) -> None:
+        """Queue one complete, privacy-safe request diagnostic snapshot."""
+        updated_at = _utc_now()
+        diagnostic = {
+            "request_id": self.request_id,
+            "session_id": self.session_id,
+            "requested_model": self.requested_model,
+            "resolved_model": self.resolved_model,
+            "provider": self.provider,
+            "credential_id": self.credential_id,
+            "prompt_cache_key_hash": None,
+            "system_instructions_hash": None,
+            "tools_schema_hash": None,
+            "reasoning_effort": None,
+            "input_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "output_tokens": None,
+            "cache_breakpoint_mode": None,
+            "cache_breakpoint_location": None,
+            "previous_response_id_present": 0,
+            "response_id_hash": None,
+            "transport_mode": None,
+            "created_at": self._diagnostic_created_at,
+            "updated_at": updated_at,
+        }
+        diagnostic.update(self._diagnostics)
+        diagnostic.update(
+            {
+                "request_id": self.request_id,
+                "session_id": self.session_id,
+                "requested_model": self.requested_model,
+                "resolved_model": self.resolved_model,
+                "provider": self.provider,
+                "credential_id": self.credential_id,
+                "created_at": self._diagnostic_created_at,
+                "updated_at": updated_at,
+            }
+        )
+        self.recorder._put(
+            ("diagnostics", tuple(diagnostic[column] for column in _DIAGNOSTIC_COLUMNS))
+        )
 
     def _emit(self, role: str, event_type: str, content: Any, *, status: str | None = None,
               metadata: Mapping[str, Any] | None = None) -> None:
@@ -507,6 +891,11 @@ class LLMTraceContext:
         """Record normalized OpenAI/Anthropic input messages (never headers)."""
         if self.requested_model is None and payload.get("model") is not None:
             self.requested_model = str(payload["model"])
+        if metadata:
+            self._request_metadata = _sanitize(metadata, drop_private_fields=True)
+        request_metadata = self._request_metadata
+        self._diagnostics.update(_request_diagnostics(payload, request_metadata))
+        self._queue_diagnostics()
         for event in normalize_request(payload):
             self._emit(event["role"], event["event_type"],
                        json.loads(event["content_json"]) if event["content_json"] else event["content_text"],
@@ -519,11 +908,19 @@ class LLMTraceContext:
         self.resolved_model = resolved_model or self.resolved_model
         self.provider = provider or self.provider
         self.credential_id = credential_id or self.credential_id
+        self._queue_diagnostics()
         self._emit("proxy", "credential_selected", None, metadata=metadata)
 
     def response(self, payload: Mapping[str, Any] | str, *, status: str | None = None,
                  metadata: Mapping[str, Any] | None = None) -> None:
         """Record a final response; streaming callers pass the assembled result once."""
+        if isinstance(payload, Mapping):
+            diagnostics = _response_diagnostics(payload)
+            response_model = diagnostics.pop("response_model", None)
+            if self.resolved_model is None and response_model is not None:
+                self.resolved_model = response_model
+            self._diagnostics.update(diagnostics)
+            self._queue_diagnostics()
         events = normalize_response(payload) if isinstance(payload, Mapping) else [_event("assistant", "response", payload)]
         for event in events:
             content = json.loads(event["content_json"]) if event["content_json"] else event["content_text"]
@@ -540,6 +937,7 @@ class LLMTraceContext:
         """Record request completion once."""
         if not self._finished:
             self._finished = True
+            self._queue_diagnostics()
             self._emit("proxy", "completed", None, status=status, metadata=metadata)
 
 

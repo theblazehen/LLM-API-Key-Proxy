@@ -279,6 +279,17 @@ class TransactionLogger:
             except OSError:
                 has_provider_logs = False
 
+        usage_summary = {
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+        }
+        prompt_token_details = usage.get("prompt_tokens_details")
+        if isinstance(prompt_token_details, dict):
+            for counter in ("cached_tokens", "cache_creation_tokens"):
+                if counter in prompt_token_details:
+                    usage_summary[counter] = prompt_token_details[counter]
+
         metadata = {
             "request_id": self.request_id,
             "timestamp_utc": datetime.utcnow().isoformat(),
@@ -287,11 +298,7 @@ class TransactionLogger:
             "provider": self.provider,
             "model": model,
             "streaming": self.streaming,
-            "usage": {
-                "prompt_tokens": usage.get("prompt_tokens"),
-                "completion_tokens": usage.get("completion_tokens"),
-                "total_tokens": usage.get("total_tokens"),
-            },
+            "usage": usage_summary,
             "finish_reason": finish_reason,
             "has_provider_logs": has_provider_logs,
             "reasoning_found": False,

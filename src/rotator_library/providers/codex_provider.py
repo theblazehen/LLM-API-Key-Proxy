@@ -1170,14 +1170,18 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                 await self._recover_unauthorized_credential(
                     credential_path, response.status_code
                 )
-                error = {
-                    "type": "error",
-                    "message": f"Codex Responses error {response.status_code}: {body.decode('utf-8', errors='replace')}",
-                    "code": "codex_responses_error",
-                }
-                yield f"data: {json.dumps(error)}\n\n".encode("utf-8")
-                yield b"data: [DONE]\n\n"
-                return
+                # Raise before yielding any SSE data.  The executor classifies this
+                # as an upstream failure and can retry or fail over credentials;
+                # emitting an SSE error here would instead look like a successful
+                # stream to the credential lifecycle.
+                raise httpx.HTTPStatusError(
+                    (
+                        f"Codex Responses error {response.status_code}: "
+                        f"{body.decode('utf-8', errors='replace')}"
+                    ),
+                    request=response.request,
+                    response=response,
+                )
             async for line in response.aiter_lines():
                 if not line:
                     yield b"\n"
@@ -1271,6 +1275,10 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                 "verbosity": "medium"
             },  # Match pi's default; controls output structure
         }
+
+        prompt_cache_key = kwargs.get("prompt_cache_key")
+        if prompt_cache_key is not None:
+            payload["prompt_cache_key"] = prompt_cache_key
 
         # The Codex Responses API requires the 'instructions' field — it's non-optional.
         # Always include it; use the current model instruction if nothing else.
@@ -1692,14 +1700,21 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                             completion_tokens=u.get("output_tokens", 0),
                             total_tokens=u.get("total_tokens", 0),
                         )
-                        # Map Responses API input_tokens_details to prompt_tokens_details
-                        # so downstream _extract_usage_tokens picks up cached_tokens
+                        # Map Responses API input_tokens_details to the OpenAI Chat
+                        # usage shape consumed by downstream usage accounting.
                         input_details = u.get("input_tokens_details") or {}
                         cached = input_details.get("cached_tokens", 0) or 0
-                        if cached:
-                            usage.prompt_tokens_details = {
-                                "cached_tokens": cached,
-                            }
+                        cache_creation = (
+                            input_details.get("cache_creation_tokens", 0) or 0
+                        )
+                        if cached or cache_creation:
+                            usage.prompt_tokens_details = {}
+                            if cached:
+                                usage.prompt_tokens_details["cached_tokens"] = cached
+                            if cache_creation:
+                                usage.prompt_tokens_details[
+                                    "cache_creation_tokens"
+                                ] = cache_creation
 
                     # Send final chunk
                     final_chunk = litellm.ModelResponse(
@@ -1837,13 +1852,21 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                             completion_tokens=u.get("output_tokens", 0),
                             total_tokens=u.get("total_tokens", 0),
                         )
-                        # Map Responses API input_tokens_details to prompt_tokens_details
+                        # Map Responses API input_tokens_details to the OpenAI Chat
+                        # usage shape consumed by downstream usage accounting.
                         input_details = u.get("input_tokens_details") or {}
                         cached = input_details.get("cached_tokens", 0) or 0
-                        if cached:
-                            usage.prompt_tokens_details = {
-                                "cached_tokens": cached,
-                            }
+                        cache_creation = (
+                            input_details.get("cache_creation_tokens", 0) or 0
+                        )
+                        if cached or cache_creation:
+                            usage.prompt_tokens_details = {}
+                            if cached:
+                                usage.prompt_tokens_details["cached_tokens"] = cached
+                            if cache_creation:
+                                usage.prompt_tokens_details[
+                                    "cache_creation_tokens"
+                                ] = cache_creation
 
                 # Handle errors
                 elif kind == "response.failed":

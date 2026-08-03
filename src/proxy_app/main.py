@@ -759,7 +759,9 @@ async def verify_anthropic_api_key(
     raise HTTPException(status_code=401, detail="Invalid or missing API Key")
 
 
-def start_llm_trace(request: Request, payload: dict):
+def start_llm_trace(
+    request: Request, payload: dict, *, transport_mode: Optional[str] = None
+):
     """Create and attach one content trace for an LLM request."""
     identity = getattr(request.state, "proxy_identity", ProxyIdentity("anonymous"))
     trace = begin_llm_trace(
@@ -768,7 +770,10 @@ def start_llm_trace(request: Request, payload: dict):
         or get_llm_trace_recorder().infer_session_id(payload, identity.user),
         proxy_user=identity.user,
         requested_model=str(payload.get("model") or "unknown"),
-        metadata={"path": request.url.path},
+        metadata={
+            "path": request.url.path,
+            **({"transport_mode": transport_mode} if transport_mode else {}),
+        },
     )
     trace.request(payload)
     request.state.llm_trace = trace
@@ -779,17 +784,40 @@ async def traced_native_response_stream(request: Request, stream):
     """Pass through a native Responses stream and retain its terminal response."""
     trace = getattr(request.state, "llm_trace", None)
     terminal_response = None
+    pending = ""
+
+    def consume_events() -> None:
+        """Parse complete SSE records without modifying the upstream stream."""
+        nonlocal pending, terminal_response
+        while "\n\n" in pending:
+            record, pending = pending.split("\n\n", 1)
+            data_lines = [
+                line[5:].lstrip()
+                for line in record.splitlines()
+                if line.startswith("data:")
+            ]
+            if not data_lines:
+                continue
+            raw = "\n".join(data_lines).strip()
+            if not raw or raw == "[DONE]":
+                continue
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "response.completed" and isinstance(
+                event.get("response"), dict
+            ):
+                terminal_response = event["response"]
+
     try:
         async for chunk in stream:
-            if isinstance(chunk, str) and chunk.startswith("data: "):
-                raw = chunk[6:].strip()
-                if raw and raw != "[DONE]":
-                    try:
-                        event = json.loads(raw)
-                        if event.get("type") == "response.completed":
-                            terminal_response = event.get("response")
-                    except json.JSONDecodeError:
-                        pass
+            pending += (
+                bytes(chunk).decode("utf-8", errors="replace")
+                if isinstance(chunk, (bytes, bytearray))
+                else str(chunk)
+            ).replace("\r\n", "\n")
+            consume_events()
             yield chunk
     except Exception as error:
         if trace:
@@ -800,6 +828,25 @@ async def traced_native_response_stream(request: Request, stream):
             if terminal_response:
                 trace.response(terminal_response)
             trace.completed()
+
+
+def _native_response_error_status(response: Any) -> Optional[int]:
+    """Return an HTTP status for a terminal native proxy error envelope."""
+    if not isinstance(response, dict):
+        return None
+    error = response.get("error")
+    if not isinstance(error, dict):
+        return None
+    error_type = error.get("type")
+    if error_type == "proxy_timeout":
+        return 504
+    if error_type in {
+        "proxy_error",
+        "proxy_busy",
+        "proxy_all_credentials_exhausted",
+    }:
+        return 503
+    return None
 
 
 async def streaming_response_wrapper(
@@ -1174,7 +1221,7 @@ async def responses(
             request_data = await request.json()
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
-        start_llm_trace(request, request_data)
+        start_llm_trace(request, request_data, transport_mode="responses")
 
         if raw_logger:
             raw_logger.log_request(headers=request.headers, body=request_data)
@@ -1199,6 +1246,24 @@ async def responses(
                         "Cache-Control": "no-cache",
                         "Connection": "keep-alive",
                         "X-Accel-Buffering": "no",
+                    },
+                )
+            error_status = _native_response_error_status(native_response)
+            if error_status is not None:
+                error = native_response["error"]
+                trace = getattr(request.state, "llm_trace", None)
+                if trace:
+                    trace.error(RuntimeError(str(error.get("message", "Native Responses request failed"))))
+                    trace.completed(status="error")
+                return JSONResponse(
+                    status_code=error_status,
+                    content={
+                        "error": {
+                            "message": error.get("message", "Native Responses request failed"),
+                            "type": "server_error",
+                            "param": None,
+                            "code": error.get("type"),
+                        }
                     },
                 )
             if raw_logger:

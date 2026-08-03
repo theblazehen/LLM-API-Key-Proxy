@@ -32,6 +32,7 @@ def responses_to_chat_request(body: Dict[str, Any]) -> Dict[str, Any]:
     _copy_if_present(body, chat, "frequency_penalty")
     _copy_if_present(body, chat, "stop")
     _copy_if_present(body, chat, "user")
+    _copy_if_present(body, chat, "prompt_cache_key")
     _copy_if_present(body, chat, "tool_choice")
     _copy_if_present(body, chat, "parallel_tool_calls")
 
@@ -687,13 +688,29 @@ def _reasoning_to_thinking(reasoning: Any, thinking: Any) -> Optional[Dict[str, 
     return {"type": "enabled"}
 
 
-def _responses_usage(usage: Any) -> Dict[str, int]:
+def _responses_usage(usage: Any) -> Dict[str, Any]:
     if not isinstance(usage, dict):
         return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     input_tokens = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
     output_tokens = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
     total_tokens = int(usage.get("total_tokens", input_tokens + output_tokens) or 0)
-    return {"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total_tokens}
+    result: Dict[str, Any] = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+    details = usage.get("input_tokens_details")
+    if not isinstance(details, dict):
+        details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        cache_details = {
+            counter: details[counter]
+            for counter in ("cached_tokens", "cache_creation_tokens")
+            if counter in details
+        }
+        if cache_details:
+            result["input_tokens_details"] = cache_details
+    return result
 
 
 def _status_from_finish_reason(finish_reason: Optional[str]) -> str:

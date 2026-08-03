@@ -16,6 +16,7 @@ with all complexity moved to specialized modules.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -63,6 +64,33 @@ if TYPE_CHECKING:
     from ..anthropic_compat import AnthropicMessagesRequest, AnthropicCountTokensRequest
 
 lib_logger = logging.getLogger("rotator_library")
+
+
+def _derive_codex_prompt_cache_key(
+    kwargs: Dict[str, Any], request: Optional[Any]
+) -> Any:
+    """Return a caller cache key or an opaque key for one traced conversation.
+
+    The trace session ID is the proxy's best existing logical-conversation
+    identity: it comes from ``x-llm-session-id`` when supplied, otherwise from
+    the trace recorder's stable conversation-prefix inference.  Hash it with
+    the authenticated proxy user so neither prompt content nor authentication
+    material is sent upstream as a cache key.
+    """
+    if "prompt_cache_key" in kwargs:
+        return kwargs["prompt_cache_key"]
+
+    trace = getattr(getattr(request, "state", None), "llm_trace", None)
+    session_id = getattr(trace, "session_id", None)
+    if not isinstance(session_id, str) or not session_id:
+        return None
+
+    proxy_user = getattr(trace, "proxy_user", None)
+    user = proxy_user if isinstance(proxy_user, str) and proxy_user else "anonymous"
+    material = f"{user}\0{session_id}".encode("utf-8", errors="replace")
+    # OpenAI limits prompt_cache_key to 64 characters. Keep the opaque prefix
+    # and enough SHA-256 output to avoid practical collisions.
+    return "omp-" + hashlib.sha256(material).hexdigest()[:60]
 
 
 class RotatingClient:
@@ -434,6 +462,10 @@ class RotatingClient:
         """Build a RequestContext for a single provider attempt."""
         resolved_model = self._model_resolver.resolve_model_id(model, provider)
         attempt_kwargs = {**kwargs, "model": resolved_model}
+        if provider == "codex":
+            prompt_cache_key = _derive_codex_prompt_cache_key(attempt_kwargs, request)
+            if prompt_cache_key is not None:
+                attempt_kwargs["prompt_cache_key"] = prompt_cache_key
 
         transaction_logger = None
         if self.enable_request_logging:
