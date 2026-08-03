@@ -901,6 +901,14 @@ class LLMTraceContext:
                        json.loads(event["content_json"]) if event["content_json"] else event["content_text"],
                        status=event["status"], metadata=metadata)
 
+    def cache_key_selected(self, cache_key: str | None) -> None:
+        """Record only the digest of a cache key derived after request tracing."""
+        cache_key_hash = _hash_text(cache_key)
+        if cache_key_hash is None:
+            return
+        self._diagnostics["prompt_cache_key_hash"] = cache_key_hash
+        self._queue_diagnostics()
+
     def credential_selected(self, *, resolved_model: str | None = None,
                             provider: str | None = None, credential_id: str | None = None,
                             metadata: Mapping[str, Any] | None = None) -> None:

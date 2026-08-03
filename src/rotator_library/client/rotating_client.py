@@ -466,6 +466,10 @@ class RotatingClient:
             prompt_cache_key = _derive_codex_prompt_cache_key(attempt_kwargs, request)
             if prompt_cache_key is not None:
                 attempt_kwargs["prompt_cache_key"] = prompt_cache_key
+                trace = getattr(getattr(request, "state", None), "llm_trace", None)
+                cache_key_selected = getattr(trace, "cache_key_selected", None)
+                if callable(cache_key_selected):
+                    cache_key_selected(prompt_cache_key)
 
         transaction_logger = None
         if self.enable_request_logging:
