@@ -20,6 +20,7 @@ for package_name, package_path in (
         "rotator_library.usage.selection.strategies",
         PACKAGE_ROOT / "usage" / "selection" / "strategies",
     ),
+    ("rotator_library.usage.limits", PACKAGE_ROOT / "usage" / "limits"),
 ):
     package = types.ModuleType(package_name)
     package.__path__ = [str(package_path)]
@@ -31,7 +32,10 @@ sys.modules.setdefault("rotator_library.error_handler", fake_error_handler)
 
 from rotator_library.usage.selection.strategies.sequential import SequentialStrategy
 from rotator_library.usage.selection.engine import SelectionEngine
+from rotator_library.usage.limits import cooldowns
+from rotator_library.usage.limits.cooldowns import CooldownChecker
 from rotator_library.usage.types import (
+    CooldownInfo,
     CredentialState,
     GroupStats,
     LimitCheckResult,
@@ -40,6 +44,15 @@ from rotator_library.usage.types import (
     SelectionContext,
     WindowStats,
 )
+
+
+def cooldown(reason, until, *, scope=None):
+    return CooldownInfo(
+        reason=reason,
+        until=until,
+        started_at=0.0,
+        model_or_group=scope,
+    )
 
 
 def credential(account, *, remaining=None, reset_at=None, priority=1, source="codex"):
@@ -96,6 +109,88 @@ class _FakeWindows:
     @staticmethod
     def get_primary_definition():
         return None
+
+
+def test_generic_group_and_model_cooldowns_are_ineligible(monkeypatch):
+    monkeypatch.setattr(cooldowns.time, "time", lambda: 100.0)
+    checker = CooldownChecker()
+    state = credential("account")
+    state.provider = "generic"
+    state.cooldowns = {
+        "shared-group": cooldown("group rate limit", 200.0, scope="shared-group"),
+        "generic-model": cooldown("model rate limit", 250.0, scope="generic-model"),
+    }
+
+    result = checker.check(state, "generic-model", "shared-group")
+    assert result.allowed is False
+    assert result.result == LimitResult.BLOCKED_COOLDOWN
+    assert result.blocked_until == 200.0
+
+    state.cooldowns = {
+        "shared-group": cooldown("expired group limit", 100.0, scope="shared-group"),
+        "generic-model": cooldown("model rate limit", 180.0, scope="generic-model")
+    }
+    result = checker.check(state, "generic-model", "shared-group")
+    assert result.allowed is False
+    assert result.result == LimitResult.BLOCKED_COOLDOWN
+    assert result.blocked_until == 180.0
+
+
+def test_codex_tracker_limit_cooldowns_are_ineligible(monkeypatch):
+    monkeypatch.setattr(cooldowns.time, "time", lambda: 100.0)
+    checker = CooldownChecker()
+    state = credential("account")
+    state.cooldowns = {
+        "5h-limit": cooldown("short quota exhausted", 200.0, scope="5h-limit"),
+        "weekly-limit": cooldown(
+            "weekly quota exhausted", 300.0, scope="weekly-limit"
+        ),
+    }
+
+    result = checker.check(state, "gpt-5-codex", "codex-global")
+    assert result.allowed is False
+    assert result.result == LimitResult.BLOCKED_COOLDOWN
+    assert result.blocked_until == 200.0
+
+    state.cooldowns = {
+        "weekly-limit": cooldown(
+            "weekly quota exhausted", 300.0, scope="weekly-limit"
+        )
+    }
+    result = checker.check(state, "gpt-5-codex", "codex-global")
+    assert result.allowed is False
+    assert result.result == LimitResult.BLOCKED_COOLDOWN
+    assert result.blocked_until == 300.0
+
+
+def test_expired_and_unrelated_cooldowns_remain_eligible(monkeypatch):
+    monkeypatch.setattr(cooldowns.time, "time", lambda: 100.0)
+    checker = CooldownChecker()
+    state = credential("account")
+    state.provider = "generic"
+    state.cooldowns = {
+        "shared-group": cooldown("expired", 100.0, scope="shared-group"),
+        "generic-model": cooldown("expired", 99.0, scope="generic-model"),
+        "other-group": cooldown("unrelated", 200.0, scope="other-group"),
+    }
+
+    result = checker.check(state, "generic-model", "shared-group")
+    assert result.allowed is True
+    assert result.result == LimitResult.ALLOWED
+
+
+def test_global_cooldown_is_ineligible_for_every_scope(monkeypatch):
+    monkeypatch.setattr(cooldowns.time, "time", lambda: 100.0)
+    checker = CooldownChecker()
+    state = credential("account")
+    state.provider = "generic"
+    state.cooldowns["_global_"] = cooldown("credential disabled", 300.0)
+
+    result = checker.check(state, "generic-model", "shared-group")
+    assert result.allowed is False
+    assert result.result == LimitResult.BLOCKED_COOLDOWN
+    assert result.blocked_until == 300.0
+    assert result.reason == "Global cooldown: credential disabled (expires in 200s)"
 
 
 def affinity_engine(*, limits=None, clock=None, ttl=30, capacity=8):

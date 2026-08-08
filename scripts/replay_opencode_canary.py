@@ -110,6 +110,101 @@ def strip_tool_descriptions(payload: dict) -> None:
             func["description"] = ""
 
 
+def keep_first_n_chars_in_system(payload: dict, count: int) -> None:
+    keep_system_slice(payload, 0, count)
+
+
+def keep_system_slice(payload: dict, start: int, length: int) -> None:
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return
+
+    start = max(start, 0)
+    remaining_start = start
+    remaining_length = max(length, 0)
+    new_messages = []
+
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "system":
+            new_messages.append(msg)
+            continue
+
+        content = msg.get("content")
+        if not isinstance(content, str):
+            new_messages.append(msg)
+            continue
+
+        if remaining_start >= len(content):
+            remaining_start -= len(content)
+            continue
+
+        slice_start = remaining_start
+        slice_end = min(len(content), slice_start + remaining_length)
+        sliced = content[slice_start:slice_end]
+        remaining_length = max(remaining_length - len(sliced), 0)
+        remaining_start = 0
+
+        if sliced:
+            copied = deepcopy(msg)
+            copied["content"] = sliced
+            new_messages.append(copied)
+
+    payload["messages"] = new_messages
+
+
+def transform_system_text(payload: dict, mode: str) -> None:
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return
+
+    def rot13_char(ch: str) -> str:
+        if "a" <= ch <= "z":
+            return chr((ord(ch) - ord("a") + 13) % 26 + ord("a"))
+        if "A" <= ch <= "Z":
+            return chr((ord(ch) - ord("A") + 13) % 26 + ord("A"))
+        return ch
+
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "system":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        if mode == "rot13":
+            msg["content"] = "".join(rot13_char(ch) for ch in content)
+        elif mode == "filler":
+            msg["content"] = "A" * len(content)
+        elif mode == "xmask":
+            msg["content"] = "".join("X" if not ch.isspace() else ch for ch in content)
+        elif mode == "html":
+            msg["content"] = (
+                content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            )
+        elif mode == "env-prose":
+            content = content.replace(
+                "Here is some useful information about the environment you are running in:\n<env>\n  Working directory: /home/jasmin\n  Workspace root folder: /\n  Is directory a git repo: no\n  Platform: linux\n  Today's date: Tue Apr 14 2026\n</env>\n<directories>\n  \n</directories>",
+                "Environment summary: Linux machine, not currently in a git repo, working from /home/jasmin with workspace root at /. Date: Tue Apr 14 2026.",
+            )
+            content = content.replace("<env>", "Environment:\n")
+            content = content.replace("</env>", "")
+            content = content.replace(
+                "<directories>\n  \n</directories>", "Directories: none listed."
+            )
+            msg["content"] = content
+
+
+def replace_in_system(payload: dict, needle: str, replacement: str) -> None:
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not needle:
+        return
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "system":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            msg["content"] = content.replace(needle, replacement)
+
+
 def minimize_tool_schemas(payload: dict) -> None:
     tools = payload.get("tools")
     if not isinstance(tools, list):
@@ -134,6 +229,10 @@ def disable_reasoning(payload: dict) -> None:
     payload["reasoning_effort"] = "none"
 
 
+def drop_reasoning(payload: dict) -> None:
+    payload.pop("reasoning_effort", None)
+
+
 def set_model(payload: dict, model: str) -> None:
     payload["model"] = model
 
@@ -144,6 +243,11 @@ def apply_variant(
     model: str | None,
     first_n_tools: int | None,
     tool_names: list[str] | None,
+    system_chars: int | None,
+    system_slice_start: int | None,
+    system_slice_length: int | None,
+    system_transform: str | None,
+    system_replace: list[tuple[str, str]] | None,
 ) -> dict:
     mutated = deepcopy(payload)
 
@@ -155,6 +259,19 @@ def apply_variant(
 
     if tool_names is not None:
         keep_named_tools(mutated, tool_names)
+
+    if system_chars is not None:
+        keep_first_n_chars_in_system(mutated, system_chars)
+
+    if system_slice_start is not None and system_slice_length is not None:
+        keep_system_slice(mutated, system_slice_start, system_slice_length)
+
+    if system_transform is not None:
+        transform_system_text(mutated, system_transform)
+
+    if system_replace is not None:
+        for needle, replacement in system_replace:
+            replace_in_system(mutated, needle, replacement)
 
     if variant == "captured":
         return mutated
@@ -173,6 +290,9 @@ def apply_variant(
         return mutated
     if variant == "no-reasoning":
         disable_reasoning(mutated)
+        return mutated
+    if variant == "drop-reasoning":
+        drop_reasoning(mutated)
         return mutated
     if variant == "titlecase-tools":
         titlecase_tool_names(mutated)
@@ -219,6 +339,7 @@ def main() -> int:
             "no-system-no-tools",
             "no-stream-options",
             "no-reasoning",
+            "drop-reasoning",
             "titlecase-tools",
             "no-tool-descriptions",
             "minimal-tool-schemas",
@@ -241,6 +362,36 @@ def main() -> int:
         help="Comma-separated list of tool names to keep from the captured payload",
     )
     parser.add_argument(
+        "--system-chars",
+        type=int,
+        default=None,
+        help="Keep only the first N characters across system messages",
+    )
+    parser.add_argument(
+        "--system-slice-start",
+        type=int,
+        default=None,
+        help="Start offset for a contiguous system prompt slice",
+    )
+    parser.add_argument(
+        "--system-slice-length",
+        type=int,
+        default=None,
+        help="Length for a contiguous system prompt slice",
+    )
+    parser.add_argument(
+        "--system-transform",
+        choices=["rot13", "filler", "xmask", "html", "env-prose"],
+        default=None,
+        help="Transform system prompt text while preserving overall size",
+    )
+    parser.add_argument(
+        "--system-replace",
+        action="append",
+        default=None,
+        help="Replace system text in the form needle=replacement",
+    )
+    parser.add_argument(
         "--dump-payload",
         action="store_true",
         help="Print the replay payload before sending",
@@ -253,12 +404,28 @@ def main() -> int:
         tool_names = [
             name.strip() for name in args.tool_names.split(",") if name.strip()
         ]
+    system_replace = None
+    if args.system_replace:
+        system_replace = []
+        for item in args.system_replace:
+            needle, sep, replacement = item.partition("=")
+            if not sep:
+                raise ValueError(
+                    "--system-replace must be in the form needle=replacement"
+                )
+            system_replace.append((needle, replacement))
+
     replay_payload = apply_variant(
         captured,
         args.variant,
         args.model,
         args.first_n_tools,
         tool_names,
+        args.system_chars,
+        args.system_slice_start,
+        args.system_slice_length,
+        args.system_transform,
+        system_replace,
     )
 
     if args.dump_payload:

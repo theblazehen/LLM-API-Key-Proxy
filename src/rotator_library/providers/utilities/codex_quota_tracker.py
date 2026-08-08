@@ -25,10 +25,10 @@ import logging
 import os
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import httpx
 
@@ -156,6 +156,12 @@ class CodexQuotaSnapshot:
     fetched_at: float
     status: str  # "success" or "error"
     error: Optional[str]
+    # Every rate-limit family advertised on the response, keyed by limit id
+    # (e.g. "codex", "codex_secondary"). Observational: routing still runs off
+    # primary/secondary above. Defaulted so existing constructors keep working.
+    families: Dict[str, Tuple[Optional[RateLimitWindow], Optional[RateLimitWindow]]] = (
+        field(default_factory=dict)
+    )
 
     @property
     def is_stale(self) -> bool:
@@ -238,8 +244,46 @@ def _classify_quota_windows(*windows: Any) -> Dict[str, Any]:
             else window.window_minutes
         )
         group = "weekly-limit" if minutes == WEEKLY_WINDOW_MINUTES else "5h-limit"
-        classified[group] = window
+        existing = classified.get(group)
+        if existing is None:
+            classified[group] = window
+            continue
+        # Upstream can advertise more than one limit family with the same
+        # advertised duration (observed in production: two weekly windows whose
+        # reset times differ by hours). Overwriting here lets a nearly-full
+        # limit mask an exhausted one, and the rotation router then believes a
+        # dead credential still has capacity. Keep the MOST CONSTRAINING window.
+        if _window_used_percent(window) > _window_used_percent(existing):
+            classified[group] = window
+        lib_logger.info(
+            "Codex quota group collision on %s: used_percent %.0f (reset %s) vs "
+            "%.0f (reset %s); keeping the most constrained",
+            group,
+            _window_used_percent(existing),
+            _window_reset_at(existing),
+            _window_used_percent(window),
+            _window_reset_at(window),
+        )
     return classified
+
+
+def _window_used_percent(window: Any) -> float:
+    """Read used_percent from either a dict or a RateLimitWindow."""
+    value = (
+        window.get("used_percent")
+        if isinstance(window, dict)
+        else getattr(window, "used_percent", None)
+    )
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
+def _window_reset_at(window: Any) -> Any:
+    """Read reset_at from either a dict or a RateLimitWindow."""
+    return (
+        window.get("reset_at")
+        if isinstance(window, dict)
+        else getattr(window, "reset_at", None)
+    )
 
 
 def _credits_to_dict(credits: CreditsInfo) -> Dict[str, Any]:
@@ -292,7 +336,58 @@ def parse_rate_limit_headers(headers: Dict[str, str]) -> CodexQuotaSnapshot:
         fetched_at=time.time(),
         status="success" if (primary or secondary or credits) else "no_data",
         error=None,
+        families=parse_all_rate_limit_families(headers),
     )
+
+
+_PRIMARY_USED_SUFFIX = "-primary-used-percent"
+
+
+def parse_all_rate_limit_families(
+    headers: Dict[str, str],
+) -> Dict[str, Tuple[Optional[RateLimitWindow], Optional[RateLimitWindow]]]:
+    """Discover every rate-limit family advertised on a response.
+
+    Upstream templates its headers as ``x-{limit_id}-primary-used-percent``
+    (and ``-window-minutes`` / ``-reset-at``, plus the same for ``secondary``),
+    where ``limit_id`` defaults to ``codex`` but may be anything. Reading only
+    the canonical pair hides additional limits, which is how an exhausted
+    weekly window ended up masked by a nearly-full one.
+
+    Returns a mapping of normalised limit id -> (primary, secondary).
+    """
+    lowered = {str(k).lower(): v for k, v in headers.items()}
+
+    limit_ids = {"codex"}
+    for name in lowered:
+        if not name.endswith(_PRIMARY_USED_SUFFIX):
+            continue
+        raw = name[: -len(_PRIMARY_USED_SUFFIX)]
+        if raw.startswith("x-"):
+            raw = raw[2:]
+        if raw:
+            limit_ids.add(raw.replace("-", "_"))
+
+    families: Dict[
+        str, Tuple[Optional[RateLimitWindow], Optional[RateLimitWindow]]
+    ] = {}
+    for limit_id in sorted(limit_ids):
+        prefix = "x-" + limit_id.replace("_", "-")
+        primary = _parse_window_from_headers(
+            lowered,
+            f"{prefix}-primary-used-percent",
+            f"{prefix}-primary-window-minutes",
+            f"{prefix}-primary-reset-at",
+        )
+        secondary = _parse_window_from_headers(
+            lowered,
+            f"{prefix}-secondary-used-percent",
+            f"{prefix}-secondary-window-minutes",
+            f"{prefix}-secondary-reset-at",
+        )
+        if primary or secondary:
+            families[limit_id] = (primary, secondary)
+    return families
 
 
 def _parse_window_from_headers(
@@ -857,17 +952,37 @@ class CodexQuotaTracker:
 
         self._quota_cache[credential_path] = snapshot
 
-        # Log quota info when captured from headers
-        if snapshot.primary:
-            remaining = snapshot.primary.remaining_percent
-            reset_secs = snapshot.primary.seconds_until_reset()
-            if reset_secs is not None:
-                reset_str = f"{int(reset_secs // 60)}m"
-            else:
-                reset_str = "?"
+        # Log every advertised family, not just `primary`. Logging primary alone
+        # was actively misleading: when upstream sends two families the stored
+        # state can come from one while the log showed the other, so the log and
+        # the payload disagreed with no way to tell why.
+        if snapshot.families or snapshot.primary:
+            parts: List[str] = []
+            for limit_id, (fam_primary, fam_secondary) in sorted(
+                snapshot.families.items()
+            ):
+                for slot, window in (
+                    ("primary", fam_primary),
+                    ("secondary", fam_secondary),
+                ):
+                    if window is None:
+                        continue
+                    parts.append(
+                        f"{limit_id}.{slot}="
+                        f"{window.remaining_percent:.0f}%rem"
+                        f"/{window.window_minutes}min"
+                        f"/reset={window.reset_at}"
+                    )
+            if not parts and snapshot.primary:
+                parts.append(
+                    f"codex.primary={snapshot.primary.remaining_percent:.0f}%rem"
+                    f"/{snapshot.primary.window_minutes}min"
+                    f"/reset={snapshot.primary.reset_at}"
+                )
             lib_logger.debug(
-                f"Codex quota from headers ({snapshot.identifier}): "
-                f"{remaining:.0f}% remaining, resets in {reset_str}"
+                "Codex quota from headers (%s): %s",
+                snapshot.identifier,
+                " ".join(parts),
             )
 
         # Push quota data to UsageManager if available

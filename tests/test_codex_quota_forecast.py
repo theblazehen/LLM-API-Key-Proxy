@@ -87,11 +87,14 @@ def test_local_six_am_boundary_starts_and_labels_quota_day() -> None:
     ).timestamp()
 
 
-def test_first_run_is_learning_and_never_invents_actual_usage() -> None:
+def test_first_run_reports_missing_baseline_and_never_invents_actual_usage() -> None:
     result = forecast([account("a", 74.375, instant(9, 18))])
 
-    assert result["status"] == "learning"
-    assert result["actual"] == {"status": "learning", "used_since_day_start": None}
+    assert result["status"] == "ready"
+    assert result["actual"] == {
+        "status": "baseline_unavailable",
+        "used_since_day_start": None,
+    }
     assert result["risk"] == {
         "aggregate_exhaustion": False,
         "basis": "forecast_targets",

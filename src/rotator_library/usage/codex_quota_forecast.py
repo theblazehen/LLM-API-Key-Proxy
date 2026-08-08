@@ -203,7 +203,7 @@ def build_codex_quota_forecast(
         else None
     )
     stale = age_seconds is None or age_seconds > stale_after_seconds
-    status = "unavailable" if not normalized else ("learning" if actual is None else "ready")
+    status = "unavailable" if not normalized else "ready"
 
     account_result = []
     for account in normalized:
@@ -402,7 +402,7 @@ def _derive_actual(
     now_ts: float,
 ) -> tuple[float | None, str]:
     if not accounts:
-        return None, "learning"
+        return None, "baseline_unavailable"
     by_account: dict[str, list[tuple[float, float]]] = {account.account_id: [] for account in accounts}
     for raw in observations:
         account_id_value = raw.get("stable_id", raw.get("account_id"))
@@ -425,7 +425,7 @@ def _derive_actual(
         points = sorted(by_account[account.account_id], key=lambda item: (item[0], item[1]))
         baselines = [point for point in points if point[0] <= day_start + _EPSILON]
         if not baselines:
-            return None, "learning"
+            return None, "baseline_unavailable"
         baseline = baselines[-1]
         # A reset restores the window to 100 and overwrites the preceding
         # remainder.  Insert it even when the proxy did not sample exactly at

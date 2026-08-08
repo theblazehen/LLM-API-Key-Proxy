@@ -32,7 +32,38 @@ class CooldownChecker(LimitChecker):
         model: str,
         quota_group: Optional[str] = None,
     ) -> LimitCheckResult:
-        """Cooldowns disabled — always pass."""
+        """Check whether a credential has an active scoped or global cooldown."""
+        now = time.time()
+        scopes = []
+        seen = set()
+
+        def add_scope(scope: Optional[str]) -> None:
+            if scope and scope not in seen:
+                seen.add(scope)
+                scopes.append(scope)
+
+        add_scope(quota_group)
+        add_scope(model)
+        if state.provider == "codex" and quota_group == "codex-global":
+            add_scope("5h-limit")
+            add_scope("weekly-limit")
+        add_scope("_global_")
+
+        for scope in scopes:
+            cooldown = state.cooldowns.get(scope)
+            if not cooldown or cooldown.until <= now:
+                continue
+
+            label = "Global cooldown" if scope == "_global_" else f"Cooldown for '{scope}'"
+            return LimitCheckResult.blocked(
+                result=LimitResult.BLOCKED_COOLDOWN,
+                reason=(
+                    f"{label}: {cooldown.reason} "
+                    f"(expires in {cooldown.until - now:.0f}s)"
+                ),
+                blocked_until=cooldown.until,
+            )
+
         return LimitCheckResult.ok()
 
     def reset(
