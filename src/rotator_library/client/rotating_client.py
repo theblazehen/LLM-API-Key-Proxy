@@ -22,8 +22,10 @@ import logging
 import os
 import random
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union, TYPE_CHECKING
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 import litellm
@@ -59,11 +61,53 @@ from ..failure_logger import configure_failure_logger
 # Import new usage package
 from ..usage import UsageManager as NewUsageManager
 from ..usage.config import load_provider_usage_config, WindowDefinition
+from ..usage.codex_quota_forecast import (
+    QUOTA_DAY_START_HOUR,
+    STALE_AFTER_SECONDS,
+    build_codex_quota_forecast,
+)
+from ..usage.quota_observation_store import (
+    CodexWeeklyObservation,
+    QuotaObservationStore,
+)
 
 if TYPE_CHECKING:
     from ..anthropic_compat import AnthropicMessagesRequest, AnthropicCountTokensRequest
 
 lib_logger = logging.getLogger("rotator_library")
+
+
+def _system_local_timezone():
+    """Return the system IANA timezone when discoverable, else its UTC offset."""
+    candidates: List[str] = []
+    env_timezone = os.getenv("TZ", "").strip().removeprefix(":")
+    if env_timezone:
+        candidates.append(env_timezone)
+
+    try:
+        configured = Path("/etc/timezone").read_text(encoding="utf-8").strip()
+        if configured:
+            candidates.append(configured)
+    except (OSError, UnicodeError):
+        pass
+
+    try:
+        resolved = Path("/etc/localtime").resolve(strict=True)
+        parts = resolved.parts
+        zoneinfo_index = parts.index("zoneinfo")
+        key = "/".join(parts[zoneinfo_index + 1 :])
+        if key:
+            candidates.append(key)
+    except (OSError, ValueError):
+        pass
+
+    for key in candidates:
+        try:
+            return ZoneInfo(key)
+        except (ZoneInfoNotFoundError, ValueError):
+            continue
+
+    return datetime.now().astimezone().tzinfo
 
 
 def _derive_codex_prompt_cache_key(
@@ -236,6 +280,9 @@ class RotatingClient:
         else:
             self._usage_base_path = self.data_dir / "usage"
         self._usage_base_path.mkdir(parents=True, exist_ok=True)
+        self._quota_observation_store = QuotaObservationStore(
+            self._usage_base_path / "quota_observations.sqlite3"
+        )
 
         # Build provider configs using ConfigLoader
         provider_configs = {}
@@ -754,6 +801,7 @@ class RotatingClient:
                 plugin, "get_reset_credit_info"
             ):
                 self._attach_codex_reset_stats(stats, plugin)
+                self._attach_codex_quota_forecast(stats, plugin)
 
             # Skip providers with no activity (filters out invalid/unused providers)
             if stats.get("total_requests", 0) == 0:
@@ -1118,6 +1166,184 @@ class RotatingClient:
             "mode": os.getenv("CODEX_RESET_MODE", "observe"),
             "available_count": total_resets,
             "next_auto_redeem_at": next_auto_redeem_at,
+        }
+
+    def _attach_codex_quota_forecast(
+        self, stats: Dict[str, Any], plugin: Any
+    ) -> None:
+        """Persist current weekly state and attach a cached-data forecast."""
+        now = datetime.now(_system_local_timezone())
+        now_timestamp = now.timestamp()
+        source_timestamps: List[float] = []
+        accounts: List[Dict[str, Any]] = []
+
+        try:
+            for credential in stats.get("credentials", {}).values():
+                stable_id = credential.get("stable_id")
+                weekly = (
+                    credential.get("group_usage", {})
+                    .get("weekly-limit", {})
+                    .get("windows", {})
+                    .get("daily", {})
+                )
+                remaining = weekly.get("remaining_percent")
+                used = weekly.get("used_percent")
+                reset_at = weekly.get("reset_at")
+                reset_info = credential.get("reset_credits") or {}
+                credits = reset_info.get("credits") or []
+
+                source_timestamp = self._codex_quota_source_timestamp(
+                    plugin, credential
+                )
+                if source_timestamp is not None:
+                    source_timestamps.append(source_timestamp)
+
+                account = {
+                    "stable_id": stable_id,
+                    "email": credential.get("email"),
+                    "remaining_percent": remaining,
+                    "reset_at": reset_at,
+                    "reset_credits": [
+                        {
+                            "id": credit.get("id"),
+                            "auto_redeem_at": credit.get("auto_redeems_at"),
+                            "expires_at": credit.get("expires_at"),
+                        }
+                        for credit in credits
+                        if isinstance(credit, dict)
+                        and credit.get("status", "available") == "available"
+                    ],
+                }
+                accounts.append(account)
+
+                if (
+                    stable_id
+                    and isinstance(used, (int, float))
+                    and not isinstance(used, bool)
+                    and isinstance(remaining, (int, float))
+                    and not isinstance(remaining, bool)
+                    and isinstance(reset_at, (int, float))
+                    and not isinstance(reset_at, bool)
+                    and source_timestamp is not None
+                ):
+                    self._quota_observation_store.record(
+                        stable_account_id=str(stable_id),
+                        email=credential.get("email"),
+                        used_percent=used,
+                        remaining_percent=remaining,
+                        reset_at=reset_at,
+                        reset_credit_metadata=account["reset_credits"],
+                        source_timestamp=source_timestamp,
+                        observed_at=source_timestamp,
+                    )
+
+            boundary = now.replace(
+                hour=QUOTA_DAY_START_HOUR, minute=0, second=0, microsecond=0
+            )
+            if now < boundary:
+                boundary -= timedelta(days=1)
+            observations: List[Dict[str, Any]] = []
+            for account in accounts:
+                stable_id = account.get("stable_id")
+                if not stable_id:
+                    continue
+                around = self._quota_observation_store.observations_around_boundary(
+                    str(stable_id), boundary.timestamp(), end_at=now_timestamp
+                )
+                for observation in ((around.baseline,) if around.baseline else ()) + around.changes:
+                    observations.append(
+                        self._forecast_observation(str(stable_id), observation)
+                    )
+
+            source_timestamp = min(source_timestamps) if source_timestamps else None
+            stats["forecast"] = build_codex_quota_forecast(
+                accounts=accounts,
+                observations=observations,
+                now=now,
+                source_timestamp=source_timestamp,
+            )
+        except Exception:
+            lib_logger.exception("Failed to build Codex quota forecast")
+            source_timestamp = min(source_timestamps) if source_timestamps else None
+            age_seconds = (
+                max(0.0, now_timestamp - source_timestamp)
+                if source_timestamp is not None
+                else None
+            )
+            boundary = now.replace(
+                hour=QUOTA_DAY_START_HOUR, minute=0, second=0, microsecond=0
+            )
+            if now < boundary:
+                boundary -= timedelta(days=1)
+            boundaries = [
+                (boundary + timedelta(days=offset)).replace(
+                    hour=QUOTA_DAY_START_HOUR, minute=0, second=0, microsecond=0
+                )
+                for offset in range(8)
+            ]
+            days = [
+                {
+                    "index": index,
+                    "start_at": boundaries[index].timestamp(),
+                    "end_at": boundaries[index + 1].timestamp(),
+                    "local_date": boundaries[index].date().isoformat(),
+                    "target": 0.0,
+                    "remaining_target": 0.0,
+                    "drain_candidate": 0.0,
+                    "sustainable_candidate": 0.0,
+                    "selected_reason": "rolling_168h_sustainable",
+                    "contributions": [],
+                    "reset_events": [],
+                }
+                for index in range(7)
+            ]
+            stats["forecast"] = {
+                "schema_version": 1,
+                "status": "unavailable",
+                "unit": "weekly_quota_percentage_points",
+                "generated_at": now_timestamp,
+                "source_timestamp": source_timestamp,
+                "age_seconds": age_seconds,
+                "stale": age_seconds is None
+                or age_seconds > STALE_AFTER_SECONDS,
+                "timezone": str(now.tzinfo),
+                "quota_day_start_hour": QUOTA_DAY_START_HOUR,
+                "horizon": {
+                    "start_at": boundaries[0].timestamp(),
+                    "end_at": boundaries[7].timestamp(),
+                    "day_count": 7,
+                },
+                "reason": "forecast_composition_failed",
+                "actual": {"status": "unavailable", "used_since_day_start": None},
+                "risk": {
+                    "aggregate_exhaustion": False,
+                    "basis": "forecast_targets",
+                },
+                "today": days[0],
+                "days": days,
+                "accounts": [],
+                "unknown_accounts": [],
+            }
+
+    @staticmethod
+    def _codex_quota_source_timestamp(
+        plugin: Any, credential: Dict[str, Any]
+    ) -> Optional[float]:
+        if hasattr(plugin, "get_cached_quota"):
+            snapshot = plugin.get_cached_quota(credential.get("full_path", ""))
+            fetched_at = getattr(snapshot, "fetched_at", None)
+            if isinstance(fetched_at, (int, float)) and not isinstance(fetched_at, bool):
+                return float(fetched_at)
+        return None
+
+    @staticmethod
+    def _forecast_observation(
+        stable_id: str, observation: CodexWeeklyObservation
+    ) -> Dict[str, Any]:
+        return {
+            "stable_id": stable_id,
+            "observed_at": observation.source_timestamp,
+            "remaining_percent": observation.remaining_percent,
         }
 
     async def redeem_codex_reset_credit(
