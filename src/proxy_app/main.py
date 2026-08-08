@@ -775,6 +775,7 @@ def start_llm_trace(
             **({"transport_mode": transport_mode} if transport_mode else {}),
         },
     )
+    trace.headers("client_request", request.scope.get("headers", ()))
     trace.request(payload)
     request.state.llm_trace = trace
     return trace

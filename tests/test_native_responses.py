@@ -30,6 +30,47 @@ class _Request:
         self.state = SimpleNamespace(llm_trace=trace)
 
 
+def test_start_llm_trace_records_ordered_asgi_headers_before_body():
+    import proxy_app.main as main
+
+    captured = []
+
+    class Trace:
+        def headers(self, direction, headers):
+            captured.append(("headers", direction, headers))
+
+        def request(self, payload):
+            captured.append(("request", payload))
+
+    class Request:
+        headers = {"x-request-id": "request-id"}
+        url = SimpleNamespace(path="/v1/responses")
+        scope = {
+            "headers": [
+                (b"authorization", b"Bearer raw-token"),
+                (b"cookie", b"session=raw-cookie"),
+                (b"x-duplicate", b"first"),
+                (b"x-duplicate", b"second"),
+                (b"x-byte", b"\xff"),
+            ]
+        }
+        state = SimpleNamespace(proxy_identity=main.ProxyIdentity("test-user"))
+
+    trace = Trace()
+    original_begin = main.begin_llm_trace
+    try:
+        main.begin_llm_trace = lambda **_: trace
+        result = main.start_llm_trace(Request(), {"model": "codex/gpt-5.6-sol"})
+    finally:
+        main.begin_llm_trace = original_begin
+
+    assert result is trace
+    assert captured == [
+        ("headers", "client_request", Request.scope["headers"]),
+        ("request", {"model": "codex/gpt-5.6-sol"}),
+    ]
+
+
 async def _collect(stream):
     return [chunk async for chunk in stream]
 

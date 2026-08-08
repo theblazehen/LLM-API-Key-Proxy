@@ -7,7 +7,9 @@ native Responses provider stream and the existing executor accounting/retry path
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -16,6 +18,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from rotator_library.client.executor import RequestExecutor
+from rotator_library.core.types import RequestContext
 from rotator_library.error_handler import classify_error
 from rotator_library.providers.codex_provider import CodexProvider
 
@@ -52,12 +55,108 @@ class _Trace:
         self.completed_calls += 1
 
 
+class _HeaderTrace:
+    def __init__(self):
+        self.header_events = []
+
+    def headers(self, direction, headers, *, status=None, metadata=None):
+        pairs = headers.items() if hasattr(headers, "items") else headers
+        self.header_events.append((direction, list(pairs), status, metadata))
+
+
+class _TraceForwardingPlugin:
+    def has_custom_logic(self):
+        return True
+
+    async def acompletion(self, _client, **kwargs):
+        return kwargs.get("_llm_trace")
+
+
+def test_executor_forwards_request_trace_to_codex_custom_provider():
+    trace = SimpleNamespace(
+        credential_selected=lambda **_kwargs: None,
+        response=lambda _payload: None,
+        completed=lambda: None,
+    )
+    request = SimpleNamespace(
+        headers={},
+        state=SimpleNamespace(llm_trace=trace),
+    )
+    executor = object.__new__(RequestExecutor)
+    executor._transforms = SimpleNamespace(
+        apply=lambda *_args, **_kwargs: None,
+    )
+
+    async def prepare(_provider, _model, _cred, _context):
+        return {"model": "codex/gpt-5.6-sol"}
+
+    executor._prepare_request_kwargs = prepare
+    plugin = _TraceForwardingPlugin()
+    executor._get_plugin_instance = lambda _provider: plugin
+    executor._run_pre_request_callback = lambda *_args: asyncio.sleep(0)
+    executor._extract_usage_tokens = lambda _response: (0, 0, 0, 0, 0)
+    executor._calculate_cost = lambda *_args: 0.0
+    executor._extract_response_headers = lambda _response: None
+    executor._max_retries = 1
+    executor._http_client = object()
+
+    class CredentialContext:
+        credential = "credential.json"
+        stable_id = "stable"
+
+        def mark_success(self, **_kwargs):
+            pass
+
+    class Acquired:
+        async def __aenter__(self):
+            return CredentialContext()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class UsageManager:
+        states = {}
+
+        async def get_availability_stats(self, *_args):
+            return {"available": 1, "total": 1}
+
+        async def acquire_credential(self, **_kwargs):
+            return Acquired()
+
+    async def prepare_execution(_context):
+        return UsageManager(), SimpleNamespace(priorities={}), ["credential.json"], None, {}
+
+    executor._prepare_execution = prepare_execution
+    executor._wait_for_cooldown = lambda *_args: asyncio.sleep(0)
+    executor._log_acquiring_credential = lambda *_args: None
+    executor._log_acquired_credential = lambda *_args: None
+
+    context = RequestContext(
+        model="codex/gpt-5.6-sol",
+        provider="codex",
+        kwargs={},
+        streaming=False,
+        credentials=["credential.json"],
+        deadline=time.time() + 5,
+        request=request,
+    )
+
+    assert asyncio.run(executor._execute_non_streaming(context)) is trace
+
+
+_RESPONSE_RAW_HEADERS = [
+    (b"x-codex-primary-used-percent", b"12.5"),
+    (b"x-codex-primary-reset-at", b"first-reset"),
+    (b"x-codex-primary-reset-at", b"second-reset"),
+]
+
+
 class _ErrorResponse:
     def __init__(self, status_code, body):
         self.status_code = status_code
         self._body = body
         self.request = httpx.Request("POST", "https://example.invalid/responses")
-        self.headers = {"content-type": "application/json"}
+        self.headers = httpx.Headers(_RESPONSE_RAW_HEADERS)
 
     @property
     def text(self):
@@ -99,12 +198,52 @@ class _NonStreamingErrorClient:
         self.response = httpx.Response(
             status_code,
             content=body,
-            headers={"content-type": "application/json"},
+            headers=_RESPONSE_RAW_HEADERS,
             request=httpx.Request("POST", "https://example.invalid/responses"),
         )
 
     async def post(self, *_args, **_kwargs):
         return self.response
+
+
+class _NativeSuccessClient:
+    def __init__(self):
+        self.headers = None
+
+    async def post(self, *_args, headers, **_kwargs):
+        self.headers = headers
+        return httpx.Response(
+            200,
+            json={"id": "resp_success", "output": []},
+            headers=_RESPONSE_RAW_HEADERS,
+            request=httpx.Request("POST", "https://example.invalid/responses"),
+        )
+
+
+class _SSESuccessResponse:
+    def __init__(self):
+        self.status_code = 200
+        self.request = httpx.Request("POST", "https://example.invalid/responses")
+        self.headers = httpx.Headers(_RESPONSE_RAW_HEADERS)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def aiter_lines(self):
+        yield 'data: {"type":"response.output_text.delta","delta":"ok"}'
+        yield "data: [DONE]"
+
+
+class _SSEClient:
+    def __init__(self):
+        self.headers = None
+
+    def stream(self, *_args, headers, **_kwargs):
+        self.headers = headers
+        return _SSESuccessResponse()
 
 
 def _fragmented_native_stream(chunks):
@@ -203,6 +342,7 @@ def test_native_responses_http_failures_raise_classifiable_exceptions(
 
 def test_native_non_streaming_error_retains_safe_status_and_category(monkeypatch):
     provider = CodexProvider()
+    trace = _HeaderTrace()
     raw_message = "distinctive raw upstream message"
     bearer_secret = "Bearer secret-token-that-must-not-leak"
     account_id = "acct-sensitive-identifier"
@@ -238,6 +378,7 @@ def test_native_non_streaming_error_retains_safe_status_and_category(monkeypatch
                 model="codex/gpt-5.6-sol",
                 input="safe fixed input",
                 stream=False,
+                _llm_trace=trace,
             )
         )
 
@@ -257,3 +398,140 @@ def test_native_non_streaming_error_retains_safe_status_and_category(monkeypatch
     assert raw_message not in error.__dict__.values()
     assert bearer_secret not in error.__dict__.values()
     assert account_id not in error.__dict__.values()
+    assert trace.header_events[0][0] == "provider_request"
+    assert trace.header_events[0][1][0] == ("Authorization", bearer_secret)
+    response_event = trace.header_events[1]
+    assert response_event[0] == "provider_response"
+    assert response_event[1][: len(_RESPONSE_RAW_HEADERS)] == _RESPONSE_RAW_HEADERS
+    assert response_event[2:] == (422, {"boundary": "native_responses"})
+
+
+def test_native_non_streaming_headers_preserve_auth_and_duplicate_response_pairs(monkeypatch):
+    provider = CodexProvider()
+    trace = _HeaderTrace()
+    client = _NativeSuccessClient()
+
+    async def auth_header(_credential):
+        return {"Authorization": "Bearer test-token"}
+
+    async def no_account_id(_credential):
+        return None
+
+    monkeypatch.setattr(provider, "get_auth_header", auth_header)
+    monkeypatch.setattr(provider, "get_account_id", no_account_id)
+
+    result = asyncio.run(
+        provider.aresponses(
+            client,
+            credential_identifier="credential.json",
+            model="codex/gpt-5.6-sol",
+            input="input",
+            stream=False,
+            _llm_trace=trace,
+        )
+    )
+
+    assert result["id"] == "resp_success"
+    assert client.headers["Authorization"] == "Bearer test-token"
+    assert trace.header_events[0] == (
+        "provider_request",
+        list(client.headers.items()),
+        None,
+        {"boundary": "native_responses"},
+    )
+    response_event = trace.header_events[1]
+    assert response_event[0] == "provider_response"
+    assert response_event[1][: len(_RESPONSE_RAW_HEADERS)] == _RESPONSE_RAW_HEADERS
+    assert response_event[2:] == (200, {"boundary": "native_responses"})
+
+
+def test_native_stream_error_headers_are_recorded_before_status_handling(monkeypatch):
+    provider = CodexProvider()
+    trace = _HeaderTrace()
+
+    async def no_credential_recovery(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(provider, "_recover_unauthorized_credential", no_credential_recovery)
+
+    async def consume():
+        stream = provider._stream_native_responses(
+            _ErrorClient(429, b'{"error":{"message":"rate limit"}}'),
+            headers={"Authorization": "Bearer test-token"},
+            payload={"stream": True},
+            credential_path="",
+            trace=trace,
+        )
+        return [chunk async for chunk in stream]
+
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(consume())
+
+    assert trace.header_events == [
+        ("provider_request", [("Authorization", "Bearer test-token")], None, {"boundary": "native_responses"}),
+        ("provider_response", _RESPONSE_RAW_HEADERS, 429, {"boundary": "native_responses"}),
+    ]
+
+
+def test_native_stream_headers_preserve_auth_and_duplicate_response_pairs():
+    trace = _HeaderTrace()
+    client = _SSEClient()
+
+    async def consume():
+        stream = CodexProvider()._stream_native_responses(
+            client,
+            headers={"Authorization": "Bearer test-token"},
+            payload={"stream": True},
+            credential_path="",
+            trace=trace,
+        )
+        return [chunk async for chunk in stream]
+
+    assert asyncio.run(consume()) == [
+        b'data: {"type":"response.output_text.delta","delta":"ok"}\n',
+        b"data: [DONE]\n",
+    ]
+    assert trace.header_events == [
+        ("provider_request", [("Authorization", "Bearer test-token")], None, {"boundary": "native_responses"}),
+        ("provider_response", _RESPONSE_RAW_HEADERS, 200, {"boundary": "native_responses"}),
+    ]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_chat_via_responses_headers_preserve_ordered_raw_pairs(monkeypatch, stream):
+    provider = CodexProvider()
+    trace = _HeaderTrace()
+    client = _SSEClient()
+
+    async def auth_header(_credential):
+        return {"Authorization": "Bearer test-token"}
+
+    async def no_account_id(_credential):
+        return None
+
+    monkeypatch.setattr(provider, "get_auth_header", auth_header)
+    monkeypatch.setattr(provider, "get_account_id", no_account_id)
+
+    async def invoke():
+        response = await provider.acompletion(
+            client,
+            credential_identifier="credential.json",
+            model="codex/gpt-5.6-sol",
+            messages=[{"role": "user", "content": "hello"}],
+            stream=stream,
+            _llm_trace=trace,
+        )
+        if stream:
+            return [chunk async for chunk in response]
+        return response
+
+    asyncio.run(invoke())
+
+    assert client.headers["Authorization"] == "Bearer test-token"
+    expected_metadata = {"boundary": "chat_via_responses"}
+    if not stream:
+        expected_metadata["attempt"] = 1
+    assert trace.header_events == [
+        ("provider_request", list(client.headers.items()), None, expected_metadata),
+        ("provider_response", _RESPONSE_RAW_HEADERS, 200, expected_metadata),
+    ]

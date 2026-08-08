@@ -580,11 +580,15 @@ class RequestExecutor:
                                     call_kwargs = dict(kwargs)
                                     call_kwargs.pop("_use_responses", None)
                                     call_kwargs["credential_identifier"] = cred
+                                    if trace and provider == "codex":
+                                        call_kwargs["_llm_trace"] = trace
                                     response = await plugin.aresponses(
                                         self._http_client, **call_kwargs
                                     )
                                 elif plugin and plugin.has_custom_logic():
                                     kwargs["credential_identifier"] = cred
+                                    if trace and provider == "codex":
+                                        kwargs["_llm_trace"] = trace
                                     response = await plugin.acompletion(
                                         self._http_client, **kwargs
                                     )
@@ -838,11 +842,15 @@ class RequestExecutor:
                                         call_kwargs = dict(kwargs)
                                         call_kwargs.pop("_use_responses", None)
                                         call_kwargs["credential_identifier"] = cred
+                                        if trace and provider == "codex":
+                                            call_kwargs["_llm_trace"] = trace
                                         stream = await plugin.aresponses(
                                             self._http_client, **call_kwargs
                                         )
                                     elif plugin and plugin.has_custom_logic():
                                         kwargs["credential_identifier"] = cred
+                                        if trace and provider == "codex":
+                                            kwargs["_llm_trace"] = trace
                                         stream = await plugin.acompletion(
                                             self._http_client, **kwargs
                                         )

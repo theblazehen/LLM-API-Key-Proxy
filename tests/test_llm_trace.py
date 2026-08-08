@@ -266,7 +266,10 @@ def test_raw_request_payload_round_trips_full_body_and_keeps_normalized_tail(tmp
     assert metadata_secret not in (archive["metadata_json"] or "")
     assert "authorization" not in (archive["metadata_json"] or "")
     assert "access_token" not in (archive["metadata_json"] or "")
-    assert json.loads(archive["metadata_json"]) == {"safe_label": "raw-request-test"}
+    assert json.loads(archive["metadata_json"]) == {
+        "nested": {},
+        "safe_label": "raw-request-test",
+    }
 
     normalized = connection.execute(
         """
@@ -281,6 +284,103 @@ def test_raw_request_payload_round_trips_full_body_and_keeps_normalized_tail(tmp
         ("tool", "message", "old result"),
         ("user", "message", "new user tail"),
     ]
+    connection.close()
+
+
+def test_raw_headers_preserve_pairs_while_metadata_stays_sanitized(tmp_path):
+    db = tmp_path / "raw-headers.sqlite3"
+    payload = {
+        "model": "codex/gpt-5.6-sol",
+        "authorization": "body-authorization",
+        "nested": {"cookie": "body-cookie"},
+    }
+    request_headers = [
+        (b"X-Order", b"first"),
+        (b"Authorization", b"Bearer raw-secret"),
+        (b"X-Order", b"second"),
+        (b"Cookie", b"session=raw"),
+        (b"X-\xff", b"value-\xfe"),
+    ]
+    response_headers = [
+        (b"Set-Cookie", b"session=response"),
+        (b"Set-Cookie", b"theme=dark"),
+    ]
+    recorder = LLMTraceRecorder(db, enabled=True)
+    trace = recorder.begin_request(request_id="raw-headers")
+    trace.request(payload)
+    trace.headers("client_request", request_headers)
+    trace.headers(
+        "provider_request",
+        request_headers,
+        metadata={"authorization": "metadata-secret", "boundary": "provider"},
+    )
+    trace.headers("provider_response", response_headers, status="200")
+    trace.headers("client_response", response_headers)
+    assert recorder.flush()
+    recorder.close()
+
+    connection = sqlite3.connect(db)
+    connection.row_factory = sqlite3.Row
+    body = connection.execute(
+        "SELECT content_json FROM llm_events WHERE request_id = ? AND event_type = ?",
+        ("raw-headers", "request_payload"),
+    ).fetchone()
+    assert json.loads(body["content_json"]) == payload
+
+    rows = connection.execute(
+        """
+        SELECT role, event_type, content_json, status, metadata_json
+        FROM llm_events
+        WHERE request_id = ? AND event_type IN ('request_headers', 'response_headers')
+        ORDER BY id
+        """,
+        ("raw-headers",),
+    ).fetchall()
+    assert len(rows) == 4
+    assert (rows[0]["role"], rows[0]["event_type"]) == ("request", "request_headers")
+    assert json.loads(rows[0]["content_json"]) == [
+        ["X-Order", "first"],
+        ["Authorization", "Bearer raw-secret"],
+        ["X-Order", "second"],
+        ["Cookie", "session=raw"],
+        ["X-ÿ", "value-þ"],
+    ]
+    assert rows[0]["metadata_json"] is None
+    assert (rows[1]["role"], rows[1]["event_type"]) == ("request", "request_headers")
+    assert json.loads(rows[1]["content_json"]) == json.loads(rows[0]["content_json"])
+    assert json.loads(rows[1]["metadata_json"]) == {"boundary": "provider"}
+    assert (rows[2]["role"], rows[2]["event_type"], rows[2]["status"]) == (
+        "response",
+        "response_headers",
+        "200",
+    )
+    assert json.loads(rows[2]["content_json"]) == [
+        ["Set-Cookie", "session=response"],
+        ["Set-Cookie", "theme=dark"],
+    ]
+    assert (rows[3]["role"], rows[3]["event_type"]) == ("response", "response_headers")
+    assert json.loads(rows[3]["content_json"]) == json.loads(rows[2]["content_json"])
+    connection.close()
+
+
+def test_raw_headers_reject_invalid_direction_without_queueing(tmp_path):
+    db = tmp_path / "invalid-header-direction.sqlite3"
+    recorder = LLMTraceRecorder(db, enabled=True)
+    trace = recorder.begin_request(request_id="invalid-header-direction")
+
+    try:
+        trace.headers("upstream", [("X-Test", "value")])
+    except ValueError as error:
+        assert "upstream" in str(error)
+    else:
+        raise AssertionError("invalid header direction did not fail")
+
+    assert recorder.flush()
+    recorder.close()
+    connection = sqlite3.connect(db)
+    assert connection.execute(
+        "SELECT COUNT(*) FROM llm_events WHERE event_type IN ('request_headers', 'response_headers')"
+    ).fetchone()[0] == 0
     connection.close()
 
 

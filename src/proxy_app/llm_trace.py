@@ -10,9 +10,9 @@ Integration is intentionally small::
     trace.response(final_response)  # call once, after stream assembly
     trace.completed()
 
-Only safe identity labels belong in ``proxy_user`` and ``credential_id``.  The
-recorder never accepts headers and recursively removes secret-looking metadata
-keys. Message bodies and tool arguments are retained verbatim by design.
+Only safe identity labels belong in ``proxy_user`` and ``credential_id``.
+Message bodies, tool arguments, and explicitly captured headers are retained
+exactly as available. Header metadata still has secret-looking keys removed.
 """
 
 from __future__ import annotations
@@ -232,6 +232,16 @@ def _json(value: Any) -> str | None:
     if value is None:
         return None
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _raw_header_pairs(headers: Any) -> list[list[str]]:
+    """Return ordered header pairs without applying archival sanitization."""
+    pairs = headers.items() if isinstance(headers, Mapping) else headers
+
+    def text(value: Any) -> str:
+        return value.decode("latin-1") if isinstance(value, bytes) else str(value)
+
+    return [[text(name), text(value)] for name, value in pairs]
 
 
 def _hash_text(value: Any) -> str | None:
@@ -888,7 +898,7 @@ class LLMTraceContext:
         ))
 
     def request(self, payload: Mapping[str, Any], *, metadata: Mapping[str, Any] | None = None) -> None:
-        """Record the raw body and normalized input messages (never headers)."""
+        """Record the raw body and normalized input messages."""
         if self.requested_model is None and payload.get("model") is not None:
             self.requested_model = str(payload["model"])
         if metadata:
@@ -901,6 +911,23 @@ class LLMTraceContext:
             self._emit(event["role"], event["event_type"],
                        json.loads(event["content_json"]) if event["content_json"] else event["content_text"],
                        status=event["status"], metadata=metadata)
+
+    def headers(self, direction: str, headers: Any, *, status: str | None = None,
+                metadata: Mapping[str, Any] | None = None) -> None:
+        """Record exact available header pairs; sanitize only optional metadata."""
+        if direction in {"client_request", "provider_request"}:
+            role, event_type = "request", "request_headers"
+        elif direction in {"provider_response", "client_response"}:
+            role, event_type = "response", "response_headers"
+        else:
+            raise ValueError(f"invalid header direction: {direction!r}")
+        self._emit(
+            role,
+            event_type,
+            _raw_header_pairs(headers),
+            status=status,
+            metadata=metadata,
+        )
 
     def cache_key_selected(self, cache_key: str | None) -> None:
         """Record only the digest of a cache key derived after request tracing."""

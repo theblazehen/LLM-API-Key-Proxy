@@ -275,6 +275,29 @@ def _start_models_refresh() -> None:
     ).start()
 
 
+def _trace_headers(
+    trace: Any,
+    direction: str,
+    headers: Any,
+    *,
+    status: Optional[int] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Emit raw HTTP headers when the request-local recorder supports it."""
+    record = getattr(trace, "headers", None)
+    if callable(record):
+        raw = getattr(headers, "raw", None)
+        pairs = raw if raw is not None else (
+            headers.items() if hasattr(headers, "items") else headers
+        )
+        record(
+            direction,
+            pairs,
+            status=status,
+            metadata=metadata,
+        )
+
+
 def _get_model_data() -> Dict[str, Any]:
     """
     Get current model data, fetching from GitHub if cache is stale.
@@ -1121,6 +1144,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
     async def aresponses(
         self, client: httpx.AsyncClient, **kwargs
     ) -> Union[Dict[str, Any], AsyncGenerator[bytes, None]]:
+        trace = kwargs.pop("_llm_trace", None)
         credential_path = kwargs.pop(
             "credential_identifier", kwargs.get("credential_path", "")
         )
@@ -1151,13 +1175,23 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             headers["ChatGPT-Account-Id"] = account_id
 
         if payload.get("stream"):
-            return self._stream_native_responses(client, headers, payload, credential_path)
+            return self._stream_native_responses(
+                client, headers, payload, credential_path, trace
+            )
 
+        _trace_headers(trace, "provider_request", headers, metadata={"boundary": "native_responses"})
         response = await client.post(
             CODEX_RESPONSES_ENDPOINT,
             headers=headers,
             json=payload,
             timeout=TimeoutConfig.streaming(),
+        )
+        _trace_headers(
+            trace,
+            "provider_response",
+            response.headers.raw,
+            status=response.status_code,
+            metadata={"boundary": "native_responses"},
         )
         if credential_path:
             self.update_quota_from_headers(
@@ -1187,7 +1221,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         headers: Dict[str, str],
         payload: Dict[str, Any],
         credential_path: str,
+        trace: Any = None,
     ) -> AsyncGenerator[bytes, None]:
+        _trace_headers(trace, "provider_request", headers, metadata={"boundary": "native_responses"})
         async with client.stream(
             "POST",
             CODEX_RESPONSES_ENDPOINT,
@@ -1195,6 +1231,13 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             json=payload,
             timeout=TimeoutConfig.streaming(),
         ) as response:
+            _trace_headers(
+                trace,
+                "provider_response",
+                response.headers.raw,
+                status=response.status_code,
+                metadata={"boundary": "native_responses"},
+            )
             if credential_path:
                 self.update_quota_from_headers(
                     credential_path, {k.lower(): v for k, v in response.headers.items()}
@@ -1228,6 +1271,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         """
         Handle chat completion request using Responses API.
         """
+        trace = kwargs.pop("_llm_trace", None)
         # Extract parameters
         model = kwargs.get("model", "gpt-5")
         messages = kwargs.get("messages", [])
@@ -1356,6 +1400,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                 requested_model,
                 kwargs.get("reasoning_compat", DEFAULT_REASONING_COMPAT),
                 credential_path,
+                trace,
             )
         else:
             return await self._non_stream_with_retry(
@@ -1365,6 +1410,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                 requested_model,
                 kwargs.get("reasoning_compat", DEFAULT_REASONING_COMPAT),
                 credential_path,
+                trace,
             )
 
     async def _stream_with_retry(
@@ -1375,6 +1421,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         model: str,
         reasoning_compat: str,
         credential_path: str = "",
+        trace: Any = None,
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
         """
         Pass Responses API chunks through without destroying streaming latency.
@@ -1389,7 +1436,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         garbled_logged = False
 
         async for chunk in self._stream_response(
-            client, headers, payload, model, reasoning_compat, credential_path
+            client, headers, payload, model, reasoning_compat, credential_path, trace
         ):
             chunk_content = ""
             if hasattr(chunk, "choices") and chunk.choices:
@@ -1420,6 +1467,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         model: str,
         reasoning_compat: str,
         credential_path: str = "",
+        trace: Any = None,
     ) -> litellm.ModelResponse:
         """
         Wrapper around _non_stream_response that retries on garbled tool calls.
@@ -1430,7 +1478,14 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         """
         for attempt in range(GARBLED_TOOL_CALL_MAX_RETRIES):
             response = await self._non_stream_response(
-                client, headers, payload, model, reasoning_compat, credential_path
+                client,
+                headers,
+                payload,
+                model,
+                reasoning_compat,
+                credential_path,
+                trace,
+                attempt + 1,
             )
 
             # Check accumulated content for garbled marker
@@ -1465,6 +1520,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         model: str,
         reasoning_compat: str,
         credential_path: str = "",
+        trace: Any = None,
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
         """Handle streaming response from Responses API."""
         created = int(time.time())
@@ -1478,6 +1534,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         streaming_reasoning = False  # True once we start streaming reasoning_content
         emitted_output = False
 
+        _trace_headers(trace, "provider_request", headers, metadata={"boundary": "chat_via_responses"})
         async with client.stream(
             "POST",
             CODEX_RESPONSES_ENDPOINT,
@@ -1485,6 +1542,13 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             json=payload,
             timeout=TimeoutConfig.streaming(),
         ) as response:
+            _trace_headers(
+                trace,
+                "provider_response",
+                response.headers.raw,
+                status=response.status_code,
+                metadata={"boundary": "chat_via_responses"},
+            )
             # Capture rate limit headers for quota tracking
             if credential_path:
                 response_headers = {k.lower(): v for k, v in response.headers.items()}
@@ -1749,6 +1813,17 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                                 usage.prompt_tokens_details[
                                     "cache_creation_tokens"
                                 ] = cache_creation
+                        # Reasoning tokens are a BREAKDOWN of output_tokens, not
+                        # an addition, so completion/total are left untouched.
+                        # executor.py reads completion_tokens_details[
+                        # "reasoning_tokens"] into thinking_tokens; without this
+                        # mapping that field is always zero.
+                        output_details = u.get("output_tokens_details") or {}
+                        reasoning = output_details.get("reasoning_tokens", 0) or 0
+                        if reasoning:
+                            usage.completion_tokens_details = {
+                                "reasoning_tokens": reasoning
+                            }
 
                     # Send final chunk
                     final_chunk = litellm.ModelResponse(
@@ -1784,6 +1859,8 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         model: str,
         reasoning_compat: str,
         credential_path: str = "",
+        trace: Any = None,
+        attempt: int = 1,
     ) -> litellm.ModelResponse:
         """Handle non-streaming response by collecting stream."""
         created = int(time.time())
@@ -1796,6 +1873,8 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         usage = None
         error_message = None
 
+        trace_metadata = {"boundary": "chat_via_responses", "attempt": attempt}
+        _trace_headers(trace, "provider_request", headers, metadata=trace_metadata)
         async with client.stream(
             "POST",
             CODEX_RESPONSES_ENDPOINT,
@@ -1803,6 +1882,13 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             json=payload,
             timeout=TimeoutConfig.streaming(),
         ) as response:
+            _trace_headers(
+                trace,
+                "provider_response",
+                response.headers.raw,
+                status=response.status_code,
+                metadata=trace_metadata,
+            )
             # Capture rate limit headers for quota tracking
             if credential_path:
                 response_headers = {k.lower(): v for k, v in response.headers.items()}
@@ -1901,6 +1987,17 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                                 usage.prompt_tokens_details[
                                     "cache_creation_tokens"
                                 ] = cache_creation
+                        # Reasoning tokens are a BREAKDOWN of output_tokens, not
+                        # an addition, so completion/total are left untouched.
+                        # executor.py reads completion_tokens_details[
+                        # "reasoning_tokens"] into thinking_tokens; without this
+                        # mapping that field is always zero.
+                        output_details = u.get("output_tokens_details") or {}
+                        reasoning = output_details.get("reasoning_tokens", 0) or 0
+                        if reasoning:
+                            usage.completion_tokens_details = {
+                                "reasoning_tokens": reasoning
+                            }
 
                 # Handle errors
                 elif kind == "response.failed":
