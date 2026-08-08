@@ -35,6 +35,9 @@ from typing import (
     TYPE_CHECKING,
 )
 
+
+_CODEX_METADATA_NAMESPACE = uuid.UUID("4707b647-b27b-4d23-9c64-bd099b9a21dd")
+
 import httpx
 import litellm
 
@@ -597,12 +600,39 @@ def _normalize_model_name(name: str) -> str:
     return mapping.get(base.lower(), base)
 
 
-def _build_codex_request_metadata() -> Dict[str, str]:
-    """Build Codex CLI-style request metadata for backend routing/telemetry."""
-    installation_id = os.getenv("CODEX_INSTALLATION_ID") or str(uuid.uuid4())
-    session_id = os.getenv("CODEX_SESSION_ID") or str(uuid.uuid4())
-    thread_id = os.getenv("CODEX_THREAD_ID") or str(uuid.uuid4())
-    window_id = os.getenv("CODEX_WINDOW_ID") or str(uuid.uuid4())
+def _build_codex_request_metadata(
+    stability_seed: str | None = None,
+) -> Dict[str, str]:
+    """Build Codex CLI-style request metadata for backend routing/telemetry.
+
+    The upstream Codex backend uses session identity for cache-affinity routing.
+    Random IDs on every request scatter one conversation across cold backend
+    machines. Deriving them from ``prompt_cache_key`` keeps a conversation on
+    one affinity while distinct conversations retain distinct identities.
+
+    Shape parity with the official Codex CLI: ``session_id`` and ``thread_id``
+    both carry the conversation id (stable for the thread's lifetime), and
+    ``x-codex-window-id`` is structured as ``{conversation_id}:{generation}``.
+    """
+
+    def generated_id(field: str) -> str:
+        if stability_seed:
+            return str(
+                uuid.uuid5(_CODEX_METADATA_NAMESPACE, f"{field}:{stability_seed}")
+            )
+        return str(uuid.uuid4())
+
+    conversation_id = generated_id("conversation")
+    installation_id = os.getenv("CODEX_INSTALLATION_ID") or generated_id(
+        "installation"
+    )
+    session_id = os.getenv("CODEX_SESSION_ID") or conversation_id
+    thread_id = os.getenv("CODEX_THREAD_ID") or (
+        conversation_id if stability_seed else generated_id("thread")
+    )
+    window_id = os.getenv("CODEX_WINDOW_ID") or (
+        f"{conversation_id}:1" if stability_seed else generated_id("window")
+    )
 
     return {
         "x-codex-installation-id": installation_id,
@@ -1384,7 +1414,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             payload["service_tier"] = service_tier
 
         if CODEX_CLIENT_METADATA:
-            metadata = _build_codex_request_metadata()
+            metadata = _build_codex_request_metadata(
+                stability_seed=payload.get("prompt_cache_key")
+            )
             payload["client_metadata"] = metadata
             headers["x-codex-window-id"] = metadata["x-codex-window-id"]
 

@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import sqlite3
 import sys
 import types
 from pathlib import Path
@@ -128,6 +130,13 @@ fake_litellm.Choices = _FakeChoices
 fake_litellm.Usage = _FakeUsage
 fake_litellm.set_verbose = False
 fake_litellm.drop_params = False
+fake_litellm.__path__ = []
+
+fake_litellm_core_utils = types.ModuleType("litellm.litellm_core_utils")
+fake_litellm_token_counter = types.ModuleType(
+    "litellm.litellm_core_utils.token_counter"
+)
+fake_litellm_token_counter.token_counter = lambda *args, **kwargs: 0
 
 fake_litellm_exceptions = types.ModuleType("litellm.exceptions")
 for _name in (
@@ -145,6 +154,10 @@ for _name in (
     setattr(fake_litellm_exceptions, _name, type(_name, (Exception,), {}))
 
 sys.modules.setdefault("litellm", fake_litellm)
+sys.modules.setdefault("litellm.litellm_core_utils", fake_litellm_core_utils)
+sys.modules.setdefault(
+    "litellm.litellm_core_utils.token_counter", fake_litellm_token_counter
+)
 sys.modules.setdefault("litellm.exceptions", fake_litellm_exceptions)
 
 
@@ -266,3 +279,75 @@ def test_codex_chat_completion_sends_prompt_cache_key_unchanged(key_factory, mon
         assert captured["payload"]["prompt_cache_key"] == prompt_cache_key
 
     asyncio.run(exercise())
+
+
+def test_codex_context_records_only_hash_for_derived_and_caller_cache_keys(tmp_path):
+    """The late-bound key updates diagnostics without emitting another trace event."""
+    from proxy_app.llm_trace import LLMTraceRecorder
+
+    database = tmp_path / "cache-key-diagnostics.sqlite3"
+    recorder = LLMTraceRecorder(database, enabled=True)
+    client = object.__new__(rotating_client.RotatingClient)
+    client._model_resolver = types.SimpleNamespace(
+        resolve_model_id=lambda model, _provider: model
+    )
+    client.enable_request_logging = False
+    client.all_credentials = {"codex": []}
+    client.global_timeout = 30
+
+    for request_id, supplied_key in (
+        ("derived-key", None),
+        ("caller-key", "caller-cache-key-private-value"),
+    ):
+        trace = recorder.begin_request(
+            request_id=request_id,
+            session_id=f"session-{request_id}",
+            proxy_user="omp-user",
+            requested_model="codex/gpt-5.6-sol",
+        )
+        trace.request(
+            {
+                "model": "codex/gpt-5.6-sol",
+                "messages": [{"role": "user", "content": "cache diagnostic probe"}],
+            }
+        )
+        request = types.SimpleNamespace(state=types.SimpleNamespace(llm_trace=trace))
+        kwargs = {"messages": [{"role": "user", "content": "cache diagnostic probe"}]}
+        if supplied_key is not None:
+            kwargs["prompt_cache_key"] = supplied_key
+
+        context = client._build_completion_context(
+            "codex/gpt-5.6-sol", "codex", kwargs, None, request, None
+        )
+        selected_key = context.kwargs["prompt_cache_key"]
+        assert selected_key == supplied_key or selected_key.startswith("omp-")
+
+    assert recorder.flush()
+    recorder.close()
+
+    connection = sqlite3.connect(database)
+    rows = dict(
+        connection.execute(
+            "SELECT request_id, prompt_cache_key_hash "
+            "FROM llm_request_diagnostics ORDER BY request_id"
+        )
+    )
+    assert rows["derived-key"] is not None
+    assert rows["caller-key"] == hashlib.sha256(
+        b"caller-cache-key-private-value"
+    ).hexdigest()
+    diagnostics_dump = "\n".join(
+        str(row)
+        for row in connection.execute("SELECT * FROM llm_request_diagnostics")
+    )
+    assert "caller-cache-key-private-value" not in diagnostics_dump
+    assert "omp-" not in diagnostics_dump
+    # Each trace has its request-begin, user-message, and archived
+    # request-headers events only (header archiving landed in 3d905f3).
+    # Updating diagnostics after key derivation must not emit a cache-key
+    # trace event on top of those.
+    assert connection.execute(
+        "SELECT COUNT(*) FROM llm_events WHERE request_id IN (?, ?)",
+        ("derived-key", "caller-key"),
+    ).fetchone()[0] == 6
+    connection.close()
