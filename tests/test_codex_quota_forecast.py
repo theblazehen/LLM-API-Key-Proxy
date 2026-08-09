@@ -72,6 +72,12 @@ def test_local_six_am_boundary_starts_and_labels_quota_day() -> None:
 
     assert before["horizon"]["start_at"] == instant(7, 6).timestamp()
     assert at["horizon"]["start_at"] == instant(8, 6).timestamp()
+    assert at["planning_horizon"]["end_at"] == instant(22, 6).timestamp()
+    assert at["planning_horizon"]["day_count"] == 14
+    assert at["planning_horizon"]["rolling_window_seconds"] == 7 * 24 * 60 * 60
+    assert len(at["days"]) == 7
+    assert len(at["planning_days"]) == 14
+    assert at["planning_days"][:7] == at["days"]
     assert [day["local_date"] for day in at["days"]] == [
         "2026-08-08",
         "2026-08-09",

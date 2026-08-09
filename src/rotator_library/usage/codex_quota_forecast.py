@@ -62,7 +62,12 @@ def build_codex_quota_forecast(
     source_timestamp: float | None = None,
     stale_after_seconds: float = STALE_AFTER_SECONDS,
 ) -> dict[str, Any]:
-    """Build a deterministic seven-quota-day Codex forecast.
+    """Build a deterministic seven-day view of a rolling 168-hour forecast.
+
+    The seven returned quota days are only the display window.  Every daily
+    target is solved over the following 168 hours, and reset events are loaded
+    through the end of that final rolling window.  This prevents the visible
+    plan from consuming capacity needed immediately after day seven.
 
     Account input fields are ``stable_id`` (or ``account_id``), optional
     ``email``, ``remaining_percent``, ``reset_at``, and optional
@@ -81,7 +86,10 @@ def build_codex_quota_forecast(
 
     now_ts = now.timestamp()
     quota_day_start = _quota_day_start(now)
-    boundaries = [_civil_boundary(quota_day_start, offset) for offset in range(8)]
+    # Return seven display days, but simulate fourteen.  The second week is
+    # needed to expose the first complete quota day after every account's next
+    # reset and to prove that the visible plan does not strand that cycle.
+    boundaries = [_civil_boundary(quota_day_start, offset) for offset in range(15)]
     normalized, unknown = _normalize_accounts(accounts, now_ts, boundaries[-1].timestamp())
     actual, actual_status = _derive_actual(
         normalized, observations, quota_day_start.timestamp(), now_ts
@@ -127,7 +135,7 @@ def build_codex_quota_forecast(
 
     days: list[dict[str, Any]] = []
     actual_for_target = actual if actual is not None else 0.0
-    for index in range(7):
+    for index in range(14):
         day_start = boundaries[index].timestamp()
         day_end = boundaries[index + 1].timestamp()
         interval_start = max(state.cursor, day_start)
@@ -242,6 +250,12 @@ def build_codex_quota_forecast(
             "end_at": boundaries[7].timestamp(),
             "day_count": 7,
         },
+        "planning_horizon": {
+            "start_at": boundaries[0].timestamp(),
+            "end_at": boundaries[14].timestamp(),
+            "day_count": 14,
+            "rolling_window_seconds": WEEK_SECONDS,
+        },
         "actual": {
             "status": actual_status,
             "used_since_day_start": actual,
@@ -254,7 +268,8 @@ def build_codex_quota_forecast(
             "basis": "forecast_targets",
         },
         "today": days[0],
-        "days": days,
+        "days": days[:7],
+        "planning_days": days,
         "accounts": account_result,
         "unknown_accounts": unknown,
     }
