@@ -235,6 +235,40 @@ def build_codex_quota_forecast(
             }
         )
 
+    # Find the first complete quota day after every account has crossed its
+    # next overwrite. A timed credit can overwrite an account before its
+    # natural reset and starts a fresh weekly cadence, so it participates in
+    # the same selection. Export the sustainable candidate, not the displayed
+    # target, because a use-it-or-lose-it drain can temporarily exceed the
+    # repeatable pace.
+    next_overwrites: list[float] = []
+    for account in normalized:
+        natural = account.natural_reset_at
+        while natural <= now_ts + _EPSILON:
+            natural += WEEK_SECONDS
+        candidates = [natural]
+        candidates.extend(
+            event.at for event in account.credit_events if event.at > now_ts + _EPSILON
+        )
+        next_overwrites.append(min(candidates))
+    final_next_overwrite = max(next_overwrites) if next_overwrites else None
+    post_reset_day = next(
+        (
+            day
+            for day in days[1:]
+            if final_next_overwrite is not None
+            and day["start_at"] >= final_next_overwrite - _EPSILON
+        ),
+        None,
+    )
+    post_reset = {
+        "after_at": final_next_overwrite,
+        "day_start_at": post_reset_day["start_at"] if post_reset_day else None,
+        "daily_sustainable_pace": (
+            post_reset_day["sustainable_candidate"] if post_reset_day else None
+        ),
+    }
+
     return {
         "schema_version": 1,
         "status": status,
@@ -270,6 +304,7 @@ def build_codex_quota_forecast(
         "today": days[0],
         "days": days[:7],
         "planning_days": days,
+        "post_reset": post_reset,
         "accounts": account_result,
         "unknown_accounts": unknown,
     }

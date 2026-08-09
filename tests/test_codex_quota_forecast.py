@@ -78,6 +78,13 @@ def test_local_six_am_boundary_starts_and_labels_quota_day() -> None:
     assert len(at["days"]) == 7
     assert len(at["planning_days"]) == 14
     assert at["planning_days"][:7] == at["days"]
+    assert at["post_reset"]["day_start_at"] is not None
+    selected = next(
+        day
+        for day in at["planning_days"]
+        if day["start_at"] == at["post_reset"]["day_start_at"]
+    )
+    assert at["post_reset"]["daily_sustainable_pace"] == selected["sustainable_candidate"]
     assert [day["local_date"] for day in at["days"]] == [
         "2026-08-08",
         "2026-08-09",
