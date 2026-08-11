@@ -266,6 +266,10 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         """Return True when the provider can handle /v1/responses natively."""
         return False
 
+    def supports_compact_api(self) -> bool:
+        """Return True when the provider can handle /v1/responses/compact natively."""
+        return False
+
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
     ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:

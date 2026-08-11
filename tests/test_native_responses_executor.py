@@ -92,6 +92,31 @@ class _NativeStreamingPlugin:
         return chunks()
 
 
+class _NativeUnaryPlugin:
+    calculate_api_equivalent_cost = True
+
+    def supports_responses_api(self):
+        return True
+
+    def has_custom_logic(self):
+        return True
+
+    async def aresponses(self, _client, **_kwargs):
+        return {
+            "id": "resp_compact",
+            "output": [{"type": "compaction", "encrypted_content": "opaque"}],
+            "usage": {
+                "input_tokens": 20,
+                "input_tokens_details": {
+                    "cached_tokens": 12,
+                    "cache_creation_tokens": 3,
+                },
+                "output_tokens": 5,
+                "output_tokens_details": {"reasoning_tokens": 2},
+            },
+        }
+
+
 def test_executor_forwards_request_trace_to_codex_custom_provider():
     trace = SimpleNamespace(
         credential_selected=lambda **_kwargs: None,
@@ -162,6 +187,91 @@ def test_executor_forwards_request_trace_to_codex_custom_provider():
     )
 
     assert asyncio.run(executor._execute_non_streaming(context)) is trace
+
+
+def test_executor_native_compact_dict_records_native_usage_and_cost():
+    executor = object.__new__(RequestExecutor)
+    executor._transforms = SimpleNamespace(apply=lambda *_args, **_kwargs: None)
+
+    async def prepare(_provider, _model, _cred, _context):
+        return {
+            "model": "codex/gpt-5.6-sol",
+            "input": "history",
+            "_use_responses": True,
+            "_compact": True,
+        }
+
+    executor._prepare_request_kwargs = prepare
+    executor._get_plugin_instance = lambda _provider: _NativeUnaryPlugin()
+    executor._run_pre_request_callback = lambda *_args: asyncio.sleep(0)
+    executor._extract_usage_tokens = lambda _response: (_ for _ in ()).throw(
+        AssertionError("generic usage extraction must not handle native dicts")
+    )
+    executor._calculate_cost = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("generic cost calculation must not handle native dicts")
+    )
+    cost_calls = []
+
+    def native_cost(*args):
+        cost_calls.append(args)
+        return 1.25
+
+    executor._calculate_native_responses_cost = native_cost
+    executor._extract_response_headers = lambda _response: None
+    executor._max_retries = 1
+    executor._http_client = object()
+    executor._wait_for_cooldown = lambda *_args: asyncio.sleep(0)
+    executor._log_acquiring_credential = lambda *_args: None
+    executor._log_acquired_credential = lambda *_args: None
+    credential = _CredentialContext()
+    credential.credential = "credential.json"
+    credential.stable_id = "stable"
+
+    class Acquired:
+        async def __aenter__(self):
+            return credential
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class UsageManager:
+        states = {}
+
+        async def get_availability_stats(self, *_args):
+            return {"available": 1, "total": 1}
+
+        async def acquire_credential(self, **_kwargs):
+            return Acquired()
+
+    async def prepare_execution(_context):
+        return UsageManager(), SimpleNamespace(priorities={}), ["credential.json"], None, {}
+
+    executor._prepare_execution = prepare_execution
+    context = RequestContext(
+        model="codex/gpt-5.6-sol",
+        provider="codex",
+        kwargs={"_use_responses": True, "_compact": True},
+        streaming=False,
+        credentials=["credential.json"],
+        deadline=time.time() + 5,
+        request=SimpleNamespace(headers={}, state=SimpleNamespace(llm_trace=None)),
+    )
+
+    response = asyncio.run(executor._execute_non_streaming(context))
+
+    assert response["id"] == "resp_compact"
+    assert cost_calls == [("codex", "codex/gpt-5.6-sol", 8, 3, 12, 3, 2)]
+    assert len(credential.successes) == 1
+    assert credential.successes[0] == {
+        "response": response,
+        "prompt_tokens": 8,
+        "completion_tokens": 3,
+        "thinking_tokens": 2,
+        "prompt_tokens_cache_read": 12,
+        "prompt_tokens_cache_write": 3,
+        "approx_cost": 1.25,
+        "response_headers": None,
+    }
 
 
 def test_executor_native_stream_dispatch_does_not_add_chat_stream_options():

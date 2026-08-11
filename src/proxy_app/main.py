@@ -12,6 +12,9 @@ from pathlib import Path
 import sys
 import argparse
 import logging
+import re
+
+import httpx
 
 # --- Argument Parsing (BEFORE heavy imports) ---
 parser = argparse.ArgumentParser(description="API Key Proxy Server")
@@ -1297,6 +1300,64 @@ async def compact_responses(
 
     except HTTPException:
         raise
+    except httpx.HTTPStatusError as e:
+        upstream_status = getattr(e, "upstream_status_code", None)
+        if not isinstance(upstream_status, int) and e.response is not None:
+            upstream_status = e.response.status_code
+        if not isinstance(upstream_status, int):
+            upstream_status = 500
+
+        if 400 <= upstream_status < 500:
+            raw_category = getattr(e, "upstream_error_category", None)
+            category = (
+                re.sub(r"[^A-Za-z0-9_.:-]+", "_", raw_category.strip())[:64]
+                if isinstance(raw_category, str)
+                else ""
+            ) or "upstream_http_error"
+            content = {
+                "error": {
+                    "message": (
+                        "Native Responses compaction was rejected by the upstream "
+                        f"service with HTTP {upstream_status}."
+                    ),
+                    "type": category,
+                    "param": None,
+                    "code": category,
+                }
+            }
+            if raw_logger:
+                raw_logger.log_final_response(
+                    status_code=upstream_status, headers=None, body=content
+                )
+            trace = getattr(request.state, "llm_trace", None)
+            if trace and not getattr(trace, "_finished", False):
+                trace.error(RuntimeError(content["error"]["message"]))
+                trace.completed(status="error")
+            logging.warning(
+                "Upstream rejected /v1/responses/compact: status=%s category=%s",
+                upstream_status,
+                category,
+            )
+            return JSONResponse(status_code=upstream_status, content=content)
+
+        logging.error(
+            "Upstream failed /v1/responses/compact: status=%s", upstream_status
+        )
+        trace = getattr(request.state, "llm_trace", None)
+        if trace and not getattr(trace, "_finished", False):
+            trace.error(RuntimeError("Native Responses compaction upstream failure"))
+            trace.completed(status="error")
+        content = {
+            "error": {
+                "message": "Internal Server Error: Native Responses compaction failed.",
+                "type": "server_error",
+                "param": None,
+                "code": "upstream_server_error",
+            }
+        }
+        if raw_logger:
+            raw_logger.log_final_response(status_code=500, headers=None, body=content)
+        return JSONResponse(status_code=500, content=content)
     except (
         litellm.InvalidRequestError,
         ValueError,

@@ -143,6 +143,7 @@ from rotator_library.providers import openai_oauth_base
 from rotator_library.providers.utilities import codex_quota_tracker
 from rotator_library.providers.codex_provider import CodexProvider
 from rotator_library.providers.ollama_cloud_provider import OllamaCloudProvider
+from rotator_library.providers.provider_interface import ProviderInterface
 from rotator_library.usage.manager import UsageManager
 from rotator_library.client.executor import RequestExecutor
 from rotator_library.client.streaming import StreamingHandler
@@ -784,6 +785,10 @@ def test_codex_56_supports_current_reasoning_levels():
 
     assert codex_provider._FALLBACK_REASONING_EFFORTS["gpt-5.6-sol"] == expected
     assert expected <= codex_provider.REASONING_EFFORTS
+
+
+def test_provider_interface_does_not_advertise_compact_api_by_default():
+    assert ProviderInterface.supports_compact_api(object()) is False
 
 
 def test_codex_context_window_comes_from_codex_model_metadata():

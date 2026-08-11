@@ -9,7 +9,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
-from proxy_app.llm_trace import LLMTraceRecorder, normalize_request
+from proxy_app.llm_trace import LLMTraceRecorder, _transport_mode, normalize_request
 from llm_tail import iter_rows, render_human
 
 
@@ -57,6 +57,19 @@ def _assert_diagnostics_do_not_expose(connection, request_id, *raw_values):
     for raw_value in raw_values:
         assert raw_value not in diagnostic_text
         assert raw_value not in metadata_text
+
+
+def test_compact_transport_mode_supports_explicit_and_path_classification():
+    payload = {"input": "compact me"}
+
+    assert (
+        _transport_mode(payload, {"transport_mode": "responses_compact"})
+        == "responses_compact"
+    )
+    assert (
+        _transport_mode(payload, {"path": "/v1/responses/compact"})
+        == "responses_compact"
+    )
 
 
 def _create_legacy_trace_database(path):

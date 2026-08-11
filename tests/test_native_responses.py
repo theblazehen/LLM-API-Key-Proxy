@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 
@@ -271,4 +273,50 @@ def test_compact_route_returns_explicit_501_without_fallback(monkeypatch):
     assert "no Chat Completions or local fallback" in body["error"]["message"]
     assert len(calls) == 1
     assert len(trace.errors) == 1
+    assert trace.completed_calls == 1
+
+
+def test_compact_route_preserves_safe_upstream_4xx_without_body_leak(monkeypatch):
+    import proxy_app.main as main
+
+    request = _CompactRequest({"model": "codex/gpt-5.6-sol", "input": "history"})
+    trace = _Trace()
+    secret = "raw-upstream-secret-must-not-leak"
+    upstream_request = httpx.Request("POST", "https://upstream.invalid/responses/compact")
+    upstream_response = httpx.Response(
+        422,
+        request=upstream_request,
+        json={"error": {"message": secret, "type": "invalid_request_error"}},
+    )
+    error = httpx.HTTPStatusError(
+        f"upstream rejected payload: {secret}",
+        request=upstream_request,
+        response=upstream_response,
+    )
+    error.upstream_status_code = 422
+    error.upstream_error_category = "invalid_request_error"
+
+    async def rejected(**_kwargs):
+        raise error
+
+    client = SimpleNamespace(acompact=rejected)
+    monkeypatch.setattr(main, "ENABLE_RAW_LOGGING", False)
+    monkeypatch.setattr(main, "start_llm_trace", lambda *_, **__: setattr(request.state, "llm_trace", trace))
+    monkeypatch.setattr(main, "log_request_to_console", lambda **_: None)
+
+    response = asyncio.run(main.compact_responses(request, client, None))
+    body = json.loads(response.body)
+
+    assert response.status_code == 422
+    assert body == {
+        "error": {
+            "message": "Native Responses compaction was rejected by the upstream service with HTTP 422.",
+            "type": "invalid_request_error",
+            "param": None,
+            "code": "invalid_request_error",
+        }
+    }
+    assert secret not in response.body.decode()
+    assert len(trace.errors) == 1
+    assert secret not in str(trace.errors[0])
     assert trace.completed_calls == 1

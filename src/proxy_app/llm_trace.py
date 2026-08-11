@@ -63,7 +63,7 @@ _PRIVATE_METADATA_KEYS = frozenset(
     }
 )
 _TRANSPORT_MODES = frozenset(
-    {"chat_completions", "responses", "anthropic_messages"}
+    {"chat_completions", "responses", "responses_compact", "anthropic_messages"}
 )
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS llm_events (
@@ -277,6 +277,8 @@ def _transport_mode(
         return "chat_completions"
     if path == "/v1/responses":
         return "responses"
+    if path == "/v1/responses/compact":
+        return "responses_compact"
     if path == "/v1/messages":
         return "anthropic_messages"
     if "input" in payload and "messages" not in payload:

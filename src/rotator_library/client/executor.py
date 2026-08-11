@@ -600,17 +600,37 @@ class RequestExecutor:
                                     kwargs.pop("transaction_context", None)
                                     response = await litellm.acompletion(**kwargs)
 
-                                # Success! Extract token usage if available
-                                (
-                                    prompt_tokens,
-                                    completion_tokens,
-                                    prompt_tokens_cached,
-                                    prompt_tokens_cache_write,
-                                    thinking_tokens,
-                                ) = self._extract_usage_tokens(response)
-                                approx_cost = self._calculate_cost(
-                                    provider, model, response
-                                )
+                                # Success! Extract token usage if available. Native
+                                # Responses returns plain dictionaries whose usage
+                                # schema differs from Chat Completions objects.
+                                if use_responses and isinstance(response, dict):
+                                    (
+                                        prompt_tokens,
+                                        completion_tokens,
+                                        prompt_tokens_cached,
+                                        prompt_tokens_cache_write,
+                                        thinking_tokens,
+                                    ) = self._native_responses_usage_tokens(response)
+                                    approx_cost = self._calculate_native_responses_cost(
+                                        provider,
+                                        model,
+                                        prompt_tokens,
+                                        completion_tokens,
+                                        prompt_tokens_cached,
+                                        prompt_tokens_cache_write,
+                                        thinking_tokens,
+                                    )
+                                else:
+                                    (
+                                        prompt_tokens,
+                                        completion_tokens,
+                                        prompt_tokens_cached,
+                                        prompt_tokens_cache_write,
+                                        thinking_tokens,
+                                    ) = self._extract_usage_tokens(response)
+                                    approx_cost = self._calculate_cost(
+                                        provider, model, response
+                                    )
                                 response_headers = self._extract_response_headers(
                                     response
                                 )
