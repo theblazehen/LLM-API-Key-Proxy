@@ -224,7 +224,17 @@ def test_compact_route_passes_native_json_through_exactly(monkeypatch):
 
     payload = {"model": "codex/gpt-5.6-sol", "input": [{"role": "user", "content": "hi"}]}
     native = {
-        "output": [{"type": "compaction", "encrypted_content": "opaque-value"}],
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "retained exactly"}],
+            },
+            {
+                "type": "compaction_summary",
+                "encrypted_content": "opaque-value",
+            },
+        ],
         "usage": {"input_tokens": 3, "output_tokens": 1},
     }
     trace = _Trace()
