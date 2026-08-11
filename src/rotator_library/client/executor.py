@@ -805,8 +805,12 @@ class RequestExecutor:
                                 provider, model, cred, context
                             )
 
-                            # Add stream options (but not for iflow - it returns 406)
-                            if provider != "iflow":
+                            # Native Responses streams carry usage in their terminal
+                            # response event and do not accept Chat Completions'
+                            # stream_options parameter.
+                            if provider != "iflow" and not kwargs.get(
+                                "_use_responses", False
+                            ):
                                 if "stream_options" not in kwargs:
                                     kwargs["stream_options"] = {}
                                 if "include_usage" not in kwargs["stream_options"]:

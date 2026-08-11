@@ -431,6 +431,61 @@ class RotatingClient:
                 raise
         return None
 
+    async def acompact(
+        self,
+        request: Optional[Any] = None,
+        pre_request_callback: Optional[callable] = None,
+        **kwargs,
+    ) -> Optional[Any]:
+        """Dispatch native Responses compaction through capable providers only."""
+        requested_model = kwargs.get("model", "")
+        model_chain = self._model_resolver.resolve_model_chain(requested_model)
+
+        candidates = []
+        for candidate in model_chain:
+            provider = candidate.split("/")[0] if "/" in candidate else ""
+            plugin = self._get_provider_instance(provider)
+            if (
+                provider
+                and provider in self.all_credentials
+                and plugin
+                and getattr(plugin, "supports_compact_api", lambda: False)()
+            ):
+                candidates.append(candidate)
+
+        if not candidates:
+            return None
+
+        parent_log_dir = kwargs.pop("_parent_log_dir", None)
+        compact_kwargs = {
+            **kwargs,
+            "stream": False,
+            "_use_responses": True,
+            "_compact": True,
+        }
+
+        for i, model in enumerate(candidates):
+            provider = model.split("/")[0]
+            is_last = i == len(candidates) - 1
+            context = self._build_completion_context(
+                model,
+                provider,
+                compact_kwargs,
+                parent_log_dir,
+                request,
+                pre_request_callback,
+            )
+            try:
+                response = await self._executor.execute(context)
+                if self._is_error_response(response) and not is_last:
+                    continue
+                return response
+            except (NoAvailableKeysError, ValueError):
+                if not is_last:
+                    continue
+                raise
+        return None
+
     async def acompletion(
         self,
         request: Optional[Any] = None,

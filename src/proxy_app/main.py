@@ -1207,7 +1207,118 @@ async def chat_completions(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- Anthropic Messages API Endpoint ---
+# --- OpenAI Responses API Endpoints ---
+@app.post("/v1/responses/compact")
+async def compact_responses(
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_api_key),
+):
+    """Compact a Responses conversation using a provider's native endpoint."""
+    raw_logger = RawIOLogger() if ENABLE_RAW_LOGGING else None
+    try:
+        try:
+            request_data = await request.json()
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
+        if not isinstance(request_data, dict):
+            raise HTTPException(
+                status_code=400, detail="Invalid Request: JSON body must be an object."
+            )
+        start_llm_trace(request, request_data, transport_mode="responses_compact")
+
+        if raw_logger:
+            raw_logger.log_request(headers=request.headers, body=request_data)
+
+        log_request_to_console(
+            url=str(request.url),
+            headers=dict(request.headers),
+            client_info=(request.client.host, request.client.port),
+            request_data=request_data,
+        )
+
+        if not request_data.get("model"):
+            raise HTTPException(
+                status_code=400, detail="Invalid Request: model is required."
+            )
+
+        native_response = await client.acompact(request=request, **request_data)
+        if native_response is None:
+            content = {
+                "error": {
+                    "message": "Native Responses compaction is unsupported for the requested model; no Chat Completions or local fallback is available.",
+                    "type": "unsupported_native_compaction",
+                    "param": "model",
+                    "code": "native_compact_unsupported",
+                }
+            }
+            if raw_logger:
+                raw_logger.log_final_response(
+                    status_code=501, headers=None, body=content
+                )
+            trace = getattr(request.state, "llm_trace", None)
+            if trace and not getattr(trace, "_finished", False):
+                trace.error(RuntimeError(content["error"]["message"]))
+                trace.completed(status="error")
+            return JSONResponse(status_code=501, content=content)
+
+        error_status = _native_response_error_status(native_response)
+        if error_status is not None:
+            error = native_response["error"]
+            content = {
+                "error": {
+                    "message": error.get(
+                        "message", "Native Responses compaction failed"
+                    ),
+                    "type": "server_error",
+                    "param": None,
+                    "code": error.get("type"),
+                }
+            }
+            if raw_logger:
+                raw_logger.log_final_response(
+                    status_code=error_status, headers=None, body=content
+                )
+            trace = getattr(request.state, "llm_trace", None)
+            if trace and not getattr(trace, "_finished", False):
+                trace.error(RuntimeError(content["error"]["message"]))
+                trace.completed(status="error")
+            return JSONResponse(status_code=error_status, content=content)
+
+        if raw_logger:
+            raw_logger.log_final_response(
+                status_code=200, headers=None, body=native_response
+            )
+        trace = getattr(request.state, "llm_trace", None)
+        if trace and not getattr(trace, "_finished", False):
+            trace.response(native_response)
+            trace.completed()
+        return JSONResponse(content=native_response)
+
+    except HTTPException:
+        raise
+    except (
+        litellm.InvalidRequestError,
+        ValueError,
+        litellm.ContextWindowExceededError,
+    ) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid Request: {str(e)}")
+    except litellm.AuthenticationError as e:
+        raise HTTPException(status_code=401, detail=f"Authentication Error: {str(e)}")
+    except litellm.RateLimitError as e:
+        raise HTTPException(status_code=429, detail=f"Rate Limit Error: {str(e)}")
+    except Exception as e:
+        logging.error(
+            f"An unexpected error occurred in /v1/responses/compact: {e}",
+            exc_info=True,
+        )
+        trace = getattr(request.state, "llm_trace", None)
+        if trace:
+            trace.error(e)
+            trace.completed(status="error")
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+
+
 @app.post("/v1/responses")
 async def responses(
     request: Request,

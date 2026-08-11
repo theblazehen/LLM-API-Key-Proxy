@@ -21,6 +21,7 @@ from rotator_library.client.executor import RequestExecutor
 from rotator_library.core.types import RequestContext
 from rotator_library.error_handler import classify_error
 from rotator_library.providers.codex_provider import CodexProvider
+from rotator_library.providers import codex_provider
 
 
 async def _collect(stream):
@@ -70,6 +71,25 @@ class _TraceForwardingPlugin:
 
     async def acompletion(self, _client, **kwargs):
         return kwargs.get("_llm_trace")
+
+
+class _NativeStreamingPlugin:
+    def __init__(self):
+        self.kwargs = None
+
+    def supports_responses_api(self):
+        return True
+
+    def has_custom_logic(self):
+        return True
+
+    async def aresponses(self, _client, **kwargs):
+        self.kwargs = kwargs
+
+        async def chunks():
+            yield b"data: [DONE]\n\n"
+
+        return chunks()
 
 
 def test_executor_forwards_request_trace_to_codex_custom_provider():
@@ -142,6 +162,73 @@ def test_executor_forwards_request_trace_to_codex_custom_provider():
     )
 
     assert asyncio.run(executor._execute_non_streaming(context)) is trace
+
+
+def test_executor_native_stream_dispatch_does_not_add_chat_stream_options():
+    plugin = _NativeStreamingPlugin()
+    executor = object.__new__(RequestExecutor)
+    executor._transforms = SimpleNamespace(apply=lambda *_args, **_kwargs: None)
+
+    async def prepare(_provider, _model, _cred, _context):
+        return {
+            "model": "codex/gpt-5.6-sol",
+            "stream": True,
+            "_use_responses": True,
+        }
+
+    executor._prepare_request_kwargs = prepare
+    executor._get_plugin_instance = lambda _provider: plugin
+    executor._run_pre_request_callback = lambda *_args: asyncio.sleep(0)
+    executor._max_retries = 1
+    executor._http_client = object()
+    executor._wait_for_cooldown = lambda *_args: asyncio.sleep(0)
+    executor._log_acquiring_credential = lambda *_args: None
+    executor._log_acquired_credential = lambda *_args: None
+
+    async def passthrough(stream, **_kwargs):
+        async for chunk in stream:
+            yield chunk
+
+    executor._native_responses_stream_wrapper = passthrough
+
+    class CredentialContext:
+        credential = "credential.json"
+        stable_id = "stable"
+
+    class Acquired:
+        async def __aenter__(self):
+            return CredentialContext()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class UsageManager:
+        states = {}
+
+        async def get_availability_stats(self, *_args):
+            return {"available": 1, "total": 1}
+
+        async def acquire_credential(self, **_kwargs):
+            return Acquired()
+
+    async def prepare_execution(_context):
+        return UsageManager(), SimpleNamespace(priorities={}), ["credential.json"], None, {}
+
+    executor._prepare_execution = prepare_execution
+    context = RequestContext(
+        model="codex/gpt-5.6-sol",
+        provider="codex",
+        kwargs={"stream": True, "_use_responses": True},
+        streaming=True,
+        credentials=["credential.json"],
+        deadline=time.time() + 5,
+        request=SimpleNamespace(headers={}, state=SimpleNamespace(llm_trace=None)),
+    )
+
+    assert asyncio.run(_collect(executor._execute_streaming(context))) == [
+        b"data: [DONE]\n\n"
+    ]
+    assert "stream_options" not in plugin.kwargs
 
 
 _RESPONSE_RAW_HEADERS = [
@@ -217,6 +304,25 @@ class _NativeSuccessClient:
             json={"id": "resp_success", "output": []},
             headers=_RESPONSE_RAW_HEADERS,
             request=httpx.Request("POST", "https://example.invalid/responses"),
+        )
+
+
+class _CapturingJSONClient:
+    def __init__(self, response_payload):
+        self.response_payload = response_payload
+        self.url = None
+        self.headers = None
+        self.payload = None
+
+    async def post(self, url, *, headers, json, **_kwargs):
+        self.url = url
+        self.headers = headers
+        self.payload = json
+        return httpx.Response(
+            200,
+            json=self.response_payload,
+            headers=_RESPONSE_RAW_HEADERS,
+            request=httpx.Request("POST", url),
         )
 
 
@@ -305,6 +411,34 @@ def test_native_terminal_usage_is_accounted_and_logged_after_fragmented_sse():
     assert usage["completion_tokens"] == 2
     assert usage["prompt_tokens_cache_read"] == 8
     assert usage["prompt_tokens_cache_write"] == 4
+
+
+def test_native_stream_wrapper_preserves_compaction_events_and_items_byte_identical():
+    chunks = [
+        b"event: response.compaction.delta\n",
+        b'data: {"type":"response.compaction.delta","delta":"opaque"}\n\n',
+        b"event: response.output_item.done\n",
+        b'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"ciphertext"}}\n\n',
+        b"event: response.completed\n",
+        b'data: {"type":"response.completed","response":{"id":"resp_compacted","object":"response","status":"completed","output":[{"type":"compaction","encrypted_content":"ciphertext"}],"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    executor = RequestExecutor.__new__(RequestExecutor)
+
+    output = asyncio.run(
+        _collect(
+            executor._native_responses_stream_wrapper(
+                _fragmented_native_stream(chunks),
+                provider="codex",
+                model="gpt-5.6-sol",
+                cred_context=_CredentialContext(),
+                transaction_logger=None,
+                llm_trace=None,
+            )
+        )
+    )
+
+    assert output == chunks
 
 
 @pytest.mark.parametrize(
@@ -443,6 +577,102 @@ def test_native_non_streaming_headers_preserve_auth_and_duplicate_response_pairs
     assert response_event[0] == "provider_response"
     assert response_event[1][: len(_RESPONSE_RAW_HEADERS)] == _RESPONSE_RAW_HEADERS
     assert response_event[2:] == (200, {"boundary": "native_responses"})
+
+
+def test_native_provider_filters_chat_only_stream_options(monkeypatch):
+    provider = CodexProvider()
+    client = _CapturingJSONClient({"id": "resp_success"})
+
+    async def auth_header(_credential):
+        return {"Authorization": "Bearer test-token"}
+
+    async def no_account_id(_credential):
+        return None
+
+    monkeypatch.setattr(provider, "get_auth_header", auth_header)
+    monkeypatch.setattr(provider, "get_account_id", no_account_id)
+
+    result = asyncio.run(
+        provider.aresponses(
+            client,
+            credential_identifier="credential.json",
+            model="codex/gpt-5.6-sol",
+            input="input",
+            stream=False,
+            stream_options={"include_usage": True},
+            max_output_tokens=23,
+            prompt_cache_retention="24h",
+            context_management=[{"type": "compaction", "compact_threshold": 99}],
+        )
+    )
+
+    assert result == {"id": "resp_success"}
+    assert "stream_options" not in client.payload
+    assert client.payload["max_output_tokens"] == 23
+    assert client.payload["prompt_cache_retention"] == "24h"
+    assert client.payload["context_management"] == [
+        {"type": "compaction", "compact_threshold": 99}
+    ]
+
+
+def test_compact_posts_unary_json_and_passes_response_through(monkeypatch):
+    provider = CodexProvider()
+    upstream_payload = {
+        "id": "cmp_123",
+        "output": [
+            {
+                "type": "compaction",
+                "encrypted_content": "opaque",
+                "unknown_future_field": {"preserved": True},
+            }
+        ],
+    }
+    client = _CapturingJSONClient(upstream_payload)
+    trace = _HeaderTrace()
+    quota_headers = []
+
+    async def auth_header(_credential):
+        return {"Authorization": "Bearer test-token"}
+
+    async def account_id(_credential):
+        return "acct-test"
+
+    monkeypatch.setattr(provider, "get_auth_header", auth_header)
+    monkeypatch.setattr(provider, "get_account_id", account_id)
+    monkeypatch.setattr(
+        provider,
+        "update_quota_from_headers",
+        lambda credential, headers: quota_headers.append((credential, headers)),
+    )
+
+    result = asyncio.run(
+        provider.aresponses(
+            client,
+            credential_identifier="credential.json",
+            model="codex/gpt-5.6-sol",
+            input=[{"role": "user", "content": "compact this"}],
+            stream=True,
+            stream_options={"include_usage": True},
+            _compact=True,
+            _llm_trace=trace,
+        )
+    )
+
+    assert result == upstream_payload
+    assert client.url == codex_provider.CODEX_RESPONSES_COMPACT_ENDPOINT
+    assert client.payload == {
+        "model": "gpt-5.6-sol",
+        "input": [{"role": "user", "content": "compact this"}],
+    }
+    assert client.headers["Authorization"] == "Bearer test-token"
+    assert client.headers["ChatGPT-Account-Id"] == "acct-test"
+    assert client.headers["Accept"] == "application/json"
+    assert quota_headers[0][0] == "credential.json"
+    assert quota_headers[0][1]["x-codex-primary-used-percent"] == "12.5"
+    assert [event[3] for event in trace.header_events] == [
+        {"boundary": "native_responses_compact"},
+        {"boundary": "native_responses_compact"},
+    ]
 
 
 def test_native_stream_error_headers_are_recorded_before_status_handling(monkeypatch):

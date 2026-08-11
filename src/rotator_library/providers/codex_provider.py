@@ -93,12 +93,14 @@ USE_OPENAI_API = env_bool("CODEX_USE_OPENAI_API", False)
 if USE_OPENAI_API:
     CODEX_API_BASE = os.getenv("CODEX_API_BASE", "https://api.openai.com/v1")
     CODEX_RESPONSES_ENDPOINT = f"{CODEX_API_BASE}/responses"
+    CODEX_RESPONSES_COMPACT_ENDPOINT = f"{CODEX_API_BASE}/responses/compact"
 else:
     # Default: ChatGPT backend API (requires OAuth + account_id)
     CODEX_API_BASE = os.getenv(
         "CODEX_API_BASE", "https://chatgpt.com/backend-api/codex"
     )
     CODEX_RESPONSES_ENDPOINT = f"{CODEX_API_BASE}/responses"
+    CODEX_RESPONSES_COMPACT_ENDPOINT = f"{CODEX_API_BASE}/responses/compact"
 
 # Reasoning effort levels (superset of all known levels)
 REASONING_EFFORTS = {
@@ -1122,6 +1124,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
     def supports_responses_api(self) -> bool:
         return True
 
+    def supports_compact_api(self) -> bool:
+        return True
+
     @staticmethod
     def _native_response_error_category(response: httpx.Response) -> str:
         """Return a bounded structural upstream error category without body text."""
@@ -1175,20 +1180,25 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         self, client: httpx.AsyncClient, **kwargs
     ) -> Union[Dict[str, Any], AsyncGenerator[bytes, None]]:
         trace = kwargs.pop("_llm_trace", None)
+        compact = bool(kwargs.pop("_compact", False))
         credential_path = kwargs.pop(
             "credential_identifier", kwargs.get("credential_path", "")
         )
         kwargs.pop("transaction_context", None)
+        kwargs.pop("stream_options", None)
 
         requested_model = kwargs.get("model", "gpt-5")
         model = requested_model.split("/", 1)[1] if "/" in requested_model else requested_model
         normalized_model = _normalize_model_name(model)
         payload = dict(kwargs)
         payload["model"] = normalized_model
-        payload.setdefault("store", False)
-        payload.setdefault("stream", bool(kwargs.get("stream", False)))
-        if not payload.get("instructions"):
-            payload["instructions"] = _get_model_instruction(normalized_model)
+        if compact:
+            payload.pop("stream", None)
+        else:
+            payload.setdefault("store", False)
+            payload.setdefault("stream", bool(kwargs.get("stream", False)))
+            if not payload.get("instructions"):
+                payload["instructions"] = _get_model_instruction(normalized_model)
 
         auth_headers = await self.get_auth_header(credential_path)
         account_id = await self.get_account_id(credential_path)
@@ -1204,14 +1214,16 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         if account_id:
             headers["ChatGPT-Account-Id"] = account_id
 
-        if payload.get("stream"):
+        if not compact and payload.get("stream"):
             return self._stream_native_responses(
                 client, headers, payload, credential_path, trace
             )
 
-        _trace_headers(trace, "provider_request", headers, metadata={"boundary": "native_responses"})
+        boundary = "native_responses_compact" if compact else "native_responses"
+        endpoint = CODEX_RESPONSES_COMPACT_ENDPOINT if compact else CODEX_RESPONSES_ENDPOINT
+        _trace_headers(trace, "provider_request", headers, metadata={"boundary": boundary})
         response = await client.post(
-            CODEX_RESPONSES_ENDPOINT,
+            endpoint,
             headers=headers,
             json=payload,
             timeout=TimeoutConfig.streaming(),
@@ -1221,7 +1233,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             "provider_response",
             response.headers.raw,
             status=response.status_code,
-            metadata={"boundary": "native_responses"},
+            metadata={"boundary": boundary},
         )
         if credential_path:
             self.update_quota_from_headers(

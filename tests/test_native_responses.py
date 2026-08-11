@@ -20,7 +20,7 @@ class _Trace:
     def error(self, error):
         self.errors.append(error)
 
-    def completed(self):
+    def completed(self, status=None):
         self.completed_calls += 1
         self._finished = True
 
@@ -151,4 +151,124 @@ def test_native_response_stream_reports_upstream_exception_and_finishes_trace():
     assert len(trace.errors) == 1
     assert str(trace.errors[0]) == "upstream stream disconnected"
     assert trace.responses == []
+    assert trace.completed_calls == 1
+
+
+class _CompactRequest:
+    def __init__(self, payload):
+        self._payload = payload
+        self.state = SimpleNamespace(proxy_identity=SimpleNamespace(user="test-user"))
+        self.headers = {}
+        self.scope = {"headers": []}
+        self.url = SimpleNamespace(path="/v1/responses/compact", __str__=lambda _: "http://test/v1/responses/compact")
+        self.client = SimpleNamespace(host="test", port=1234)
+
+    async def json(self):
+        return self._payload
+
+
+def test_rotating_client_acompact_uses_only_capable_native_executor_candidates():
+    from rotator_library.client.rotating_client import RotatingClient
+
+    contexts = []
+    capable = SimpleNamespace(supports_compact_api=lambda: True)
+    incapable = SimpleNamespace(supports_compact_api=lambda: False)
+
+    class Executor:
+        async def execute(self, context):
+            contexts.append(context)
+            return {"output": [{"type": "compaction", "encrypted_content": "opaque"}]}
+
+    client = SimpleNamespace(
+        _model_resolver=SimpleNamespace(
+            resolve_model_chain=lambda _: ["other/model", "codex/gpt-5.6-sol"]
+        ),
+        all_credentials={"other": ["other.json"], "codex": ["codex.json"]},
+        _get_provider_instance=lambda provider: {
+            "other": incapable,
+            "codex": capable,
+        }[provider],
+        _build_completion_context=lambda model, provider, kwargs, *args: SimpleNamespace(
+            model=model, provider=provider, kwargs=kwargs
+        ),
+        _executor=Executor(),
+        _is_error_response=lambda _: False,
+    )
+
+    response = asyncio.run(
+        RotatingClient.acompact(
+            client,
+            model="alias/compact",
+            input=[{"role": "user", "content": "keep exact"}],
+        )
+    )
+
+    assert response == {
+        "output": [{"type": "compaction", "encrypted_content": "opaque"}]
+    }
+    assert len(contexts) == 1
+    assert contexts[0].model == "codex/gpt-5.6-sol"
+    assert contexts[0].kwargs == {
+        "model": "alias/compact",
+        "input": [{"role": "user", "content": "keep exact"}],
+        "stream": False,
+        "_use_responses": True,
+        "_compact": True,
+    }
+
+
+def test_compact_route_passes_native_json_through_exactly(monkeypatch):
+    import proxy_app.main as main
+
+    payload = {"model": "codex/gpt-5.6-sol", "input": [{"role": "user", "content": "hi"}]}
+    native = {
+        "output": [{"type": "compaction", "encrypted_content": "opaque-value"}],
+        "usage": {"input_tokens": 3, "output_tokens": 1},
+    }
+    trace = _Trace()
+    request = _CompactRequest(payload)
+    client = SimpleNamespace(acompact=lambda **_: None)
+
+    async def compact(**kwargs):
+        assert kwargs["request"] is request
+        assert {key: value for key, value in kwargs.items() if key != "request"} == payload
+        return native
+
+    client.acompact = compact
+    monkeypatch.setattr(main, "ENABLE_RAW_LOGGING", False)
+    monkeypatch.setattr(main, "start_llm_trace", lambda *_, **__: setattr(request.state, "llm_trace", trace))
+    monkeypatch.setattr(main, "log_request_to_console", lambda **_: None)
+
+    response = asyncio.run(main.compact_responses(request, client, None))
+
+    assert response.status_code == 200
+    assert json.loads(response.body) == native
+    assert trace.responses == [native]
+    assert trace.completed_calls == 1
+
+
+def test_compact_route_returns_explicit_501_without_fallback(monkeypatch):
+    import proxy_app.main as main
+
+    request = _CompactRequest({"model": "ollama/model", "input": "history"})
+    trace = _Trace()
+    calls = []
+
+    async def unsupported(**kwargs):
+        calls.append(kwargs)
+        return None
+
+    client = SimpleNamespace(acompact=unsupported)
+    monkeypatch.setattr(main, "ENABLE_RAW_LOGGING", False)
+    monkeypatch.setattr(main, "start_llm_trace", lambda *_, **__: setattr(request.state, "llm_trace", trace))
+    monkeypatch.setattr(main, "log_request_to_console", lambda **_: None)
+
+    response = asyncio.run(main.compact_responses(request, client, None))
+    body = json.loads(response.body)
+
+    assert response.status_code == 501
+    assert body["error"]["code"] == "native_compact_unsupported"
+    assert "no Chat Completions or local fallback" in body["error"]["message"]
+    assert len(calls) == 1
+    assert len(trace.errors) == 1
     assert trace.completed_calls == 1
