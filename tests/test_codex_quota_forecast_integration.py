@@ -145,7 +145,7 @@ def test_forecast_is_additive_and_identical_composition_dedupes_observation(
     assert {key: stats[key] for key in original} == original
     forecast = stats["forecast"]
     assert isinstance(forecast, dict)
-    assert forecast["schema_version"] == 1
+    assert forecast["schema_version"] == 2
     assert forecast["status"] == "ready"
     assert forecast["unit"] == "weekly_quota_percentage_points"
     assert forecast["source_timestamp"] == SOURCE_TIMESTAMP
@@ -222,7 +222,7 @@ def test_composition_failure_retains_stats_and_returns_explicit_unavailable(
 
     assert {key: stats[key] for key in original} == original
     forecast = stats["forecast"]
-    assert forecast["schema_version"] == 1
+    assert forecast["schema_version"] == 2
     assert forecast["status"] == "unavailable"
     assert forecast["reason"] == "forecast_composition_failed"
     assert forecast["source_timestamp"] == SOURCE_TIMESTAMP
@@ -255,9 +255,11 @@ def test_composition_failure_retains_stats_and_returns_explicit_unavailable(
             "local_date": start.date().isoformat(),
             "target": 0.0,
             "remaining_target": 0.0,
-            "drain_candidate": 0.0,
-            "sustainable_candidate": 0.0,
-            "selected_reason": "rolling_168h_sustainable",
+            "baseline_allocation": 0.0,
+            "expiry_bonus": 0.0,
+            "sustainable_daily_rate": 0.0,
+            "live_sustainable_remaining": 0.0,
+            "expected_used_by_now": 0.0,
             "contributions": [],
             "reset_events": [],
         }

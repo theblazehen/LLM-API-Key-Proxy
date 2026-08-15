@@ -98,6 +98,7 @@ def build_codex_quota_forecast(
     baseline_accounts = _accounts_at_day_start(
         normalized, observations, quota_day_start.timestamp()
     )
+    baseline_plan: dict[str, Any] | None = None
     if baseline_accounts is not None:
         baseline_events = _forecast_events(
             baseline_accounts,
@@ -109,21 +110,19 @@ def build_codex_quota_forecast(
             events=baseline_events,
             cursor=quota_day_start.timestamp(),
         )
-        baseline_day_seconds = boundaries[1].timestamp() - quota_day_start.timestamp()
-        baseline_drain = min(
-            _drain_rate(baseline_state, quota_day_start.timestamp()) * baseline_day_seconds,
-            _maximum_consumable(
-                baseline_state, quota_day_start.timestamp(), boundaries[1].timestamp()
-            ),
-        )
-        baseline_sustainable = _maximum_sustainable_rate(
-            baseline_state,
+        baseline_rate_state = baseline_state.copy()
+        _apply_events_at(baseline_rate_state, quota_day_start.timestamp())
+        baseline_rate = _maximum_sustainable_rate(
+            baseline_rate_state,
             quota_day_start.timestamp(),
             quota_day_start.timestamp() + WEEK_SECONDS,
-        ) * baseline_day_seconds
-    else:
-        baseline_drain = None
-        baseline_sustainable = None
+        )
+        baseline_plan = _consume_baseline_plus_expiry(
+            baseline_state,
+            quota_day_start.timestamp(),
+            boundaries[1].timestamp(),
+            baseline_rate,
+        )
 
     events = _forecast_events(normalized, now_ts, boundaries[-1].timestamp() + WEEK_SECONDS)
     state = _State(
@@ -134,59 +133,58 @@ def build_codex_quota_forecast(
     aggregate_exhaustion = False
 
     days: list[dict[str, Any]] = []
-    actual_for_target = actual if actual is not None else 0.0
     for index in range(14):
         day_start = boundaries[index].timestamp()
         day_end = boundaries[index + 1].timestamp()
         interval_start = max(state.cursor, day_start)
-        if interval_start >= day_end - _EPSILON:
-            target_remaining = 0.0
-            drain_remaining = 0.0
-            sustainable_remaining = 0.0
-            selected_reason = "rolling_168h_sustainable"
-            contributions: list[dict[str, Any]] = []
-            reset_events: list[dict[str, Any]] = []
-        else:
-            # Quota-day intervals are half-open. A reset at exactly 06:00
-            # restores capacity for this new day, never for the prior one.
-            reset_events = _apply_events_at(state, interval_start)
-            drain_rate = _drain_rate(state, interval_start)
-            sustainable_rate = _maximum_sustainable_rate(
-                state, interval_start, interval_start + WEEK_SECONDS
-            )
-            remaining_seconds = day_end - interval_start
-            day_capacity = _maximum_consumable(state, interval_start, day_end)
-            drain_remaining = min(drain_rate * remaining_seconds, day_capacity)
-            sustainable_remaining = min(
-                sustainable_rate * remaining_seconds, day_capacity
-            )
-            if drain_remaining > sustainable_remaining + _EPSILON:
-                selected_reason = "next_reset_drain"
-                target_remaining = drain_remaining
-            else:
-                selected_reason = "rolling_168h_sustainable"
-                target_remaining = sustainable_remaining
+        rate_state = state.copy()
+        _apply_events_at(rate_state, interval_start)
+        daily_rate = _maximum_sustainable_rate(
+            rate_state, interval_start, interval_start + WEEK_SECONDS
+        ) * 24.0 * 60.0 * 60.0
+        live_sustainable_remaining = daily_rate * max(0.0, day_end - interval_start) / (
+            24.0 * 60.0 * 60.0
+        )
 
+        if index == 0 and baseline_plan is not None and actual is not None:
+            target = baseline_plan["target"]
+            target_remaining = max(0.0, target - actual)
+            baseline_allocation = baseline_plan["baseline_allocation"]
+            expiry_bonus = baseline_plan["expiry_bonus"]
+            expected_used_by_now = _expected_used_by(
+                baseline_plan["segments"], interval_start
+            )
             if normalized and _has_positive_dry_interval(
                 state, interval_start, day_end, target_remaining
             ):
                 aggregate_exhaustion = True
-            consumption = max(0.0, target_remaining)
-            contributions, later_reset_events, consumed = _consume_target(
-                state, interval_start, day_end, consumption
+            contributions, reset_events, consumed = _consume_fixed_allocation(
+                state, interval_start, day_end, target_remaining
             )
-            reset_events.extend(later_reset_events)
-            target_remaining = consumed
+            target_remaining = max(0.0, target - actual)
+        elif interval_start >= day_end - _EPSILON:
+            target = 0.0
+            target_remaining = 0.0
+            baseline_allocation = 0.0
+            expiry_bonus = 0.0
+            expected_used_by_now = 0.0
+            contributions: list[dict[str, Any]] = []
+            reset_events: list[dict[str, Any]] = []
+        else:
+            plan = _consume_baseline_plus_expiry(
+                state,
+                interval_start,
+                day_end,
+                daily_rate / (24.0 * 60.0 * 60.0),
+            )
+            target = plan["target"]
+            target_remaining = target
+            baseline_allocation = plan["baseline_allocation"]
+            expiry_bonus = plan["expiry_bonus"]
+            expected_used_by_now = 0.0
+            contributions = plan["contributions"]
+            reset_events = plan["reset_events"]
 
-        target = (
-            actual_for_target + target_remaining if index == 0 else target_remaining
-        )
-        drain_total = actual_for_target + drain_remaining if index == 0 else drain_remaining
-        sustainable_total = (
-            actual_for_target + sustainable_remaining
-            if index == 0
-            else sustainable_remaining
-        )
         day = {
                 "index": index,
                 "start_at": day_start,
@@ -194,14 +192,14 @@ def build_codex_quota_forecast(
                 "local_date": boundaries[index].date().isoformat(),
                 "target": target,
                 "remaining_target": target_remaining,
-                "drain_candidate": drain_total,
-                "sustainable_candidate": sustainable_total,
-                "selected_reason": selected_reason,
+                "baseline_allocation": baseline_allocation,
+                "expiry_bonus": expiry_bonus,
+                "sustainable_daily_rate": daily_rate,
+                "live_sustainable_remaining": live_sustainable_remaining,
+                "expected_used_by_now": expected_used_by_now,
                 "contributions": contributions,
                 "reset_events": reset_events,
             }
-        if index == 0 and baseline_drain is not None and baseline_sustainable is not None:
-            day["planned_at_day_start"] = max(baseline_drain, baseline_sustainable)
         days.append(day)
 
     generated_at = now_ts
@@ -211,7 +209,11 @@ def build_codex_quota_forecast(
         else None
     )
     stale = age_seconds is None or age_seconds > stale_after_seconds
-    status = "unavailable" if not normalized else "ready"
+    status = (
+        "ready"
+        if normalized and baseline_plan is not None and actual is not None
+        else "unavailable"
+    )
 
     account_result = []
     for account in normalized:
@@ -237,10 +239,9 @@ def build_codex_quota_forecast(
 
     # Find the first complete quota day after every account has crossed its
     # next overwrite. A timed credit can overwrite an account before its
-    # natural reset and starts a fresh weekly cadence, so it participates in
-    # the same selection. Export the sustainable candidate, not the displayed
-    # target, because a use-it-or-lose-it drain can temporarily exceed the
-    # repeatable pace.
+    # reset and starts a fresh weekly cadence, so it participates in
+    # the same selection. Export the current-state constant-rate advisory,
+    # not a target that may include a one-off expiry bonus.
     next_overwrites: list[float] = []
     for account in normalized:
         natural = account.natural_reset_at
@@ -265,12 +266,12 @@ def build_codex_quota_forecast(
         "after_at": final_next_overwrite,
         "day_start_at": post_reset_day["start_at"] if post_reset_day else None,
         "daily_sustainable_pace": (
-            post_reset_day["sustainable_candidate"] if post_reset_day else None
+            post_reset_day["sustainable_daily_rate"] if post_reset_day else None
         ),
     }
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": status,
         "unit": "weekly_quota_percentage_points",
         "generated_at": generated_at,
@@ -550,12 +551,15 @@ def _accounts_at_day_start(
             account, day_start, day_start + 1.0
         ):
             remaining = 100.0
+        natural_reset_at = account.natural_reset_at
+        while natural_reset_at - WEEK_SECONDS >= day_start - _EPSILON:
+            natural_reset_at -= WEEK_SECONDS
         reconstructed.append(
             _Account(
                 account_id=account.account_id,
                 email=account.email,
                 remaining=remaining,
-                natural_reset_at=account.natural_reset_at,
+                natural_reset_at=natural_reset_at,
                 credit_events=list(account.known_credit_events),
                 known_credit_events=list(account.known_credit_events),
                 untimed_credit_count=account.untimed_credit_count,
@@ -569,15 +573,6 @@ def _next_event_for_account(state: _State, account_id: str, at: float) -> float:
         (event.at for event in state.events if event.account_id == account_id and event.at > at + _EPSILON),
         default=math.inf,
     )
-
-
-def _drain_rate(state: _State, at: float) -> float:
-    candidates = [event for event in state.events if event.at > at + _EPSILON]
-    if not candidates:
-        return 0.0
-    event = candidates[0]
-    seconds = event.at - at
-    return state.balances.get(event.account_id, 0.0) / seconds if seconds > 0 else 0.0
 
 
 def _maximum_sustainable_rate(state: _State, start: float, end: float) -> float:
@@ -597,13 +592,6 @@ def _maximum_sustainable_rate(state: _State, start: float, end: float) -> float:
         else:
             high = middle
     return low
-
-
-def _maximum_consumable(state: _State, start: float, end: float) -> float:
-    """Return capacity that can be spent in an interval, including overwrites."""
-    probe = state.copy()
-    _, _, consumed = _consume_interval(probe, start, end, 1_000_000_000.0)
-    return consumed
 
 
 def _has_positive_dry_interval(
@@ -645,6 +633,101 @@ def _has_positive_dry_interval(
     return False
 
 
+def _consume_baseline_plus_expiry(
+    state: _State, start: float, end: float, baseline_rate: float
+) -> dict[str, Any]:
+    """Consume a constant baseline and only the quota it would overwrite.
+
+    Each reset boundary closes one planning segment. The constant baseline is
+    consumed earliest-deadline-first within that segment, then any balance
+    still held by *all* accounts resetting at that instant is the segment's
+    expiry bonus. This aggregates simultaneous resets and never carries a
+    pre-reset drain rate into the following segment.
+    """
+    contributions: dict[str, float] = {}
+    reset_result = _apply_events_at(state, start)
+    segments: list[dict[str, float]] = []
+    baseline_allocation = 0.0
+    expiry_bonus = 0.0
+    cursor = start
+
+    while cursor < end - _EPSILON:
+        next_at = min(
+            (
+                event.at
+                for event in state.events
+                if cursor < event.at <= end + _EPSILON
+            ),
+            default=end,
+        )
+        baseline_requested = max(0.0, baseline_rate) * (next_at - cursor)
+        baseline_consumed = _consume_amount(
+            state, cursor, baseline_requested, contributions
+        )
+        baseline_allocation += baseline_consumed
+
+        segment_bonus = 0.0
+        if next_at <= end + _EPSILON:
+            resetting_accounts = sorted(
+                {
+                    event.account_id
+                    for event in state.events
+                    if abs(event.at - next_at) <= _EPSILON
+                }
+            )
+            for account_id in resetting_accounts:
+                amount = max(0.0, state.balances.get(account_id, 0.0))
+                if amount <= _EPSILON:
+                    continue
+                state.balances[account_id] = 0.0
+                contributions[account_id] = (
+                    contributions.get(account_id, 0.0) + amount
+                )
+                segment_bonus += amount
+            expiry_bonus += segment_bonus
+
+        segments.append(
+            {
+                "start_at": cursor,
+                "end_at": next_at,
+                "baseline_allocation": baseline_consumed,
+                "expiry_bonus": segment_bonus,
+                "target": baseline_consumed + segment_bonus,
+            }
+        )
+        cursor = next_at
+        if cursor < end - _EPSILON:
+            reset_result.extend(_apply_events_at(state, cursor))
+
+    state.cursor = end
+    return {
+        "target": baseline_allocation + expiry_bonus,
+        "baseline_allocation": baseline_allocation,
+        "expiry_bonus": expiry_bonus,
+        "segments": segments,
+        "contributions": _contribution_list(contributions),
+        "reset_events": reset_result,
+    }
+
+
+def _expected_used_by(segments: Sequence[Mapping[str, Any]], at: float) -> float:
+    """Integrate a fixed piecewise allocation schedule through ``at``."""
+    expected = 0.0
+    for segment in segments:
+        start = float(segment["start_at"])
+        end = float(segment["end_at"])
+        target = float(segment["target"])
+        if at <= start + _EPSILON:
+            break
+        if at >= end - _EPSILON:
+            expected += target
+            continue
+        if end > start:
+            expected += target * (at - start) / (end - start)
+        break
+    return expected
+
+
 def _consume_interval(
     state: _State, start: float, end: float, requested: float
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float]:
@@ -680,38 +763,42 @@ def _consume_interval(
     return _contribution_list(contributions), reset_result, sum(contributions.values())
 
 
-def _consume_target(
+def _consume_fixed_allocation(
     state: _State, start: float, end: float, requested: float
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float]:
-    """Allocate a selected daily target before the earliest overwrite events.
+    """Allocate a frozen remainder earliest-deadline-first.
 
-    This is deliberately not the uniform-rate simulation used to solve the
-    sustainable candidate. The displayed target is a use-it-or-lose-it target:
-    it drains the account that will reset first, then carries any remaining
-    target through subsequent reset events.
+    The amount is fixed before this function runs. Spending currently banked
+    quota first keeps the reconstructed day plan coherent without inventing a
+    new drain rate or carrying one across a reset boundary.
     """
     contributions: dict[str, float] = {}
-    reset_result: list[dict[str, Any]] = []
-    remaining = requested
+    reset_result = _apply_events_at(state, start)
+    remaining = max(0.0, requested)
     cursor = start
-    while cursor < end - _EPSILON and remaining > _EPSILON:
+    while cursor < end - _EPSILON:
+        _consume_amount(state, cursor, remaining, contributions)
+        remaining = max(0.0, requested - sum(contributions.values()))
         next_at = min(
-            (event.at for event in state.events if event.at > cursor + _EPSILON),
+            (
+                event.at
+                for event in state.events
+                if cursor < event.at < end - _EPSILON
+            ),
             default=end,
         )
-        _consume_amount(state, cursor, remaining, contributions)
-        remaining = requested - sum(contributions.values())
-        cursor = min(end, next_at)
-        if abs(cursor - next_at) <= _EPSILON and cursor < end - _EPSILON:
+        cursor = next_at
+        if cursor < end - _EPSILON:
             reset_result.extend(_apply_events_at(state, cursor))
-    if cursor < end - _EPSILON:
-        _consume_amount(state, cursor, remaining, contributions)
-    # Preserve every overwrite later in this quota day even when the target
-    # was already satisfied. The half-open interval leaves an event exactly at
-    # `end` for the quota day beginning at that boundary.
+        if remaining <= _EPSILON:
+            break
     reset_result.extend(_apply_events_through(state, cursor, end))
     state.cursor = end
-    return _contribution_list(contributions), reset_result, sum(contributions.values())
+    return (
+        _contribution_list(contributions),
+        reset_result,
+        requested - max(0.0, remaining),
+    )
 
 
 def _consume_amount(

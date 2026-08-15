@@ -84,7 +84,9 @@ def test_local_six_am_boundary_starts_and_labels_quota_day() -> None:
         for day in at["planning_days"]
         if day["start_at"] == at["post_reset"]["day_start_at"]
     )
-    assert at["post_reset"]["daily_sustainable_pace"] == selected["sustainable_candidate"]
+    assert at["post_reset"]["daily_sustainable_pace"] == selected[
+        "sustainable_daily_rate"
+    ]
     assert [day["local_date"] for day in at["days"]] == [
         "2026-08-08",
         "2026-08-09",
@@ -103,7 +105,7 @@ def test_local_six_am_boundary_starts_and_labels_quota_day() -> None:
 def test_first_run_reports_missing_baseline_and_never_invents_actual_usage() -> None:
     result = forecast([account("a", 74.375, instant(9, 18))])
 
-    assert result["status"] == "ready"
+    assert result["status"] == "unavailable"
     assert result["actual"] == {
         "status": "baseline_unavailable",
         "used_since_day_start": None,
@@ -201,7 +203,7 @@ def test_actual_reconstructs_earlier_today_reset_from_next_week_timestamp() -> N
     assert result["actual"] == {"status": "observed", "used_since_day_start": 30.0}
 
 
-def test_reset_at_quota_day_start_owns_new_day_actual_and_candidates() -> None:
+def test_reset_at_quota_day_start_owns_new_day_actual_and_allocation() -> None:
     now = instant(8, 12)
     reset_at = instant(8, 6)
     pre_reset = {
@@ -224,11 +226,11 @@ def test_reset_at_quota_day_start_owns_new_day_actual_and_candidates() -> None:
 
     assert result["actual"] == {"status": "observed", "used_since_day_start": 10.0}
     assert result["today"]["target"] == pytest.approx(post_reset_baseline["today"]["target"])
-    assert result["today"]["drain_candidate"] == pytest.approx(
-        post_reset_baseline["today"]["drain_candidate"]
+    assert result["today"]["baseline_allocation"] == pytest.approx(
+        post_reset_baseline["today"]["baseline_allocation"]
     )
-    assert result["today"]["sustainable_candidate"] == pytest.approx(
-        post_reset_baseline["today"]["sustainable_candidate"]
+    assert result["today"]["expiry_bonus"] == pytest.approx(
+        post_reset_baseline["today"]["expiry_bonus"]
     )
 
 
@@ -265,11 +267,11 @@ def test_credit_at_quota_day_start_restores_pre_boundary_baseline_once() -> None
     assert pre_reset["actual"] == {"status": "observed", "used_since_day_start": 10.0}
     assert post_reset["actual"] == pre_reset["actual"]
     assert pre_reset["today"]["target"] == pytest.approx(post_reset["today"]["target"])
-    assert pre_reset["today"]["drain_candidate"] == pytest.approx(
-        post_reset["today"]["drain_candidate"]
+    assert pre_reset["today"]["baseline_allocation"] == pytest.approx(
+        post_reset["today"]["baseline_allocation"]
     )
-    assert pre_reset["today"]["sustainable_candidate"] == pytest.approx(
-        post_reset["today"]["sustainable_candidate"]
+    assert pre_reset["today"]["expiry_bonus"] == pytest.approx(
+        post_reset["today"]["expiry_bonus"]
     )
 
 
@@ -338,17 +340,47 @@ def test_unavailable_accounts_do_not_claim_aggregate_exhaustion() -> None:
     assert result["risk"]["aggregate_exhaustion"] is False
 
 
-def test_drain_candidate_wins_when_next_reset_requires_faster_use() -> None:
-    now = instant(8, 12)
-    result = forecast([account("a", 80.0, instant(8, 16))], now=now)
+def test_simultaneous_resets_aggregate_all_expiring_balances() -> None:
+    now = instant(8, 7)
+    result = forecast(
+        [
+            account("a", 80.0, instant(9, 5)),
+            account("b", 80.0, instant(9, 5)),
+        ],
+        now=now,
+        observations=[
+            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 80.0},
+            {"stable_id": "b", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 80.0},
+        ],
+    )
     today = result["today"]
 
-    assert today["drain_candidate"] > today["sustainable_candidate"]
-    assert today["selected_reason"] == "next_reset_drain"
-    assert today["target"] == pytest.approx(today["drain_candidate"])
+    assert today["expiry_bonus"] > 100.0
+    assert today["target"] == pytest.approx(
+        today["baseline_allocation"] + today["expiry_bonus"]
+    )
+    assert {item["account_id"] for item in today["contributions"]} == {"a", "b"}
 
 
-def test_slow_current_day_leaves_more_future_capacity_than_overuse() -> None:
+def test_early_reset_expiry_bonus_never_spends_fresh_post_reset_capacity() -> None:
+    now = instant(8, 12)
+    result = forecast(
+        [account("a", 80.0, instant(8, 13))],
+        now=now,
+        observations=[
+            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 80.0},
+        ],
+    )
+    today = result["today"]
+
+    assert 0.0 < today["expiry_bonus"] <= 80.0
+    assert today["target"] == pytest.approx(
+        today["baseline_allocation"] + today["expiry_bonus"]
+    )
+    assert today["target"] < 180.0
+
+
+def test_day_zero_target_is_fixed_as_actual_rises_from_same_baseline() -> None:
     now = instant(8, 18)
     accounts = [
         account("a", 50.0, instant(9, 6)),
@@ -371,29 +403,57 @@ def test_slow_current_day_leaves_more_future_capacity_than_overuse() -> None:
         ],
     )
 
-    assert slow["days"][1]["target"] > overused["days"][1]["target"]
+    assert slow["actual"]["used_since_day_start"] == pytest.approx(0.0)
     assert overused["actual"]["used_since_day_start"] == pytest.approx(45.0)
+    assert slow["today"]["target"] == pytest.approx(overused["today"]["target"])
+    assert slow["today"]["expected_used_by_now"] == pytest.approx(
+        overused["today"]["expected_used_by_now"]
+    )
 
 
-def test_day_zero_target_reconciles_actual_with_live_remaining_capacity() -> None:
+def test_actual_can_exceed_fixed_target_without_moving_the_allocation() -> None:
     now = instant(8, 18)
     result = forecast(
-        [account("a", 5.0, instant(13, 6))],
+        [account("a", 0.0, instant(15, 6))],
         now=now,
         observations=[
-            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 50.0},
+            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 100.0},
         ],
     )
 
-    assert result["actual"]["used_since_day_start"] == pytest.approx(45.0)
-    assert result["today"]["remaining_target"] >= 0.0
-    assert result["today"]["target"] == pytest.approx(
-        result["actual"]["used_since_day_start"]
-        + result["today"]["remaining_target"]
+    assert result["actual"]["used_since_day_start"] == pytest.approx(100.0)
+    assert result["actual"]["used_since_day_start"] > result["today"]["target"]
+    assert result["today"]["remaining_target"] == 0.0
+
+
+def test_day_zero_borrowing_reduces_tomorrows_allocation() -> None:
+    now = instant(8, 18)
+    reset_at = instant(13, 6)
+    observations = [
+        {
+            "stable_id": account_id,
+            "observed_at": instant(8, 6).timestamp(),
+            "remaining_percent": 50.0,
+        }
+        for account_id in ("a", "b")
+    ]
+    on_plan = forecast(
+        [account("a", 40.0, reset_at), account("b", 40.0, reset_at)],
+        now=now,
+        observations=observations,
+    )
+    overused = forecast(
+        [account("a", 10.0, reset_at), account("b", 10.0, reset_at)],
+        now=now,
+        observations=observations,
     )
 
+    assert overused["today"]["target"] == pytest.approx(on_plan["today"]["target"])
+    assert overused["actual"]["used_since_day_start"] > overused["today"]["target"]
+    assert overused["days"][1]["target"] < on_plan["days"][1]["target"]
 
-def test_same_day_reset_does_not_publish_unreachable_morning_target() -> None:
+
+def test_same_day_reset_keeps_day_start_allocation_after_actual_is_observed() -> None:
     now = instant(8, 18)
     result = forecast(
         [account("a", 55.0, instant(8, 10) + timedelta(days=7))],
@@ -405,11 +465,13 @@ def test_same_day_reset_does_not_publish_unreachable_morning_target() -> None:
 
     today = result["today"]
     assert result["actual"]["used_since_day_start"] == pytest.approx(45.0)
+    assert today["expiry_bonus"] > 0.0
     assert today["target"] == pytest.approx(
-        result["actual"]["used_since_day_start"] + today["remaining_target"]
+        today["baseline_allocation"] + today["expiry_bonus"]
     )
-    assert today["planned_at_day_start"] == pytest.approx(130.0)
-    assert today["target"] < today["planned_at_day_start"]
+    assert today["remaining_target"] == pytest.approx(
+        max(0.0, today["target"] - result["actual"]["used_since_day_start"])
+    )
 
 
 def test_staggered_same_day_resets_keep_today_target_live_reachable() -> None:
@@ -435,15 +497,78 @@ def test_staggered_same_day_resets_keep_today_target_live_reachable() -> None:
     assert today["target"] <= result["actual"]["used_since_day_start"] + 165.0
 
 
+def test_live_sustainable_rate_responds_to_current_balances() -> None:
+    now = instant(8, 12)
+    low = forecast(
+        [account("a", 20.0, instant(12, 6))],
+        now=now,
+        observations=[
+            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 20.0},
+        ],
+    )
+    high = forecast(
+        [account("a", 80.0, instant(12, 6))],
+        now=now,
+        observations=[
+            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 80.0},
+        ],
+    )
+
+    assert low["status"] == high["status"] == "ready"
+    assert high["today"]["sustainable_daily_rate"] > low["today"][
+        "sustainable_daily_rate"
+    ]
+    assert high["today"]["live_sustainable_remaining"] > low["today"][
+        "live_sustainable_remaining"
+    ]
+
+
+def test_expected_used_by_now_tracks_fixed_day_plan() -> None:
+    now = instant(8, 12)
+    next_reset = instant(15, 6)
+    result = forecast(
+        [account("a", 100.0, next_reset)],
+        now=now,
+        observations=[
+            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 100.0},
+        ],
+    )
+    today = result["today"]
+
+    assert next_reset.timestamp() > today["end_at"]
+    assert today["reset_events"] == []
+    assert today["expiry_bonus"] == 0.0
+    assert today["expected_used_by_now"] == pytest.approx(today["target"] / 4.0)
+
+
 def test_fully_dead_known_pool_reports_aggregate_exhaustion() -> None:
-    result = forecast([account("a", 0.0, instant(9, 18))])
+    result = forecast(
+        [account("a", 0.0, instant(9, 18))],
+        observations=[
+            {
+                "stable_id": "a",
+                "observed_at": instant(8, 6).timestamp(),
+                "remaining_percent": 0.0,
+            }
+        ],
+    )
 
     assert result["risk"]["aggregate_exhaustion"] is True
 
 
 def test_materially_dry_pool_before_replenishment_reports_exhaustion() -> None:
     now = instant(8, 12)
-    result = forecast([account("a", 0.0, instant(8, 18))], now=now)
+    result = forecast(
+        [account("a", 0.0, instant(8, 18))],
+        now=now,
+        observations=[
+            {
+                "stable_id": "a",
+                "observed_at": instant(8, 6).timestamp(),
+                "remaining_percent": 0.0,
+            }
+        ],
+    )
 
     assert result["risk"]["aggregate_exhaustion"] is True
 
@@ -483,9 +608,21 @@ def test_continuous_weekly_capacity_is_not_aggregate_exhaustion() -> None:
 
 def test_depletion_exactly_at_replenishment_has_no_dry_interval() -> None:
     now = instant(8, 12)
-    result = forecast([account("a", 10.0, instant(8, 18))], now=now)
+    result = forecast(
+        [account("a", 10.0, instant(8, 18))],
+        now=now,
+        observations=[
+            {
+                "stable_id": "a",
+                "observed_at": instant(8, 6).timestamp(),
+                "remaining_percent": 10.0,
+            }
+        ],
+    )
 
-    assert result["today"]["target"] == pytest.approx(30.0)
+    assert result["today"]["target"] == pytest.approx(
+        result["today"]["baseline_allocation"] + result["today"]["expiry_bonus"]
+    )
     assert result["risk"]["aggregate_exhaustion"] is False
 
 
@@ -521,7 +658,8 @@ def test_result_is_json_safe_and_deterministic() -> None:
     second = forecast(accounts, now=now)
 
     assert first == second
-    assert json.loads(json.dumps(first)) == first
+    encoded = json.dumps(first, allow_nan=False)
+    assert json.loads(encoded) == first
 
 
 def test_naive_now_is_rejected() -> None:
@@ -530,9 +668,6 @@ def test_naive_now_is_rejected() -> None:
             accounts=[],
             now=datetime(2026, 8, 8, 12),
         )
-
-
-SELECTION_REASONS = {"next_reset_drain", "rolling_168h_sustainable"}
 
 
 def horizon_events(result: dict[str, object]) -> list[dict[str, object]]:
@@ -637,7 +772,7 @@ def test_stale_flag_follows_source_age_against_the_threshold() -> None:
     assert at_age(900.0)["stale"] is False
 
 
-def test_selected_reason_is_always_a_published_candidate() -> None:
+def test_ready_days_publish_only_schema_v2_allocation_fields() -> None:
     result = forecast(
         [
             account("a", 5.0, instant(8, 14)),
@@ -647,5 +782,20 @@ def test_selected_reason_is_always_a_published_candidate() -> None:
         now=instant(8, 12),
     )
 
-    assert {day["selected_reason"] for day in result["days"]} <= SELECTION_REASONS
-    assert result["today"]["selected_reason"] in SELECTION_REASONS
+    expected_keys = {
+        "index",
+        "start_at",
+        "end_at",
+        "local_date",
+        "target",
+        "remaining_target",
+        "baseline_allocation",
+        "expiry_bonus",
+        "sustainable_daily_rate",
+        "live_sustainable_remaining",
+        "expected_used_by_now",
+        "contributions",
+        "reset_events",
+    }
+    assert result["schema_version"] == 2
+    assert all(set(day) == expected_keys for day in result["days"])

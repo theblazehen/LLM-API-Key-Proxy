@@ -1334,7 +1334,7 @@ class RotatingClient:
                 (boundary + timedelta(days=offset)).replace(
                     hour=QUOTA_DAY_START_HOUR, minute=0, second=0, microsecond=0
                 )
-                for offset in range(8)
+                for offset in range(15)
             ]
             days = [
                 {
@@ -1344,16 +1344,18 @@ class RotatingClient:
                     "local_date": boundaries[index].date().isoformat(),
                     "target": 0.0,
                     "remaining_target": 0.0,
-                    "drain_candidate": 0.0,
-                    "sustainable_candidate": 0.0,
-                    "selected_reason": "rolling_168h_sustainable",
+                    "baseline_allocation": 0.0,
+                    "expiry_bonus": 0.0,
+                    "sustainable_daily_rate": 0.0,
+                    "live_sustainable_remaining": 0.0,
+                    "expected_used_by_now": 0.0,
                     "contributions": [],
                     "reset_events": [],
                 }
-                for index in range(7)
+                for index in range(14)
             ]
             stats["forecast"] = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "status": "unavailable",
                 "unit": "weekly_quota_percentage_points",
                 "generated_at": now_timestamp,
@@ -1368,6 +1370,12 @@ class RotatingClient:
                     "end_at": boundaries[7].timestamp(),
                     "day_count": 7,
                 },
+                "planning_horizon": {
+                    "start_at": boundaries[0].timestamp(),
+                    "end_at": boundaries[14].timestamp(),
+                    "day_count": 14,
+                    "rolling_window_seconds": 7 * 24 * 60 * 60,
+                },
                 "reason": "forecast_composition_failed",
                 "actual": {"status": "unavailable", "used_since_day_start": None},
                 "risk": {
@@ -1375,7 +1383,13 @@ class RotatingClient:
                     "basis": "forecast_targets",
                 },
                 "today": days[0],
-                "days": days,
+                "days": days[:7],
+                "planning_days": days,
+                "post_reset": {
+                    "after_at": None,
+                    "day_start_at": None,
+                    "daily_sustainable_pace": None,
+                },
                 "accounts": [],
                 "unknown_accounts": [],
             }
