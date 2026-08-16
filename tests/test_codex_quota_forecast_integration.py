@@ -174,6 +174,26 @@ def test_forecast_is_additive_and_identical_composition_dedupes_observation(
     assert len(observation_rows(client)) == 1
 
 
+def test_persisted_forecast_observation_includes_its_reset_anchor(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:  # type: ignore[no-untyped-def]
+    client = make_client(tmp_path)
+    captured: dict[str, object] = {}
+
+    def capture_forecast(**kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return {"schema_version": 2}
+
+    monkeypatch.setattr(
+        rotating_client_module, "build_codex_quota_forecast", capture_forecast
+    )
+    client._attach_codex_quota_forecast(make_stats(), FakeCodexPlugin())
+
+    observations = captured["observations"]
+    assert isinstance(observations, list)
+    assert observations[0]["reset_at"] == RESET_AT
+
+
 def test_changed_weekly_balance_inserts_observation_and_updates_forecast(
     tmp_path,
 ) -> None:  # type: ignore[no-untyped-def]

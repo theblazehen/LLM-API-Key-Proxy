@@ -23,6 +23,10 @@ _FEASIBILITY_TOLERANCE = 1e-7
 # points, while a dry interval is measured in seconds.
 _MATERIAL_DRY_QUOTA_PP = 1e-6
 _MATERIAL_DRY_SECONDS = 1.0
+# Sliding upstream reset estimates commonly advance with observation time.  A
+# generation change must move materially farther than that ordinary drift
+# before it can establish a reset without a visible balance restoration.
+_OBSERVED_RESET_ANCHOR_JUMP_SECONDS = WEEK_SECONDS / 2.0
 
 
 @dataclass(frozen=True)
@@ -75,9 +79,9 @@ def build_codex_quota_forecast(
     ``expires_at``; a timed credit is modeled as an overwrite-to-100 event.
 
     Observation fields are ``stable_id`` (or ``account_id``), ``observed_at``,
-    and ``remaining_percent``.  A baseline at or before the current 06:00 local
-    boundary is required for every included account before current-day actual
-    usage is reported.
+    ``remaining_percent``, and optional ``reset_at``.  A baseline at or before
+    the current 06:00 local boundary is required for every included account
+    before current-day actual usage is reported.
     """
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
@@ -419,11 +423,9 @@ def _forecast_events(accounts: Sequence[_Account], start: float, end: float) -> 
     for account in accounts:
         timed = sorted(account.credit_events, key=lambda event: (event.at, event.kind, event.credit_id or ""))
         natural = account.natural_reset_at
-        # ``reset_at`` normally names the next reset. For a reconstructed
-        # start state it can be one week ahead of an overwrite later that same
-        # quota day, so locate the first cadence event strictly after start.
-        while natural - WEEK_SECONDS > start + _EPSILON:
-            natural -= WEEK_SECONDS
+        # ``reset_at`` is a forward anchor for the state supplied at ``start``.
+        # Never backtrack it to invent historical resets: upstream may slide
+        # this estimate forward with every observation.
         while natural <= start + _EPSILON:
             natural += WEEK_SECONDS
         for credit in timed:
@@ -454,13 +456,16 @@ def _derive_actual(
 ) -> tuple[float | None, str]:
     if not accounts:
         return None, "baseline_unavailable"
-    by_account: dict[str, list[tuple[float, float]]] = {account.account_id: [] for account in accounts}
+    by_account: dict[str, list[tuple[float, float, float | None]]] = {
+        account.account_id: [] for account in accounts
+    }
     for raw in observations:
         account_id_value = raw.get("stable_id", raw.get("account_id"))
         account_id = str(account_id_value) if account_id_value is not None else ""
         if account_id not in by_account:
             continue
         observed_at = _timestamp(raw.get("observed_at"))
+        reset_at = _timestamp(raw.get("reset_at"))
         remaining = raw.get("remaining_percent")
         if (
             observed_at is None
@@ -469,55 +474,56 @@ def _derive_actual(
             or not 0.0 <= float(remaining) <= 100.0
         ):
             continue
-        by_account[account_id].append((observed_at, float(remaining)))
+        by_account[account_id].append((observed_at, float(remaining), reset_at))
 
     total = 0.0
     for account in accounts:
-        points = sorted(by_account[account.account_id], key=lambda item: (item[0], item[1]))
+        points = sorted(
+            by_account[account.account_id],
+            key=lambda item: (item[0], item[1], item[2] or math.inf),
+        )
         baselines = [point for point in points if point[0] <= day_start + _EPSILON]
         if not baselines:
             return None, "baseline_unavailable"
         baseline = baselines[-1]
-        # A reset restores the window to 100 and overwrites the preceding
-        # remainder.  Insert it even when the proxy did not sample exactly at
-        # that moment, otherwise a pre-reset baseline and post-reset balance
-        # loses all post-reset consumption.
-        transitions: list[tuple[float, int, float]] = []
-        for reset_at in _actual_reset_times(account, day_start, now_ts):
-            transitions.append((reset_at, 0, 100.0))
-        transitions.extend(
-            (observed_at, 1, remaining)
-            for observed_at, remaining in points
-            if day_start < observed_at <= now_ts + _EPSILON
-        )
-        if not transitions or transitions[-1][0] < now_ts - _EPSILON:
-            transitions.append((now_ts, 1, account.remaining))
+        transitions = [
+            point
+            for point in points
+            if day_start < point[0] <= now_ts + _EPSILON
+        ]
+        current_point = (now_ts, account.remaining, account.natural_reset_at)
+        if not transitions or (
+            transitions[-1][0] < now_ts - _EPSILON
+            or transitions[-1][1:] != current_point[1:]
+        ):
+            transitions.append(current_point)
+        previous_point = baseline
         previous = baseline[1]
-        for _, _, current in sorted(transitions):
+        for current_point in transitions:
+            if _is_observed_reset(previous_point, current_point):
+                previous = 100.0
+            current = current_point[1]
             if current < previous:
                 total += previous - current
             previous = current
+            previous_point = current_point
     return total, "observed"
 
 
-def _actual_reset_times(account: _Account, start: float, end: float) -> list[float]:
-    """Return overwrites in the half-open observation span ``[start, end)``."""
-    natural = account.natural_reset_at
-    while natural - WEEK_SECONDS >= start - _EPSILON:
-        natural -= WEEK_SECONDS
-    while natural < start - _EPSILON:
-        natural += WEEK_SECONDS
-    result: list[float] = []
-    while natural < end - _EPSILON:
-        if natural >= start - _EPSILON:
-            result.append(natural)
-        natural += WEEK_SECONDS
-    result.extend(
-        event.at
-        for event in account.known_credit_events
-        if start - _EPSILON <= event.at < end - _EPSILON
-    )
-    return sorted(set(result))
+def _is_observed_reset(
+    previous: tuple[float, float, float | None],
+    current: tuple[float, float, float | None],
+) -> bool:
+    """Return whether two persisted states establish a reset between them."""
+    if current[1] > previous[1] + _EPSILON:
+        return True
+    previous_anchor = previous[2]
+    current_anchor = current[2]
+    if previous_anchor is None or current_anchor is None:
+        return False
+    elapsed = max(0.0, current[0] - previous[0])
+    anchor_advance_beyond_drift = current_anchor - previous_anchor - elapsed
+    return anchor_advance_beyond_drift > _OBSERVED_RESET_ANCHOR_JUMP_SECONDS
 
 
 def _accounts_at_day_start(
@@ -526,11 +532,12 @@ def _accounts_at_day_start(
     day_start: float,
 ) -> list[_Account] | None:
     """Reconstruct account balances at the current quota-day boundary."""
-    baselines: dict[str, tuple[float, float]] = {}
+    baselines: dict[str, tuple[float, float, float | None]] = {}
     for raw in observations:
         account_id_value = raw.get("stable_id", raw.get("account_id"))
         account_id = str(account_id_value) if account_id_value is not None else ""
         observed_at = _timestamp(raw.get("observed_at"))
+        reset_at = _timestamp(raw.get("reset_at"))
         remaining = raw.get("remaining_percent")
         if (
             observed_at is None
@@ -539,21 +546,29 @@ def _accounts_at_day_start(
             or not 0.0 <= float(remaining) <= 100.0
         ):
             continue
-        candidate = (observed_at, float(remaining))
+        candidate = (observed_at, float(remaining), reset_at)
         if account_id not in baselines or candidate[0] > baselines[account_id][0]:
             baselines[account_id] = candidate
     if any(account.account_id not in baselines for account in accounts):
         return None
     reconstructed: list[_Account] = []
     for account in accounts:
-        observed_at, remaining = baselines[account.account_id]
-        if observed_at < day_start - _EPSILON and _actual_reset_times(
-            account, day_start, day_start + 1.0
-        ):
-            remaining = 100.0
-        natural_reset_at = account.natural_reset_at
-        while natural_reset_at - WEEK_SECONDS >= day_start - _EPSILON:
-            natural_reset_at -= WEEK_SECONDS
+        observed_at, remaining, observed_reset_at = baselines[account.account_id]
+        natural_reset_at = (
+            observed_reset_at
+            if observed_reset_at is not None
+            else account.natural_reset_at
+        )
+        if observed_reset_at is not None:
+            # Move only forward from the persisted state to the boundary.  A
+            # reset due in that short interval is real future information in
+            # the observation; an anchor already reflected by the observation
+            # is merely advanced to its next generation.
+            while natural_reset_at <= observed_at + _EPSILON:
+                natural_reset_at += WEEK_SECONDS
+            while natural_reset_at <= day_start + _EPSILON:
+                remaining = 100.0
+                natural_reset_at += WEEK_SECONDS
         reconstructed.append(
             _Account(
                 account_id=account.account_id,

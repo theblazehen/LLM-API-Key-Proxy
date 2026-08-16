@@ -174,33 +174,110 @@ def test_actual_since_day_start_ignores_reset_balance_restoration() -> None:
     assert result["actual"] == {"status": "observed", "used_since_day_start": 59.0}
 
 
-def test_observed_actual_reconciles_unobserved_reset_overwrite() -> None:
+def test_current_future_anchor_never_invents_an_unobserved_reset() -> None:
     now = instant(8, 20)
     result = forecast(
-        [account("a", 70.0, instant(8, 18))],
+        [account("a", 70.0, instant(15, 18))],
         now=now,
         observations=[
-            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 80.0},
+            {
+                "stable_id": "a",
+                "observed_at": instant(8, 6).timestamp(),
+                "remaining_percent": 80.0,
+                "reset_at": instant(15, 6).timestamp(),
+            },
         ],
     )
 
-    # 80 remains at 06:00. The 18:00 reset overwrites the unknown pre-reset
-    # remainder with 100, and the live 70 proves 30 pp of post-reset usage.
-    assert result["actual"] == {"status": "observed", "used_since_day_start": 30.0}
+    assert result["actual"] == {"status": "observed", "used_since_day_start": 10.0}
 
 
-def test_actual_reconstructs_earlier_today_reset_from_next_week_timestamp() -> None:
-    now = instant(8, 20)
-    earlier_today = instant(8, 18)
+def test_aug15_future_anchor_does_not_create_expiry_bonus_or_move_fixed_target() -> None:
+    now = instant(15, 18)
     result = forecast(
-        [account("a", 70.0, earlier_today + timedelta(days=7))],
+        [account("a", 0.0, instant(22, 18))],
         now=now,
         observations=[
-            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 80.0},
+            {
+                "stable_id": "a",
+                "observed_at": instant(15, 6).timestamp(),
+                "remaining_percent": 80.0,
+                "reset_at": instant(20, 18).timestamp(),
+            },
+        ],
+    )
+
+    assert result["actual"] == {"status": "observed", "used_since_day_start": 80.0}
+    assert result["today"]["expiry_bonus"] == 0.0
+    assert result["today"]["target"] < result["actual"]["used_since_day_start"]
+
+
+def test_aug13_balance_restoration_establishes_observed_reset() -> None:
+    now = instant(13, 18)
+    result = forecast(
+        [account("a", 70.0, instant(20, 12))],
+        now=now,
+        observations=[
+            {
+                "stable_id": "a",
+                "observed_at": instant(13, 6).timestamp(),
+                "remaining_percent": 80.0,
+                "reset_at": instant(16, 12).timestamp(),
+            },
+            {
+                "stable_id": "a",
+                "observed_at": instant(13, 12).timestamp(),
+                "remaining_percent": 100.0,
+                "reset_at": instant(20, 12).timestamp(),
+            },
         ],
     )
 
     assert result["actual"] == {"status": "observed", "used_since_day_start": 30.0}
+
+
+def test_large_observed_anchor_generation_jump_establishes_reset() -> None:
+    now = instant(13, 18)
+    result = forecast(
+        [account("a", 70.0, instant(20, 12))],
+        now=now,
+        observations=[
+            {
+                "stable_id": "a",
+                "observed_at": instant(13, 6).timestamp(),
+                "remaining_percent": 80.0,
+                "reset_at": instant(16, 12).timestamp(),
+            },
+            {
+                "stable_id": "a",
+                "observed_at": instant(13, 12).timestamp(),
+                "remaining_percent": 75.0,
+                "reset_at": instant(20, 12).timestamp(),
+            },
+        ],
+    )
+
+    assert result["actual"] == {"status": "observed", "used_since_day_start": 30.0}
+
+
+def test_observed_at_plus_week_drift_does_not_create_repeated_resets() -> None:
+    now = instant(15, 12)
+    observations = [
+        {
+            "stable_id": "a",
+            "observed_at": instant(15, hour).timestamp(),
+            "remaining_percent": remaining,
+            "reset_at": instant(22, hour).timestamp(),
+        }
+        for hour, remaining in ((6, 80.0), (7, 78.0), (8, 76.0), (9, 74.0))
+    ]
+    result = forecast(
+        [account("a", 70.0, instant(22, 12))],
+        now=now,
+        observations=observations,
+    )
+
+    assert result["actual"] == {"status": "observed", "used_since_day_start": 10.0}
 
 
 def test_reset_at_quota_day_start_owns_new_day_actual_and_allocation() -> None:
@@ -210,6 +287,7 @@ def test_reset_at_quota_day_start_owns_new_day_actual_and_allocation() -> None:
         "stable_id": "a",
         "observed_at": instant(8, 5, 59).timestamp(),
         "remaining_percent": 80.0,
+        "reset_at": reset_at.timestamp(),
     }
     result = forecast(
         [account("a", 90.0, reset_at + timedelta(days=7))],
@@ -220,7 +298,12 @@ def test_reset_at_quota_day_start_owns_new_day_actual_and_allocation() -> None:
         [account("a", 90.0, reset_at + timedelta(days=7))],
         now=now,
         observations=[
-            {"stable_id": "a", "observed_at": reset_at.timestamp(), "remaining_percent": 100.0},
+            {
+                "stable_id": "a",
+                "observed_at": reset_at.timestamp(),
+                "remaining_percent": 100.0,
+                "reset_at": (reset_at + timedelta(days=7)).timestamp(),
+            },
         ],
     )
 
@@ -253,6 +336,7 @@ def test_credit_at_quota_day_start_restores_pre_boundary_baseline_once() -> None
                 "stable_id": "a",
                 "observed_at": instant(8, 5, 59).timestamp(),
                 "remaining_percent": 80.0,
+                "reset_at": instant(12, 6).timestamp(),
             },
         ],
     )
@@ -260,7 +344,12 @@ def test_credit_at_quota_day_start_restores_pre_boundary_baseline_once() -> None
         accounts,
         now=now,
         observations=[
-            {"stable_id": "a", "observed_at": reset_at.timestamp(), "remaining_percent": 100.0},
+            {
+                "stable_id": "a",
+                "observed_at": reset_at.timestamp(),
+                "remaining_percent": 100.0,
+                "reset_at": instant(12, 6).timestamp(),
+            },
         ],
     )
 
@@ -368,7 +457,12 @@ def test_early_reset_expiry_bonus_never_spends_fresh_post_reset_capacity() -> No
         [account("a", 80.0, instant(8, 13))],
         now=now,
         observations=[
-            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 80.0},
+            {
+                "stable_id": "a",
+                "observed_at": instant(8, 6).timestamp(),
+                "remaining_percent": 80.0,
+                "reset_at": instant(8, 13).timestamp(),
+            },
         ],
     )
     today = result["today"]
@@ -459,7 +553,12 @@ def test_same_day_reset_keeps_day_start_allocation_after_actual_is_observed() ->
         [account("a", 55.0, instant(8, 10) + timedelta(days=7))],
         now=now,
         observations=[
-            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 30.0},
+            {
+                "stable_id": "a",
+                "observed_at": instant(8, 6).timestamp(),
+                "remaining_percent": 30.0,
+                "reset_at": instant(8, 10).timestamp(),
+            },
         ],
     )
 
@@ -484,9 +583,24 @@ def test_staggered_same_day_resets_keep_today_target_live_reachable() -> None:
         ],
         now=now,
         observations=[
-            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 30.0},
-            {"stable_id": "b", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 25.0},
-            {"stable_id": "c", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 50.0},
+            {
+                "stable_id": "a",
+                "observed_at": instant(8, 6).timestamp(),
+                "remaining_percent": 30.0,
+                "reset_at": instant(8, 10).timestamp(),
+            },
+            {
+                "stable_id": "b",
+                "observed_at": instant(8, 6).timestamp(),
+                "remaining_percent": 25.0,
+                "reset_at": instant(8, 14).timestamp(),
+            },
+            {
+                "stable_id": "c",
+                "observed_at": instant(8, 6).timestamp(),
+                "remaining_percent": 50.0,
+                "reset_at": instant(12, 6).timestamp(),
+            },
         ],
     )
 

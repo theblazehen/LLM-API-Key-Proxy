@@ -1413,6 +1413,7 @@ class RotatingClient:
             "stable_id": stable_id,
             "observed_at": observation.source_timestamp,
             "remaining_percent": observation.remaining_percent,
+            "reset_at": observation.reset_at,
         }
 
     async def redeem_codex_reset_credit(
