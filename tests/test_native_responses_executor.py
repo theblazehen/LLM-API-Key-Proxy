@@ -725,6 +725,88 @@ def test_native_provider_filters_chat_only_stream_options(monkeypatch):
     ]
 
 
+def test_codex_native_responses_lite_preserves_header_and_body_shape(monkeypatch):
+    provider = CodexProvider()
+    lite_header = "x-openai-internal-codex-responses-lite"
+    lite_input = [
+        {
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "lite instructions"}],
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "compact this"}],
+        },
+    ]
+
+    async def auth_header(_credential):
+        return {"Authorization": "Bearer test-token"}
+
+    async def no_account_id(_credential):
+        return None
+
+    monkeypatch.setattr(provider, "get_auth_header", auth_header)
+    monkeypatch.setattr(provider, "get_account_id", no_account_id)
+
+    clients = []
+    for compact in (False, True):
+        client = _CapturingJSONClient({"id": "resp_success", "output": []})
+        clients.append(client)
+        result = asyncio.run(
+            provider.aresponses(
+                client,
+                credential_identifier="credential.json",
+                model="codex/gpt-5.6-sol",
+                input=lite_input,
+                stream=False,
+                _compact=compact,
+                _codex_responses_lite=True,
+            )
+        )
+
+        assert result == {"id": "resp_success", "output": []}
+        assert client.headers[lite_header] == "true"
+        assert client.payload["input"] == lite_input
+        assert "instructions" not in client.payload
+        assert "_codex_responses_lite" not in client.payload
+        assert lite_header not in client.payload
+
+    assert clients[0].url == codex_provider.CODEX_RESPONSES_ENDPOINT
+    assert clients[1].url == codex_provider.CODEX_RESPONSES_COMPACT_ENDPOINT
+
+
+def test_codex_native_responses_non_lite_keeps_instruction_injection(monkeypatch):
+    provider = CodexProvider()
+    client = _CapturingJSONClient({"id": "resp_success", "output": []})
+
+    async def auth_header(_credential):
+        return {"Authorization": "Bearer test-token"}
+
+    async def no_account_id(_credential):
+        return None
+
+    monkeypatch.setattr(provider, "get_auth_header", auth_header)
+    monkeypatch.setattr(provider, "get_account_id", no_account_id)
+
+    result = asyncio.run(
+        provider.aresponses(
+            client,
+            credential_identifier="credential.json",
+            model="codex/gpt-5.6-sol",
+            input="ordinary input",
+            stream=False,
+        )
+    )
+
+    assert result == {"id": "resp_success", "output": []}
+    assert "x-openai-internal-codex-responses-lite" not in client.headers
+    assert client.payload["instructions"] == codex_provider._get_model_instruction(
+        "gpt-5.6-sol"
+    )
+
+
 def test_compact_posts_unary_json_and_passes_response_through(monkeypatch):
     provider = CodexProvider()
     upstream_payload = {

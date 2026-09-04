@@ -76,6 +76,18 @@ if TYPE_CHECKING:
 
 lib_logger = logging.getLogger("rotator_library")
 
+_CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
+_CODEX_RESPONSES_LITE_KWARG = "_codex_responses_lite"
+
+
+def _codex_responses_lite_enabled(request: Optional[Any]) -> bool:
+    """Return the normalized, allowlisted Responses Lite request marker."""
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return False
+    value = headers.get(_CODEX_RESPONSES_LITE_HEADER)
+    return isinstance(value, str) and value.casefold() == "true"
+
 
 def _system_local_timezone():
     """Return the system IANA timezone when discoverable, else its UTC offset."""
@@ -564,6 +576,15 @@ class RotatingClient:
         """Build a RequestContext for a single provider attempt."""
         resolved_model = self._model_resolver.resolve_model_id(model, provider)
         attempt_kwargs = {**kwargs, "model": resolved_model}
+        # Never trust an identically named JSON field. The internal marker is
+        # derived exclusively from the allowlisted inbound header below.
+        attempt_kwargs.pop(_CODEX_RESPONSES_LITE_KWARG, None)
+        attempt_kwargs.pop(_CODEX_RESPONSES_LITE_HEADER, None)
+        responses_lite = (
+            provider == "codex"
+            and bool(attempt_kwargs.get("_use_responses"))
+            and _codex_responses_lite_enabled(request)
+        )
         if provider == "codex":
             prompt_cache_key = _derive_codex_prompt_cache_key(attempt_kwargs, request)
             if prompt_cache_key is not None:
@@ -582,6 +603,12 @@ class RotatingClient:
                 parent_dir=parent_log_dir,
             )
             transaction_logger.log_request(attempt_kwargs)
+
+        # Add transport metadata only after request logging and only to the
+        # Codex native-Responses attempt. CodexProvider consumes it before
+        # constructing the upstream JSON body.
+        if responses_lite:
+            attempt_kwargs[_CODEX_RESPONSES_LITE_KWARG] = True
 
         return RequestContext(
             model=resolved_model,

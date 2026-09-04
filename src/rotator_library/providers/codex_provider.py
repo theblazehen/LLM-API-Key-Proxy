@@ -58,6 +58,9 @@ if TYPE_CHECKING:
 
 lib_logger = logging.getLogger("rotator_library")
 
+_CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
+_CODEX_RESPONSES_LITE_KWARG = "_codex_responses_lite"
+
 
 # =============================================================================
 # CONFIGURATION
@@ -1181,6 +1184,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
     ) -> Union[Dict[str, Any], AsyncGenerator[bytes, None]]:
         trace = kwargs.pop("_llm_trace", None)
         compact = bool(kwargs.pop("_compact", False))
+        responses_lite = kwargs.pop(_CODEX_RESPONSES_LITE_KWARG, False) is True
         credential_path = kwargs.pop(
             "credential_identifier", kwargs.get("credential_path", "")
         )
@@ -1197,7 +1201,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         else:
             payload.setdefault("store", False)
             payload.setdefault("stream", bool(kwargs.get("stream", False)))
-            if not payload.get("instructions"):
+            if not responses_lite and not payload.get("instructions"):
                 payload["instructions"] = _get_model_instruction(normalized_model)
 
         auth_headers = await self.get_auth_header(credential_path)
@@ -1213,6 +1217,8 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         }
         if account_id:
             headers["ChatGPT-Account-Id"] = account_id
+        if responses_lite:
+            headers[_CODEX_RESPONSES_LITE_HEADER] = "true"
 
         if not compact and payload.get("stream"):
             return self._stream_native_responses(

@@ -219,6 +219,103 @@ def test_rotating_client_acompact_uses_only_capable_native_executor_candidates()
     }
 
 
+def test_rotating_client_normalizes_lite_transport_for_responses_and_compact():
+    from rotator_library.client.rotating_client import RotatingClient
+
+    lite_header = "x-openai-internal-codex-responses-lite"
+    contexts = []
+
+    class Executor:
+        async def execute(self, context):
+            contexts.append(context)
+            return {"id": "native-result", "output": []}
+
+    client = object.__new__(RotatingClient)
+    client._model_resolver = SimpleNamespace(
+        resolve_model_chain=lambda _: ["codex/gpt-5.6-sol"],
+        resolve_model_id=lambda model, _provider: model,
+    )
+    client.all_credentials = {"codex": ["codex.json"]}
+    client._get_provider_instance = lambda _provider: SimpleNamespace(
+        supports_responses_api=lambda: True,
+        supports_compact_api=lambda: True,
+    )
+    client._executor = Executor()
+    client._is_error_response = lambda _: False
+    client.enable_request_logging = False
+    client.global_timeout = 30
+    request = SimpleNamespace(
+        headers={lite_header: "TrUe"},
+        state=SimpleNamespace(),
+    )
+
+    async def dispatch_lite_requests():
+        await client.aresponses(
+            request=request,
+            model="codex/gpt-5.6-sol",
+            input=[{"type": "message", "role": "user", "content": []}],
+            stream=False,
+        )
+        await client.acompact(
+            request=request,
+            model="codex/gpt-5.6-sol",
+            input=[{"type": "message", "role": "user", "content": []}],
+        )
+
+    asyncio.run(dispatch_lite_requests())
+
+    assert [context.provider for context in contexts] == ["codex", "codex"]
+    assert all(context.kwargs["_codex_responses_lite"] is True for context in contexts)
+    assert all(lite_header not in context.kwargs for context in contexts)
+    assert "_compact" not in contexts[0].kwargs
+    assert contexts[1].kwargs["_compact"] is True
+
+
+def test_rotating_client_rejects_spoofed_lite_json_without_header():
+    from rotator_library.client.rotating_client import RotatingClient
+
+    lite_header = "x-openai-internal-codex-responses-lite"
+    contexts = []
+
+    class Executor:
+        async def execute(self, context):
+            contexts.append(context)
+            return {"id": "native-result", "output": []}
+
+    client = object.__new__(RotatingClient)
+    client._model_resolver = SimpleNamespace(
+        resolve_model_chain=lambda _: ["codex/gpt-5.6-sol"],
+        resolve_model_id=lambda model, _provider: model,
+    )
+    client.all_credentials = {"codex": ["codex.json"]}
+    client._get_provider_instance = lambda _provider: SimpleNamespace(
+        supports_responses_api=lambda: True,
+    )
+    client._executor = Executor()
+    client._is_error_response = lambda _: False
+    client.enable_request_logging = False
+    client.global_timeout = 30
+
+    async def dispatch_non_lite_requests():
+        for headers in ({}, {lite_header: "FALSE"}):
+            await client.aresponses(
+                request=SimpleNamespace(headers=headers, state=SimpleNamespace()),
+                model="codex/gpt-5.6-sol",
+                input="unchanged input",
+                stream=False,
+                **{
+                    lite_header: "true",
+                    "_codex_responses_lite": True,
+                },
+            )
+
+    asyncio.run(dispatch_non_lite_requests())
+
+    assert len(contexts) == 2
+    assert all(lite_header not in context.kwargs for context in contexts)
+    assert all("_codex_responses_lite" not in context.kwargs for context in contexts)
+
+
 def test_compact_route_passes_native_json_through_exactly(monkeypatch):
     import proxy_app.main as main
 
