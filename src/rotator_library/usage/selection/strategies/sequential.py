@@ -180,17 +180,17 @@ class SequentialStrategy:
                 return None
 
             effective_hours = (reset_at - now) / 3600.0 - _EFFECTIVE_DEADLINE_LEAD_HOURS
-            auto_redeem_at = states[candidate].reset_auto_redeem_at
+            credit_expiry_at = states[candidate].reset_credit_expiry_at
             if (
                 states[candidate].reset_credit_count > 0
-                and auto_redeem_at is not None
-                and auto_redeem_at > now
+                and credit_expiry_at is not None
+                and credit_expiry_at > now
             ):
-                # Existing capacity will also be overwritten when an earned
-                # credit auto-redeems, so drain toward the earlier deadline.
+                # Preserve the existing routing preference toward an expiring
+                # credit option; this is not a forecast of an automatic refill.
                 effective_hours = min(
                     effective_hours,
-                    (auto_redeem_at - now) / 3600.0
+                    (credit_expiry_at - now) / 3600.0
                     - _EFFECTIVE_DEADLINE_LEAD_HOURS,
                 )
             snapshots[candidate] = (

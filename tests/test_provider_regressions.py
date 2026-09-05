@@ -4,6 +4,7 @@ import base64
 import sys
 import time
 import types
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -363,6 +364,8 @@ def _codex_quota(path, remaining, reset_at, fetched_at):
         fetched_at=fetched_at,
         status="success",
         error=None,
+        account_id=f"account-{path}",
+        source="api",
     )
 
 
@@ -428,7 +431,7 @@ def test_codex_reset_policy_redeems_only_when_fleet_blocked(monkeypatch):
     assert credit_id == "reset-1"
 
 
-def test_codex_reset_policy_waits_for_imminent_auto_redemption(monkeypatch):
+def test_codex_reset_policy_waits_for_imminent_credit_expiry(monkeypatch):
     now = 1_000_000.0
     monkeypatch.setattr(codex_quota_tracker.time, "time", lambda: now)
     monkeypatch.setattr(codex_quota_tracker, "RESET_AUTO_MODE", "automatic")
@@ -439,7 +442,7 @@ def test_codex_reset_policy_waits_for_imminent_auto_redemption(monkeypatch):
     action, reason, _ = provider._reset_policy("a", ["a"])
 
     assert action == "wait"
-    assert "auto-redemption" in reason
+    assert reason == "credit expiry is imminent; automatic refill unverified"
 
 
 def test_codex_fetch_reset_credits_sorts_available_details(monkeypatch):
@@ -478,7 +481,7 @@ def test_codex_fetch_reset_credits_sorts_available_details(monkeypatch):
     assert snapshot.status == "success"
     assert snapshot.available_count == 2
     assert [credit.id for credit in snapshot.credits] == ["earlier", "later"]
-    assert snapshot.next_auto_redeem_at == pytest.approx(1784592000.0)
+    assert snapshot.next_expiry_at == pytest.approx(1784592000.0)
 
 
 def test_codex_redeem_reset_credit_uses_requested_id_and_idempotency(monkeypatch):
@@ -919,32 +922,31 @@ def test_codex_percent_quota_snapshots_are_exposed_in_group_stats_without_reques
         manager = UsageManager(provider="codex")
         await manager.initialize([credential])
         provider = CodexProvider()
+        observed = []
+        provider.set_quota_observer(observed.append)
+        snapshot = replace(
+            _codex_quota(credential, 18.75, secondary_reset, time.time()),
+            primary=codex_quota_tracker.RateLimitWindow(
+                used_percent=37.5,
+                remaining_percent=62.5,
+                window_minutes=300,
+                reset_at=primary_reset,
+            ),
+            secondary=codex_quota_tracker.RateLimitWindow(
+                used_percent=81.25,
+                remaining_percent=18.75,
+                window_minutes=10_080,
+                reset_at=secondary_reset,
+            ),
+        )
+        provider._publish_quota_snapshot(snapshot)
 
         stored = await provider._store_baselines_to_usage_manager(
-            {
-                credential: {
-                    "status": "success",
-                    "primary": {
-                        "used_percent": 37.5,
-                        "remaining_percent": 62.5,
-                        "remaining_fraction": 0.625,
-                        "window_minutes": 300,
-                        "reset_at": primary_reset,
-                        "is_exhausted": False,
-                    },
-                    "secondary": {
-                        "used_percent": 81.25,
-                        "remaining_percent": 18.75,
-                        "remaining_fraction": 0.1875,
-                        "window_minutes": 10_080,
-                        "reset_at": secondary_reset,
-                        "is_exhausted": False,
-                    },
-                }
-            },
+            {credential: {"status": "success"}},
             manager,
             force=True,
         )
+        assert observed == [snapshot]
         return stored, await manager.get_stats_for_endpoint()
 
     stored, stats = asyncio.run(store_snapshots_and_get_stats())
@@ -994,24 +996,16 @@ def test_codex_weekly_primary_replaces_removed_short_window_and_resets_stale_sta
         global_cycle.exhausted = True
         global_cycle.exhausted_reason = "quota_exceeded"
 
+        observed = []
+        provider.set_quota_observer(observed.append)
+        snapshot = _codex_quota(credential, 53.0, weekly_reset, time.time())
+        provider._publish_quota_snapshot(snapshot)
         stored = await provider._store_baselines_to_usage_manager(
-            {
-                credential: {
-                    "status": "success",
-                    "primary": {
-                        "used_percent": 47.0,
-                        "remaining_percent": 53.0,
-                        "remaining_fraction": 0.53,
-                        "window_minutes": 10_080,
-                        "reset_at": weekly_reset,
-                        "is_exhausted": False,
-                    },
-                    "secondary": None,
-                }
-            },
+            {credential: {"status": "success"}},
             manager,
             force=True,
         )
+        assert observed == [snapshot]
         return stored, await manager.get_stats_for_endpoint()
 
     stored, stats = asyncio.run(refresh_and_get_stats())

@@ -22,13 +22,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING
 
 import httpx
 
@@ -108,14 +110,23 @@ RESET_DRAIN_LEAD_SECONDS = int(
 # =============================================================================
 
 
-@dataclass
+@dataclass(frozen=True)
 class RateLimitWindow:
     """Rate limit window info from Codex API."""
 
     used_percent: float  # 0-100
     remaining_percent: float  # 100 - used_percent
     window_minutes: Optional[int]
-    reset_at: Optional[int]  # Unix timestamp
+    reset_at: Optional[float]  # Unix timestamp
+
+    def __post_init__(self) -> None:
+        for value in (self.used_percent, self.remaining_percent):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 100:
+                raise ValueError("quota percentages must be finite and between0 and100")
+        if not math.isclose(self.used_percent + self.remaining_percent, 100.0, abs_tol=1e-6):
+            raise ValueError("quota percentages must sum to100")
+        if self.reset_at is not None and (isinstance(self.reset_at, bool) or not isinstance(self.reset_at, (int, float)) or not math.isfinite(self.reset_at) or self.reset_at <= 0):
+            raise ValueError("quota reset timestamp must be positive and finite")
 
     @property
     def remaining_fraction(self) -> float:
@@ -134,7 +145,7 @@ class RateLimitWindow:
         return max(0, self.reset_at - time.time())
 
 
-@dataclass
+@dataclass(frozen=True)
 class CreditsInfo:
     """Credits info from Codex API."""
 
@@ -143,7 +154,7 @@ class CreditsInfo:
     balance: Optional[str]  # Could be numeric string or "unlimited"
 
 
-@dataclass
+@dataclass(frozen=True)
 class CodexQuotaSnapshot:
     """Complete quota snapshot for a Codex credential."""
 
@@ -159,9 +170,42 @@ class CodexQuotaSnapshot:
     # Every rate-limit family advertised on the response, keyed by limit id
     # (e.g. "codex", "codex_secondary"). Observational: routing still runs off
     # primary/secondary above. Defaulted so existing constructors keep working.
-    families: Dict[str, Tuple[Optional[RateLimitWindow], Optional[RateLimitWindow]]] = (
+    families: Mapping[str, Tuple[Optional[RateLimitWindow], Optional[RateLimitWindow]]] = (
         field(default_factory=dict)
     )
+    account_id: Optional[str] = None
+    source: str = "headers"
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.fetched_at) or self.fetched_at <= 0:
+            raise ValueError("quota source timestamp must be positive and finite")
+        if self.account_id is not None and (not isinstance(self.account_id, str) or not self.account_id.strip()):
+            raise ValueError("quota account identity must be a nonempty string")
+        object.__setattr__(self, "families", MappingProxyType(dict(self.families)))
+
+    @property
+    def quota_pool_id(self) -> Optional[str]:
+        return f"codex:{self.account_id}:weekly" if self.account_id else None
+
+    @property
+    def weekly_window(self) -> Optional[RateLimitWindow]:
+        windows = [window for window in (self.primary, self.secondary)
+                   if window and window.window_minutes == WEEKLY_WINDOW_MINUTES]
+        return windows[0] if len(windows) == 1 else None
+
+    @property
+    def weekly_unknown_reason(self) -> Optional[str]:
+        if not self.account_id:
+            return "missing_upstream_pool_identity"
+        windows = [window for window in (self.primary, self.secondary)
+                   if window and window.window_minutes == WEEKLY_WINDOW_MINUTES]
+        if len(windows) > 1:
+            return "ambiguous_weekly_windows"
+        if not windows:
+            return "weekly_window_unavailable"
+        if windows[0].reset_at is None:
+            return "weekly_reset_unavailable"
+        return None
 
     @property
     def is_stale(self) -> bool:
@@ -197,7 +241,7 @@ class ResetCreditsSnapshot:
         return time.time() - self.fetched_at > RESET_CREDITS_STALE_SECONDS
 
     @property
-    def next_auto_redeem_at(self) -> Optional[float]:
+    def next_expiry_at(self) -> Optional[float]:
         return min(
             (
                 credit.expires_at
@@ -209,8 +253,10 @@ class ResetCreditsSnapshot:
 
 
 def _parse_credit_timestamp(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
     if isinstance(value, (int, float)):
-        return float(value)
+        return float(value) if math.isfinite(value) and value > 0 else None
     if not isinstance(value, str) or not value:
         return None
     try:
@@ -326,6 +372,15 @@ def parse_rate_limit_headers(headers: Dict[str, str]) -> CodexQuotaSnapshot:
 
     credits = _parse_credits_from_headers(headers)
 
+    malformed = False
+    for used_key, minutes_key, reset_key, window in (
+        (HEADER_PRIMARY_USED_PERCENT, HEADER_PRIMARY_WINDOW_MINUTES, HEADER_PRIMARY_RESET_AT, primary),
+        (HEADER_SECONDARY_USED_PERCENT, HEADER_SECONDARY_WINDOW_MINUTES, HEADER_SECONDARY_RESET_AT, secondary),
+    ):
+        present = any(key in headers for key in (used_key, minutes_key, reset_key))
+        if present and (window is None or window.window_minutes is None or window.window_minutes <= 0 or window.reset_at is None):
+            malformed = True
+
     return CodexQuotaSnapshot(
         credential_path="",
         identifier="",
@@ -334,8 +389,8 @@ def parse_rate_limit_headers(headers: Dict[str, str]) -> CodexQuotaSnapshot:
         secondary=secondary,
         credits=credits,
         fetched_at=time.time(),
-        status="success" if (primary or secondary or credits) else "no_data",
-        error=None,
+        status="error" if malformed else ("success" if (primary or secondary or credits) else "no_data"),
+        error="invalid_quota_headers" if malformed else None,
         families=parse_all_rate_limit_families(headers),
     )
 
@@ -406,6 +461,9 @@ def _parse_window_from_headers(
     except (ValueError, TypeError):
         return None
 
+    if not math.isfinite(used_percent) or not 0 <= used_percent <= 100:
+        return None
+
     # Parse optional fields
     window_minutes = None
     window_minutes_str = headers.get(window_minutes_header)
@@ -420,6 +478,8 @@ def _parse_window_from_headers(
     if reset_at_str:
         try:
             reset_at = int(reset_at_str)
+            if reset_at <= 0:
+                reset_at = None
         except (ValueError, TypeError):
             pass
 
@@ -429,6 +489,28 @@ def _parse_window_from_headers(
         window_minutes=window_minutes,
         reset_at=reset_at,
     )
+
+
+def _parse_api_window(data: Any) -> Optional[RateLimitWindow]:
+    if data is None:
+        return None
+    if not isinstance(data, dict):
+        raise ValueError("present quota window must be an object")
+    used = data.get("used_percent")
+    if isinstance(used, bool) or not isinstance(used, (int, float)):
+        raise ValueError("present quota window has missing or invalid usage")
+    if not math.isfinite(used) or not 0 <= used <= 100:
+        raise ValueError("present quota window has invalid usage")
+    seconds = data.get("limit_window_seconds")
+    minutes = None
+    if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and math.isfinite(seconds) and seconds > 0 and seconds % 60 == 0:
+        minutes = int(seconds / 60)
+    if minutes is None:
+        raise ValueError("present quota window has missing or invalid duration")
+    reset = data.get("reset_at")
+    if isinstance(reset, bool) or not isinstance(reset, (int, float)) or not math.isfinite(reset) or reset <= 0:
+        raise ValueError("present quota window has missing or invalid reset timestamp")
+    return RateLimitWindow(float(used), 100.0 - float(used), minutes, reset)
 
 
 def _parse_credits_from_headers(headers: Dict[str, str]) -> Optional[CreditsInfo]:
@@ -486,12 +568,56 @@ class CodexQuotaTracker:
         """Provider mixin contract."""
         raise NotImplementedError
 
+    def set_quota_observer(self, callback: Callable[[CodexQuotaSnapshot], None]) -> None:
+        self._quota_observer = callback
+
+    def _advance_quota_epoch(self, key: str) -> int:
+        epoch = self._quota_epochs.get(key, 0) + 1
+        self._quota_epochs[key] = epoch
+        return epoch
+
+    def _quota_guard_current(self, guard: Mapping[str, int]) -> bool:
+        return all(self._quota_epochs.get(key) == epoch for key, epoch in guard.items())
+
+    def _publish_quota_snapshot(self, snapshot: CodexQuotaSnapshot) -> None:
+        """Publish one coherent immutable state and synchronously persist its evidence."""
+        self._advance_quota_epoch(f"path:{snapshot.credential_path}")
+        if snapshot.account_id:
+            self._advance_quota_epoch(f"account:{snapshot.account_id}")
+        self._quota_cache[snapshot.credential_path] = snapshot
+        self._quota_errors.pop(snapshot.credential_path, None)
+        if self._quota_observer is None:
+            self._quota_history_errors[snapshot.credential_path] = "quota_observer_unavailable"
+            return
+        try:
+            self._quota_observer(snapshot)
+        except Exception:
+            # A storage outage invalidates historical evidence, not a successful
+            # provider response or its coherent current quota. Reconciliation
+            # must still run after this publication.
+            self._quota_history_errors[snapshot.credential_path] = "quota_observation_persistence_failed"
+            lib_logger.exception("Failed to persist Codex quota observation")
+        else:
+            self._quota_history_errors.pop(snapshot.credential_path, None)
+
+    def get_quota_error(self, credential_path: str) -> Optional[str]:
+        return self._quota_errors.get(credential_path)
+
+    def get_quota_history_error(self, credential_path: str) -> Optional[str]:
+        return self._quota_history_errors.get(credential_path)
+
     def _init_quota_tracker(self):
         """Initialize quota tracker state. Call from provider's __init__."""
         self._quota_cache: Dict[str, CodexQuotaSnapshot] = {}
         self._quota_refresh_interval: int = DEFAULT_QUOTA_REFRESH_INTERVAL
         self._usage_manager: Optional["UsageManager"] = None
         self._initial_baselines_fetched: bool = False
+        self._quota_observer: Optional[Callable[[CodexQuotaSnapshot], None]] = None
+        self._quota_errors: Dict[str, str] = {}
+        self._quota_history_errors: Dict[str, str] = {}
+        self._quota_epochs: Dict[str, int] = {}
+        self._quota_push_locks: Dict[str, asyncio.Lock] = {}
+        self._quota_push_tasks: set[asyncio.Task] = set()
         self._reset_credits_cache: Dict[str, ResetCreditsSnapshot] = {}
         self._reset_locks: Dict[str, asyncio.Lock] = {}
 
@@ -616,16 +742,26 @@ class CodexQuotaTracker:
             }
             if credit_id:
                 body["credit_id"] = credit_id
+            consume_headers = await self._account_headers(credential_path)
+            epoch_keys = [f"path:{credential_path}"]
+            if consume_headers.get("ChatGPT-Account-Id"):
+                epoch_keys.append(f"account:{consume_headers['ChatGPT-Account-Id']}")
+            for key in epoch_keys:
+                self._advance_quota_epoch(key)
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     CODEX_RESET_CONSUME_URL,
-                    headers=await self._account_headers(credential_path),
+                    headers=consume_headers,
                     json=body,
                     timeout=30,
                 )
                 response.raise_for_status()
                 outcome = response.json()
-            await self.fetch_quota_from_api(credential_path)
+            for key in epoch_keys:
+                self._advance_quota_epoch(key)
+            reconciled = await self.fetch_quota_from_api(credential_path)
+            if reconciled.status != "success":
+                raise RuntimeError("reset request completed but quota reconciliation failed; refresh before any further redemption")
             refreshed = await self.fetch_reset_credits(credential_path)
             outcome_name = str(outcome.get("code") or outcome.get("status") or "unknown")
             self._reset_credits_cache[credential_path] = ResetCreditsSnapshot(
@@ -647,8 +783,12 @@ class CodexQuotaTracker:
             "error": snapshot.error,
             "fetched_at": snapshot.fetched_at,
             "stale": snapshot.is_stale,
-            "details_complete": len(snapshot.credits) >= snapshot.available_count,
-            "next_auto_redeem_at": snapshot.next_auto_redeem_at,
+            "details_complete": (
+                len([credit for credit in snapshot.credits if credit.status == "available"])
+                == snapshot.available_count
+                == len({credit.id for credit in snapshot.credits if credit.status == "available"})
+            ),
+            "next_expiry_at": snapshot.next_expiry_at,
             "policy": {
                 "action": snapshot.policy_action,
                 "reason": snapshot.policy_reason,
@@ -662,7 +802,6 @@ class CodexQuotaTracker:
                     "status": credit.status,
                     "granted_at": credit.granted_at,
                     "expires_at": credit.expires_at,
-                    "auto_redeems_at": credit.expires_at,
                     "title": credit.title,
                     "description": credit.description,
                 }
@@ -709,10 +848,10 @@ class CodexQuotaTracker:
         if natural_reset and natural_reset - now <= RESET_AUTO_WAIT_SECONDS:
             return "wait", "natural reset is imminent", available[0].id
         if (
-            reset.next_auto_redeem_at
-            and reset.next_auto_redeem_at - now <= RESET_AUTO_WAIT_SECONDS
+            reset.next_expiry_at
+            and reset.next_expiry_at - now <= RESET_AUTO_WAIT_SECONDS
         ):
-            return "wait", "credit auto-redemption is imminent", available[0].id
+            return "wait", "credit expiry is imminent; automatic refill unverified", available[0].id
         if (
             alternative_available
             and natural_reset
@@ -773,10 +912,10 @@ class CodexQuotaTracker:
             snapshot = self._reset_credits_cache.get(state.accessor)
             if snapshot is None or snapshot.status != "success" or snapshot.is_stale:
                 state.reset_credit_count = 0
-                state.reset_auto_redeem_at = None
+                state.reset_credit_expiry_at = None
                 continue
             state.reset_credit_count = snapshot.available_count
-            state.reset_auto_redeem_at = snapshot.next_auto_redeem_at
+            state.reset_credit_expiry_at = snapshot.next_expiry_at
 
     async def fetch_quota_from_api(
         self,
@@ -794,11 +933,18 @@ class CodexQuotaTracker:
             CodexQuotaSnapshot with rate limit and credits info
         """
         identifier = _get_credential_identifier(credential_path)
+        path_key = f"path:{credential_path}"
+        request_guard = {path_key: self._advance_quota_epoch(path_key)}
 
         try:
             # Get auth headers
             auth_headers = await self.get_auth_header(credential_path)
             account_id = await self.get_account_id(credential_path)
+            if not self._quota_guard_current(request_guard):
+                raise RuntimeError("quota_refresh_superseded")
+            if account_id:
+                account_key = f"account:{account_id}"
+                request_guard[account_key] = self._advance_quota_epoch(account_key)
 
             headers = {
                 **auth_headers,
@@ -818,6 +964,12 @@ class CodexQuotaTracker:
                 response.raise_for_status()
                 data = response.json()
 
+            # A newer request/publication (including a reset refresh or headers
+            # from a credential alias of this pool) owns the current generation.
+            # Never relabel this older response with a fresh completion time.
+            if not self._quota_guard_current(request_guard):
+                raise RuntimeError("quota_refresh_superseded")
+
             # Parse response
             plan_type = data.get("plan_type")
 
@@ -826,30 +978,11 @@ class CodexQuotaTracker:
             primary = None
             secondary = None
 
-            if rate_limit:
-                primary_data = rate_limit.get("primary_window")
-                if primary_data:
-                    primary = RateLimitWindow(
-                        used_percent=float(primary_data.get("used_percent", 0)),
-                        remaining_percent=100
-                        - float(primary_data.get("used_percent", 0)),
-                        window_minutes=_seconds_to_minutes(
-                            primary_data.get("limit_window_seconds")
-                        ),
-                        reset_at=primary_data.get("reset_at"),
-                    )
-
-                secondary_data = rate_limit.get("secondary_window")
-                if secondary_data:
-                    secondary = RateLimitWindow(
-                        used_percent=float(secondary_data.get("used_percent", 0)),
-                        remaining_percent=100
-                        - float(secondary_data.get("used_percent", 0)),
-                        window_minutes=_seconds_to_minutes(
-                            secondary_data.get("limit_window_seconds")
-                        ),
-                        reset_at=secondary_data.get("reset_at"),
-                    )
+            if rate_limit is not None and not isinstance(rate_limit, dict):
+                raise ValueError("rate_limit must be an object or null")
+            if isinstance(rate_limit, dict):
+                primary = _parse_api_window(rate_limit.get("primary_window"))
+                secondary = _parse_api_window(rate_limit.get("secondary_window"))
 
             # Parse credits section
             credits_data = data.get("credits")
@@ -873,8 +1006,10 @@ class CodexQuotaTracker:
                 error=None,
             )
 
-            # Cache the snapshot
-            self._quota_cache[credential_path] = snapshot
+            snapshot = replace(snapshot, account_id=account_id, source="api")
+            self._publish_quota_snapshot(snapshot)
+            request_guard = {key: self._quota_epochs[key] for key in request_guard}
+            await self._apply_quota_to_usage_manager(credential_path, snapshot)
 
             lib_logger.debug(
                 f"Fetched Codex quota for {identifier}: "
@@ -887,6 +1022,8 @@ class CodexQuotaTracker:
 
         except httpx.HTTPStatusError as e:
             error_msg = f"HTTP {e.response.status_code}: {e.response.text[:200]}"
+            if self._quota_guard_current(request_guard):
+                self._quota_errors[credential_path] = error_msg
             lib_logger.warning(
                 f"Failed to fetch Codex quota for {identifier}: {error_msg}"
             )
@@ -904,6 +1041,8 @@ class CodexQuotaTracker:
 
         except Exception as e:
             error_msg = str(e)
+            if self._quota_guard_current(request_guard):
+                self._quota_errors[credential_path] = error_msg
             lib_logger.warning(
                 f"Failed to fetch Codex quota for {identifier}: {error_msg}"
             )
@@ -939,18 +1078,26 @@ class CodexQuotaTracker:
         """
         snapshot = parse_rate_limit_headers(headers)
 
+        if snapshot.status == "error":
+            self._quota_errors[credential_path] = snapshot.error
+            lib_logger.warning("Rejected malformed Codex quota headers")
+            return None
         if snapshot.status == "no_data":
+            if any(key.lower().endswith("-used-percent") for key in headers):
+                self._quota_errors[credential_path] = "invalid_quota_headers"
+                lib_logger.warning("Rejected invalid Codex quota headers")
             return None
 
-        # Preserve existing metadata
         existing = self._quota_cache.get(credential_path)
-        if existing:
-            snapshot.plan_type = existing.plan_type
-
-        snapshot.credential_path = credential_path
-        snapshot.identifier = _get_credential_identifier(credential_path)
-
-        self._quota_cache[credential_path] = snapshot
+        credential = self._credentials_cache.get(credential_path, {})
+        account_id = credential.get("account_id") or credential.get("_proxy_metadata", {}).get("account_id")
+        snapshot = replace(
+            snapshot, credential_path=credential_path,
+            identifier=_get_credential_identifier(credential_path),
+            plan_type=existing.plan_type if existing else None,
+            account_id=account_id, source="headers",
+        )
+        self._publish_quota_snapshot(snapshot)
 
         # Log every advertised family, not just `primary`. Logging primary alone
         # was actively misleading: when upstream sends two families the stored
@@ -992,96 +1139,72 @@ class CodexQuotaTracker:
         return snapshot
 
     def _push_quota_to_usage_manager(
-        self,
-        credential_path: str,
-        snapshot: CodexQuotaSnapshot,
+        self, credential_path: str, snapshot: CodexQuotaSnapshot,
     ) -> None:
-        """
-        Push parsed quota snapshot to the UsageManager.
-
-        Translates the primary/secondary rate limit windows into
-        update_quota_baseline calls so the TUI can display quota status.
-        """
-        if not self._usage_manager:
+        if self._usage_manager is None:
             return
-        usage_manager = self._usage_manager
-
-        provider_prefix = getattr(self, "provider_env_name", "codex")
-
         try:
-            import asyncio
-
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
         except RuntimeError:
+            raise RuntimeError("Codex quota publication requires a running event loop")
+        task = loop.create_task(self._reconcile_header_quota(credential_path, snapshot))
+        self._quota_push_tasks.add(task)
+        task.add_done_callback(self._quota_push_finished)
+
+    async def _reconcile_header_quota(self, credential_path: str, snapshot: CodexQuotaSnapshot) -> None:
+        try:
+            await self._apply_quota_to_usage_manager(credential_path, snapshot)
+        except Exception:
+            self._quota_errors[credential_path] = "quota_manager_reconciliation_failed"
+            raise
+
+    def _quota_push_finished(self, task: asyncio.Task) -> None:
+        self._quota_push_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            error = task.exception()
+            lib_logger.error("Failed to reconcile Codex quota with UsageManager",
+                             exc_info=(type(error), error, error.__traceback__))
+
+    async def _apply_quota_to_usage_manager(
+        self, credential_path: str, snapshot: CodexQuotaSnapshot,
+    ) -> None:
+        usage_manager = self._usage_manager
+        if usage_manager is None:
             return
-
-        async def _push():
-            try:
-                # Codex rate limits come from the API as a percentage (0-100),
-                # not a request count. We intentionally do NOT pass
-                # quota_max_requests or quota_used here: that would encode the
-                # percent as a literal request cap and cause WindowLimitChecker
-                # to block credentials once local request_count crosses 100.
-                # Exhaustion is signalled via apply_exhaustion=is_exhausted,
-                # which applies a cooldown until reset_at.
+        lock = self._quota_push_locks.setdefault(credential_path, asyncio.Lock())
+        async with lock:
+            # Queued work never replays its old payload over a newer publication.
+            snapshot = self._quota_cache.get(credential_path)
+            while snapshot is not None:
+                provider = getattr(self, "provider_env_name", "codex")
                 windows = _classify_quota_windows(snapshot.primary, snapshot.secondary)
-                short_window = windows.get("5h-limit")
-                weekly_window = windows.get("weekly-limit")
-
-                if short_window:
-                    await usage_manager.update_quota_baseline(accessor=credential_path,
-                    model=f"{provider_prefix}/_5h_window",
-                    quota_reset_ts=short_window.reset_at,
-                    quota_group="5h-limit",
-                    force=True,
-                    apply_exhaustion=short_window.is_exhausted,
-                    quota_used_percent=short_window.used_percent,
-                    quota_remaining_percent=short_window.remaining_percent,
-                    quota_window_minutes=short_window.window_minutes,
-                    quota_source="codex",)
-                    if not short_window.is_exhausted:
-                        await usage_manager.clear_cooldown_if_exists(accessor=credential_path,
-                        model_or_group="5h-limit",)
-                else:
-                    await usage_manager.clear_quota_group_state(credential_path, "5h-limit")
-
-                if weekly_window:
-                    await usage_manager.update_quota_baseline(accessor=credential_path,
-                    model=f"{provider_prefix}/_weekly_window",
-                    quota_reset_ts=weekly_window.reset_at,
-                    quota_group="weekly-limit",
-                    force=True,
-                    apply_exhaustion=weekly_window.is_exhausted,
-                    quota_used_percent=weekly_window.used_percent,
-                    quota_remaining_percent=weekly_window.remaining_percent,
-                    quota_window_minutes=weekly_window.window_minutes,
-                    quota_source="codex",)
-                    if not weekly_window.is_exhausted:
-                        await usage_manager.clear_cooldown_if_exists(accessor=credential_path,
-                        model_or_group="weekly-limit",)
-                else:
-                    await usage_manager.clear_quota_group_state(credential_path, "weekly-limit")
-
-                authoritative_window = short_window or weekly_window
-                if authoritative_window:
-                    await usage_manager.update_quota_baseline(accessor=credential_path,
-                    model=f"{provider_prefix}/_global_quota",
-                    quota_reset_ts=authoritative_window.reset_at,
-                    quota_group="codex-global",
-                    force=True,
-                    apply_exhaustion=False,)
-                    await usage_manager.clear_cooldown_if_exists(accessor=credential_path,
-                    model_or_group="codex-global",)
-                    await usage_manager.clear_quota_group_state(credential_path, "codex-global", remove_usage=False)
-            except Exception as e:
-                lib_logger.debug(f"Failed to push Codex quota to UsageManager: {e}")
-
-        # Schedule the async push - we're already in an async context
-        # when this is called from the streaming/non-streaming handlers
-        if loop.is_running():
-            asyncio.ensure_future(_push())
-        else:
-            loop.run_until_complete(_push())
+                for group, model in (("5h-limit", "_5h_window"), ("weekly-limit", "_weekly_window")):
+                    window = windows.get(group)
+                    if window is None or window.reset_at is None:
+                        await usage_manager.clear_quota_group_state(credential_path, group)
+                        continue
+                    await usage_manager.update_quota_baseline(
+                        accessor=credential_path, model=f"{provider}/{model}",
+                        quota_reset_ts=window.reset_at, quota_group=group,
+                        force=True, apply_exhaustion=window.is_exhausted,
+                        quota_used_percent=window.used_percent,
+                        quota_remaining_percent=window.remaining_percent,
+                        quota_window_minutes=window.window_minutes, quota_source="codex",
+                    )
+                    if not window.is_exhausted:
+                        await usage_manager.clear_cooldown_if_exists(
+                            accessor=credential_path, model_or_group=group,
+                        )
+                await usage_manager.clear_cooldown_if_exists(
+                    accessor=credential_path, model_or_group="codex-global",
+                )
+                await usage_manager.clear_quota_group_state(
+                    credential_path, "codex-global", remove_usage=False,
+                )
+                latest = self._quota_cache.get(credential_path)
+                if latest is snapshot:
+                    return
+                snapshot = latest
 
     def get_cached_quota(
         self,
@@ -1357,143 +1480,19 @@ class CodexQuotaTracker:
     # =========================================================================
 
     async def _store_baselines_to_usage_manager(
-        self,
-        quota_results: Dict[str, Dict[str, Any]],
-        usage_manager: "UsageManager",
-        force: bool = False,
-        is_initial_fetch: bool = False,
+        self, quota_results: Dict[str, Dict[str, Any]], usage_manager: "UsageManager",
+        force: bool = False, is_initial_fetch: bool = False,
     ) -> int:
-        """
-        Store Codex quota baselines into UsageManager.
-
-        Codex has a global rate limit (primary/secondary window) that applies
-        to all models. This method stores the same baseline for all models
-        so the quota display works correctly.
-
-        Args:
-            quota_results: Dict from fetch_initial_baselines mapping cred_path -> quota data
-            usage_manager: UsageManager instance to store baselines in
-            force: If True, always overwrite existing values
-            is_initial_fetch: If True, apply exhaustion cooldowns
-
-        Returns:
-            Number of baselines successfully stored
-        """
-        stored_count = 0
-
-        # Get available models from the provider (will be set by CodexProvider)
-        models = getattr(self, "_available_models_for_quota", [])
-        provider_prefix = getattr(self, "provider_env_name", "codex")
-
-        for cred_path, quota_data in quota_results.items():
-            if quota_data.get("status") != "success":
+        """Reconcile the latest publications, never detached older result dictionaries."""
+        self.set_usage_manager(usage_manager)
+        count = 0
+        for path, result in quota_results.items():
+            snapshot = self._quota_cache.get(path)
+            if result.get("status") != "success" or snapshot is None:
                 continue
-
-            # Upstream field positions are not stable identities. During the
-            # temporary removal of the 5-hour restriction, the weekly window
-            # moved into primary and secondary became null.
-            primary = quota_data.get("primary")
-            secondary = quota_data.get("secondary")
-            windows = _classify_quota_windows(primary, secondary)
-            short_window = windows.get("5h-limit")
-            weekly_window = windows.get("weekly-limit")
-
-            # Short credential name for logging
-            if cred_path.startswith("env://"):
-                short_cred = cred_path.split("/")[-1]
-            else:
-                short_cred = Path(cred_path).stem
-
-            # Codex reports quota as a percentage, not a request count.
-            # We only store reset_at + apply_exhaustion so the UsageManager
-            # can cooldown an exhausted window without treating the 0-100
-            # percent scale as a literal request cap.
-            if short_window:
-                primary_remaining = short_window.get("remaining_fraction", 1.0)
-                primary_reset = short_window.get("reset_at")
-                is_exhausted = short_window.get("is_exhausted", False)
-                try:
-                    await usage_manager.update_quota_baseline(
-                        accessor=cred_path,
-                        model=f"{provider_prefix}/_5h_window",
-                        quota_reset_ts=primary_reset,
-                        quota_group="5h-limit",
-                        force=force,
-                        apply_exhaustion=is_exhausted and is_initial_fetch,
-                        quota_used_percent=short_window.get("used_percent"),
-                        quota_remaining_percent=short_window.get("remaining_percent"),
-                        quota_window_minutes=short_window.get("window_minutes"),
-                        quota_source="codex",
-                    )
-                    if not is_exhausted:
-                        await usage_manager.clear_cooldown_if_exists(
-                            accessor=cred_path,
-                            model_or_group="5h-limit",
-                        )
-                    stored_count += 1
-                    lib_logger.debug(
-                        f"Stored Codex 5h baseline for {short_cred}: "
-                        f"{primary_remaining * 100:.1f}% remaining"
-                    )
-                except Exception as e:
-                    lib_logger.warning(
-                        f"Failed to store Codex 5h baseline for {short_cred}: {e}"
-                    )
-            else:
-                await usage_manager.clear_quota_group_state(cred_path, "5h-limit")
-
-            if weekly_window:
-                secondary_remaining = weekly_window.get("remaining_fraction", 1.0)
-                secondary_reset = weekly_window.get("reset_at")
-                is_exhausted = weekly_window.get("is_exhausted", False)
-                try:
-                    await usage_manager.update_quota_baseline(
-                        accessor=cred_path,
-                        model=f"{provider_prefix}/_weekly_window",
-                        quota_reset_ts=secondary_reset,
-                        quota_group="weekly-limit",
-                        force=force,
-                        apply_exhaustion=is_exhausted and is_initial_fetch,
-                        quota_used_percent=weekly_window.get("used_percent"),
-                        quota_remaining_percent=weekly_window.get("remaining_percent"),
-                        quota_window_minutes=weekly_window.get("window_minutes"),
-                        quota_source="codex",
-                    )
-                    if not is_exhausted:
-                        await usage_manager.clear_cooldown_if_exists(
-                            accessor=cred_path,
-                            model_or_group="weekly-limit",
-                        )
-                    stored_count += 1
-                    lib_logger.debug(
-                        f"Stored Codex weekly baseline for {short_cred}: "
-                        f"{secondary_remaining * 100:.1f}% remaining"
-                    )
-                except Exception as e:
-                    lib_logger.warning(
-                        f"Failed to store Codex weekly baseline for {short_cred}: {e}"
-                    )
-            else:
-                await usage_manager.clear_quota_group_state(cred_path, "weekly-limit")
-
-            authoritative_window = short_window or weekly_window
-            if authoritative_window:
-                await usage_manager.update_quota_baseline(
-                    accessor=cred_path,
-                    model=f"{provider_prefix}/_global_quota",
-                    quota_reset_ts=authoritative_window.get("reset_at"),
-                    quota_group="codex-global",
-                    force=force,
-                    apply_exhaustion=False,
-                )
-                await usage_manager.clear_cooldown_if_exists(
-                    accessor=cred_path, model_or_group="codex-global"
-                )
-                await usage_manager.clear_quota_group_state(
-                    cred_path, "codex-global", remove_usage=False
-                )
-
-        return stored_count
+            await self._apply_quota_to_usage_manager(path, snapshot)
+            count += len(_classify_quota_windows(snapshot.primary, snapshot.secondary))
+        return count
 
     async def fetch_initial_baselines(
         self,

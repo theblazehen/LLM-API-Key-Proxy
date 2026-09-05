@@ -341,7 +341,7 @@ class CredentialState:
 
     # Transient provider hints, refreshed outside the request path.
     reset_credit_count: int = 0
-    reset_auto_redeem_at: Optional[float] = None
+    reset_credit_expiry_at: Optional[float] = None
 
     # Metadata
     created_at: Optional[float] = None

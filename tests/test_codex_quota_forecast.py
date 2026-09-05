@@ -1,915 +1,386 @@
-"""Observable contract tests for the pure Codex quota forecast."""
+"""Behavioral contracts for forward-only weekly quota plans and usage evidence."""
 
 from __future__ import annotations
 
+import importlib
 import json
-from datetime import datetime, timedelta, timezone
-import importlib.util
-from pathlib import Path
 import sys
+import types
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
 
-_MODULE_PATH = Path(__file__).parents[1] / "src/rotator_library/usage/codex_quota_forecast.py"
-_SPEC = importlib.util.spec_from_file_location("codex_quota_forecast", _MODULE_PATH)
-assert _SPEC and _SPEC.loader
-_MODULE = importlib.util.module_from_spec(_SPEC)
-sys.modules[_SPEC.name] = _MODULE
-_SPEC.loader.exec_module(_MODULE)
-build_codex_quota_forecast = _MODULE.build_codex_quota_forecast
-
+# Load the pure usage modules as a package, without importing the API client or
+# replacing rotator_library in sys.modules for unrelated tests.
+_PACKAGE = types.ModuleType("_quota_forecast_contract")
+_PACKAGE.__path__ = [str(Path(__file__).parents[1] / "src/rotator_library/usage")]
+sys.modules.setdefault(_PACKAGE.__name__, _PACKAGE)
+build_codex_quota_forecast = importlib.import_module(
+    f"{_PACKAGE.__name__}.codex_quota_forecast"
+).build_codex_quota_forecast
 
 UTC = timezone.utc
+DAY = 86400
+WEEK = 7 * DAY
 
 
 def instant(day: int, hour: int = 6, minute: int = 0) -> datetime:
     return datetime(2026, 8, day, hour, minute, tzinfo=UTC)
 
 
-def account(
-    account_id: str,
-    remaining: float,
-    reset_at: datetime,
-    **extra: object,
-) -> dict[str, object]:
+def account(account_id, remaining, reset_at, **extra):
     return {
         "stable_id": account_id,
-        "email": f"{account_id}@example.test",
         "remaining_percent": remaining,
         "reset_at": reset_at.timestamp(),
         **extra,
     }
 
 
-def forecast(
-    accounts: list[dict[str, object]],
-    *,
-    now: datetime = instant(8, 12),
-    observations: list[dict[str, object]] | None = None,
-) -> dict[str, object]:
+def forecast(accounts, *, now=instant(8, 12), observations=()):
     return build_codex_quota_forecast(
-        accounts=accounts,
-        observations=observations or [],
-        now=now,
+        accounts=accounts, observations=observations, now=now,
         source_timestamp=now.timestamp(),
     )
 
 
-def contribution_sum(day: dict[str, object]) -> float:
-    return sum(segment["amount"] for segment in day["contributions"])
+def observation(at, remaining, *, pool="a", sequence=1, **extra):
+    return {
+        "stable_id": pool, "pool_id": pool, "id": sequence,
+        "observed_at": at.timestamp(), "source_timestamp": at.timestamp(),
+        "confirmed_at": at.timestamp(), "source": "api",
+        "remaining_percent": remaining, **extra,
+    }
 
 
-def test_local_six_am_boundary_starts_and_labels_quota_day() -> None:
-    accounts = [account("a", 50.0, instant(9, 18))]
+def test_local_six_am_boundary_starts_and_labels_quota_day():
+    accounts = [account("a", 50, instant(9, 18))]
     before = forecast(accounts, now=instant(8, 5, 59))
-    at = forecast(accounts, now=instant(8, 6, 0))
+    at = forecast(accounts, now=instant(8, 6))
     local = timezone(timedelta(hours=2))
-    local_before = build_codex_quota_forecast(
-        accounts=[account("a", 50.0, datetime(2026, 8, 9, 18, tzinfo=local))],
-        now=datetime(2026, 8, 8, 5, 59, tzinfo=local),
-    )
-
-    assert before["horizon"]["start_at"] == instant(7, 6).timestamp()
-    assert at["horizon"]["start_at"] == instant(8, 6).timestamp()
-    assert at["planning_horizon"]["end_at"] == instant(22, 6).timestamp()
-    assert at["planning_horizon"]["day_count"] == 14
-    assert at["planning_horizon"]["rolling_window_seconds"] == 7 * 24 * 60 * 60
-    assert len(at["days"]) == 7
-    assert len(at["planning_days"]) == 14
+    local_before = forecast(accounts, now=datetime(2026, 8, 8, 5, 59, tzinfo=local))
+    assert before["horizon"]["start_at"] == instant(7).timestamp()
+    assert at["horizon"]["start_at"] == instant(8).timestamp()
+    assert at["planning_horizon"]["end_at"] == instant(22).timestamp()
+    assert at["planning_horizon"]["rolling_window_seconds"] == WEEK
+    assert len(at["days"]) == 7 and len(at["planning_days"]) == 14
     assert at["planning_days"][:7] == at["days"]
-    assert at["post_reset"]["day_start_at"] is not None
-    selected = next(
-        day
-        for day in at["planning_days"]
-        if day["start_at"] == at["post_reset"]["day_start_at"]
-    )
-    assert at["post_reset"]["daily_sustainable_pace"] == selected[
-        "sustainable_daily_rate"
-    ]
-    assert [day["local_date"] for day in at["days"]] == [
-        "2026-08-08",
-        "2026-08-09",
-        "2026-08-10",
-        "2026-08-11",
-        "2026-08-12",
-        "2026-08-13",
-        "2026-08-14",
-    ]
+    assert [day["local_date"] for day in at["days"]] == [f"2026-08-{d:02}" for d in range(8, 15)]
     assert at["quota_day_start_hour"] == 6
-    assert local_before["horizon"]["start_at"] == datetime(
-        2026, 8, 7, 6, tzinfo=local
-    ).timestamp()
+    assert local_before["horizon"]["start_at"] == datetime(2026, 8, 7, 6, tzinfo=local).timestamp()
+    post = next(day for day in at["planning_days"] if day["start_at"] == at["post_reset"]["day_start_at"])
+    assert at["post_reset"]["daily_sustainable_pace"] == post["sustainable_daily_rate"]
 
 
-def test_first_run_reports_missing_baseline_and_never_invents_actual_usage() -> None:
+@pytest.mark.parametrize(("month", "day", "hours"), [(3, 7, 23), (10, 31, 25)])
+def test_dst_civil_day_integrates_actual_elapsed_time(month, day, hours):
+    zone = ZoneInfo("America/New_York")
+    now = datetime(2026, month, day, 6, tzinfo=zone)
+    reset = datetime.fromtimestamp(now.timestamp() + 6 * DAY, zone)
+    result = forecast([account("a", 100, reset)], now=now)
+    today = result["today"]
+    assert today["end_at"] - today["start_at"] == hours * 3600
+    assert today["expiry_bonus"] == 0
+    assert today["baseline_allocation"] == pytest.approx(today["sustainable_daily_rate"] * hours / 24)
+    assert result["days"][1]["start_at"] == today["end_at"]
+
+
+def test_first_run_has_forward_plan_without_inventing_historical_usage():
     result = forecast([account("a", 74.375, instant(9, 18))])
-
-    assert result["status"] == "unavailable"
-    assert result["actual"] == {
-        "status": "baseline_unavailable",
-        "used_since_day_start": None,
-    }
-    assert result["risk"] == {
-        "aggregate_exhaustion": False,
-        "basis": "forecast_targets",
-    }
-    assert result["accounts"][0]["remaining_percent"] == pytest.approx(74.375)
+    assert result["schema_version"] == 3 and result["status"] == "ready"
+    assert result["today"]["target"] > 0
+    assert result["actual"]["status"] == "unavailable"
+    assert result["actual"]["estimate"] is None
+    assert result["actual"]["lower_bound"] is None
+    assert result["accounts"][0]["remaining_percent"] == 74.375
 
 
-def test_observed_actual_preserves_fractional_precision() -> None:
-    now = instant(8, 12)
-    result = forecast(
-        [account("a", 74.375, instant(9, 18))],
-        now=now,
-        observations=[
-            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 80.5},
-            {"stable_id": "a", "observed_at": instant(8, 10).timestamp(), "remaining_percent": 76.25},
-        ],
-    )
-
-    assert result["status"] == "ready"
-    assert result["actual"]["used_since_day_start"] == pytest.approx(6.125)
-    assert result["today"]["target"] % 1 != 0
-
-
-def test_actual_since_day_start_sums_each_account_transition() -> None:
-    now = instant(8, 12)
-    result = forecast(
-        [
-            account("a", 48.0, instant(9, 18)),
-            account("b", 41.0, instant(10, 18)),
-        ],
-        now=now,
-        observations=[
-            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 80.0},
-            {"stable_id": "a", "observed_at": instant(8, 9).timestamp(), "remaining_percent": 60.0},
-            {"stable_id": "b", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 70.0},
-            {"stable_id": "b", "observed_at": instant(8, 10).timestamp(), "remaining_percent": 55.0},
-        ],
-    )
-
-    # A consumed 20 + 12 = 32 pp; B consumed 15 + 14 = 29 pp.
-    # This fails if one account, or only one transition per account, is used.
-    assert result["status"] == "ready"
-    assert result["actual"] == {"status": "observed", "used_since_day_start": 61.0}
-
-
-def test_actual_since_day_start_ignores_reset_balance_restoration() -> None:
-    now = instant(8, 20)
-    reset = instant(8, 18)
-    result = forecast(
-        [account("a", 71.0, reset)],
-        now=now,
-        observations=[
-            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 80.0},
-            {"stable_id": "a", "observed_at": instant(8, 12).timestamp(), "remaining_percent": 50.0},
-            # The natural reset restores the balance; the post-reset decrease
-            # must add 29 pp rather than canceling the earlier 30 pp.
-            {"stable_id": "a", "observed_at": instant(8, 19).timestamp(), "remaining_percent": 71.0},
-        ],
-    )
-
-    assert result["status"] == "ready"
-    assert result["actual"] == {"status": "observed", "used_since_day_start": 59.0}
-
-
-def test_current_future_anchor_never_invents_an_unobserved_reset() -> None:
-    now = instant(8, 20)
-    result = forecast(
-        [account("a", 70.0, instant(15, 18))],
-        now=now,
-        observations=[
-            {
-                "stable_id": "a",
-                "observed_at": instant(8, 6).timestamp(),
-                "remaining_percent": 80.0,
-                "reset_at": instant(15, 6).timestamp(),
-            },
-        ],
-    )
-
-    assert result["actual"] == {"status": "observed", "used_since_day_start": 10.0}
-
-
-def test_aug15_future_anchor_does_not_create_expiry_bonus_or_move_fixed_target() -> None:
-    now = instant(15, 18)
-    result = forecast(
-        [account("a", 0.0, instant(22, 18))],
-        now=now,
-        observations=[
-            {
-                "stable_id": "a",
-                "observed_at": instant(15, 6).timestamp(),
-                "remaining_percent": 80.0,
-                "reset_at": instant(20, 18).timestamp(),
-            },
-        ],
-    )
-
-    assert result["actual"] == {"status": "observed", "used_since_day_start": 80.0}
-    assert result["today"]["expiry_bonus"] == 0.0
-    assert result["today"]["target"] < result["actual"]["used_since_day_start"]
-
-
-def test_aug13_balance_restoration_establishes_observed_reset() -> None:
-    now = instant(13, 18)
-    result = forecast(
-        [account("a", 70.0, instant(20, 12))],
-        now=now,
-        observations=[
-            {
-                "stable_id": "a",
-                "observed_at": instant(13, 6).timestamp(),
-                "remaining_percent": 80.0,
-                "reset_at": instant(16, 12).timestamp(),
-            },
-            {
-                "stable_id": "a",
-                "observed_at": instant(13, 12).timestamp(),
-                "remaining_percent": 100.0,
-                "reset_at": instant(20, 12).timestamp(),
-            },
-        ],
-    )
-
-    assert result["actual"] == {"status": "observed", "used_since_day_start": 30.0}
-
-
-def test_large_observed_anchor_generation_jump_establishes_reset() -> None:
-    now = instant(13, 18)
-    result = forecast(
-        [account("a", 70.0, instant(20, 12))],
-        now=now,
-        observations=[
-            {
-                "stable_id": "a",
-                "observed_at": instant(13, 6).timestamp(),
-                "remaining_percent": 80.0,
-                "reset_at": instant(16, 12).timestamp(),
-            },
-            {
-                "stable_id": "a",
-                "observed_at": instant(13, 12).timestamp(),
-                "remaining_percent": 75.0,
-                "reset_at": instant(20, 12).timestamp(),
-            },
-        ],
-    )
-
-    assert result["actual"] == {"status": "observed", "used_since_day_start": 30.0}
-
-
-def test_observed_at_plus_week_drift_does_not_create_repeated_resets() -> None:
-    now = instant(15, 12)
-    observations = [
-        {
-            "stable_id": "a",
-            "observed_at": instant(15, hour).timestamp(),
-            "remaining_percent": remaining,
-            "reset_at": instant(22, hour).timestamp(),
-        }
-        for hour, remaining in ((6, 80.0), (7, 78.0), (8, 76.0), (9, 74.0))
-    ]
-    result = forecast(
-        [account("a", 70.0, instant(22, 12))],
-        now=now,
-        observations=observations,
-    )
-
-    assert result["actual"] == {"status": "observed", "used_since_day_start": 10.0}
-
-
-def test_reset_at_quota_day_start_owns_new_day_actual_and_allocation() -> None:
-    now = instant(8, 12)
-    reset_at = instant(8, 6)
-    pre_reset = {
-        "stable_id": "a",
-        "observed_at": instant(8, 5, 59).timestamp(),
-        "remaining_percent": 80.0,
-        "reset_at": reset_at.timestamp(),
-    }
-    result = forecast(
-        [account("a", 90.0, reset_at + timedelta(days=7))],
-        now=now,
-        observations=[pre_reset],
-    )
-    post_reset_baseline = forecast(
-        [account("a", 90.0, reset_at + timedelta(days=7))],
-        now=now,
-        observations=[
-            {
-                "stable_id": "a",
-                "observed_at": reset_at.timestamp(),
-                "remaining_percent": 100.0,
-                "reset_at": (reset_at + timedelta(days=7)).timestamp(),
-            },
-        ],
-    )
-
-    assert result["actual"] == {"status": "observed", "used_since_day_start": 10.0}
-    assert result["today"]["target"] == pytest.approx(post_reset_baseline["today"]["target"])
-    assert result["today"]["baseline_allocation"] == pytest.approx(
-        post_reset_baseline["today"]["baseline_allocation"]
-    )
-    assert result["today"]["expiry_bonus"] == pytest.approx(
-        post_reset_baseline["today"]["expiry_bonus"]
-    )
-
-
-def test_credit_at_quota_day_start_restores_pre_boundary_baseline_once() -> None:
-    now = instant(8, 12)
-    reset_at = instant(8, 6)
+def test_saved_live_snapshot_matches_independent_repeatable_pace():
+    now = datetime.fromtimestamp(1788637959.2294838, UTC)
     accounts = [
-        account(
-            "a",
-            90.0,
-            instant(12, 6),
-            reset_credits=[{"id": "boundary", "auto_redeem_at": reset_at.timestamp()}],
-        )
-    ]
-    pre_reset = forecast(
-        accounts,
-        now=now,
-        observations=[
-            {
-                "stable_id": "a",
-                "observed_at": instant(8, 5, 59).timestamp(),
-                "remaining_percent": 80.0,
-                "reset_at": instant(12, 6).timestamp(),
-            },
-        ],
-    )
-    post_reset = forecast(
-        accounts,
-        now=now,
-        observations=[
-            {
-                "stable_id": "a",
-                "observed_at": reset_at.timestamp(),
-                "remaining_percent": 100.0,
-                "reset_at": instant(12, 6).timestamp(),
-            },
-        ],
-    )
-
-    assert pre_reset["actual"] == {"status": "observed", "used_since_day_start": 10.0}
-    assert post_reset["actual"] == pre_reset["actual"]
-    assert pre_reset["today"]["target"] == pytest.approx(post_reset["today"]["target"])
-    assert pre_reset["today"]["baseline_allocation"] == pytest.approx(
-        post_reset["today"]["baseline_allocation"]
-    )
-    assert pre_reset["today"]["expiry_bonus"] == pytest.approx(
-        post_reset["today"]["expiry_bonus"]
-    )
-
-
-def test_natural_reset_overwrites_remainder_not_adds_to_it() -> None:
-    now = instant(8, 12)
-    reset = instant(8, 18)
-    result = forecast([account("a", 40.0, reset)], now=now)
-    today = result["today"]
-    natural_events = [event for event in today["reset_events"] if event["kind"] == "natural"]
-
-    assert natural_events
-    assert natural_events[0]["balance_after"] == 100.0
-    assert natural_events[0]["capacity_added"] <= 100.0
-    assert natural_events[0]["capacity_added"] != 140.0
-
-
-def test_timed_credit_overwrites_balance_and_expiry_is_fallback() -> None:
-    now = instant(8, 12)
-    credit_at = instant(8, 15)
-    result = forecast(
-        [
-            account(
-                "a",
-                60.0,
-                instant(15, 12),
-                reset_credits=[
-                    {"id": "auto", "auto_redeem_at": credit_at.timestamp(), "expires_at": instant(8, 16).timestamp()},
-                    {"id": "expiry", "expires_at": instant(10, 12).timestamp()},
-                ],
-            )
-        ],
-        now=now,
-    )
-
-    events = [event for day in result["days"] for event in day["reset_events"]]
-    credit_events = [event for event in events if event["kind"].startswith("credit_")]
-    assert [(event["kind"], event["at"]) for event in credit_events] == [
-        ("credit_auto_redeem", credit_at.timestamp()),
-        ("credit_expiry", instant(10, 12).timestamp()),
-    ]
-    assert all(event["balance_after"] == 100.0 for event in credit_events)
-
-
-def test_missing_weekly_fields_are_excluded_and_reported() -> None:
-    result = forecast(
-        [
-            account("known", 55.0, instant(9, 12)),
-            {"stable_id": "missing-balance", "reset_at": instant(9, 12).timestamp()},
-            {"stable_id": "missing-reset", "remaining_percent": 44.0},
-        ]
-    )
-
-    assert [item["account_id"] for item in result["accounts"]] == ["known"]
-    assert [item["account_id"] for item in result["unknown_accounts"]] == [
-        "missing-balance",
-        "missing-reset",
-    ]
-    assert result["unknown_accounts"][0]["reasons"] == ["missing_or_invalid_remaining_percent"]
-    assert result["unknown_accounts"][1]["reasons"] == ["missing_or_invalid_reset_at"]
-
-
-def test_unavailable_accounts_do_not_claim_aggregate_exhaustion() -> None:
-    result = forecast([{"stable_id": "unknown"}])
-
-    assert result["status"] == "unavailable"
-    assert result["risk"]["aggregate_exhaustion"] is False
-
-
-def test_simultaneous_resets_aggregate_all_expiring_balances() -> None:
-    now = instant(8, 7)
-    result = forecast(
-        [
-            account("a", 80.0, instant(9, 5)),
-            account("b", 80.0, instant(9, 5)),
-        ],
-        now=now,
-        observations=[
-            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 80.0},
-            {"stable_id": "b", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 80.0},
-        ],
-    )
-    today = result["today"]
-
-    assert today["expiry_bonus"] > 100.0
-    assert today["target"] == pytest.approx(
-        today["baseline_allocation"] + today["expiry_bonus"]
-    )
-    assert {item["account_id"] for item in today["contributions"]} == {"a", "b"}
-
-
-def test_early_reset_expiry_bonus_never_spends_fresh_post_reset_capacity() -> None:
-    now = instant(8, 12)
-    result = forecast(
-        [account("a", 80.0, instant(8, 13))],
-        now=now,
-        observations=[
-            {
-                "stable_id": "a",
-                "observed_at": instant(8, 6).timestamp(),
-                "remaining_percent": 80.0,
-                "reset_at": instant(8, 13).timestamp(),
-            },
-        ],
-    )
-    today = result["today"]
-
-    assert 0.0 < today["expiry_bonus"] <= 80.0
-    assert today["target"] == pytest.approx(
-        today["baseline_allocation"] + today["expiry_bonus"]
-    )
-    assert today["target"] < 180.0
-
-
-def test_day_zero_target_is_fixed_as_actual_rises_from_same_baseline() -> None:
-    now = instant(8, 18)
-    accounts = [
-        account("a", 50.0, instant(9, 6)),
-        account("b", 100.0, instant(13, 6)),
-    ]
-    slow = forecast(
-        accounts,
-        now=now,
-        observations=[
-            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 50.0},
-            {"stable_id": "b", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 100.0},
-        ],
-    )
-    overused = forecast(
-        [account("a", 5.0, instant(9, 6)), account("b", 100.0, instant(13, 6))],
-        now=now,
-        observations=[
-            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 50.0},
-            {"stable_id": "b", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 100.0},
-        ],
-    )
-
-    assert slow["actual"]["used_since_day_start"] == pytest.approx(0.0)
-    assert overused["actual"]["used_since_day_start"] == pytest.approx(45.0)
-    assert slow["today"]["target"] == pytest.approx(overused["today"]["target"])
-    assert slow["today"]["expected_used_by_now"] == pytest.approx(
-        overused["today"]["expected_used_by_now"]
-    )
-
-
-def test_actual_can_exceed_fixed_target_without_moving_the_allocation() -> None:
-    now = instant(8, 18)
-    result = forecast(
-        [account("a", 0.0, instant(15, 6))],
-        now=now,
-        observations=[
-            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 100.0},
-        ],
-    )
-
-    assert result["actual"]["used_since_day_start"] == pytest.approx(100.0)
-    assert result["actual"]["used_since_day_start"] > result["today"]["target"]
-    assert result["today"]["remaining_target"] == 0.0
-
-
-def test_day_zero_borrowing_reduces_tomorrows_allocation() -> None:
-    now = instant(8, 18)
-    reset_at = instant(13, 6)
-    observations = [
-        {
-            "stable_id": account_id,
-            "observed_at": instant(8, 6).timestamp(),
-            "remaining_percent": 50.0,
-        }
-        for account_id in ("a", "b")
-    ]
-    on_plan = forecast(
-        [account("a", 40.0, reset_at), account("b", 40.0, reset_at)],
-        now=now,
-        observations=observations,
-    )
-    overused = forecast(
-        [account("a", 10.0, reset_at), account("b", 10.0, reset_at)],
-        now=now,
-        observations=observations,
-    )
-
-    assert overused["today"]["target"] == pytest.approx(on_plan["today"]["target"])
-    assert overused["actual"]["used_since_day_start"] > overused["today"]["target"]
-    assert overused["days"][1]["target"] < on_plan["days"][1]["target"]
-
-
-def test_same_day_reset_keeps_day_start_allocation_after_actual_is_observed() -> None:
-    now = instant(8, 18)
-    result = forecast(
-        [account("a", 55.0, instant(8, 10) + timedelta(days=7))],
-        now=now,
-        observations=[
-            {
-                "stable_id": "a",
-                "observed_at": instant(8, 6).timestamp(),
-                "remaining_percent": 30.0,
-                "reset_at": instant(8, 10).timestamp(),
-            },
-        ],
-    )
-
-    today = result["today"]
-    assert result["actual"]["used_since_day_start"] == pytest.approx(45.0)
-    assert today["expiry_bonus"] > 0.0
-    assert today["target"] == pytest.approx(
-        today["baseline_allocation"] + today["expiry_bonus"]
-    )
-    assert today["remaining_target"] == pytest.approx(
-        max(0.0, today["target"] - result["actual"]["used_since_day_start"])
-    )
-
-
-def test_staggered_same_day_resets_keep_today_target_live_reachable() -> None:
-    now = instant(8, 18)
-    result = forecast(
-        [
-            account("a", 55.0, instant(8, 10) + timedelta(days=7)),
-            account("b", 70.0, instant(8, 14) + timedelta(days=7)),
-            account("c", 40.0, instant(12, 6)),
-        ],
-        now=now,
-        observations=[
-            {
-                "stable_id": "a",
-                "observed_at": instant(8, 6).timestamp(),
-                "remaining_percent": 30.0,
-                "reset_at": instant(8, 10).timestamp(),
-            },
-            {
-                "stable_id": "b",
-                "observed_at": instant(8, 6).timestamp(),
-                "remaining_percent": 25.0,
-                "reset_at": instant(8, 14).timestamp(),
-            },
-            {
-                "stable_id": "c",
-                "observed_at": instant(8, 6).timestamp(),
-                "remaining_percent": 50.0,
-                "reset_at": instant(12, 6).timestamp(),
-            },
-        ],
-    )
-
-    today = result["today"]
-    assert today["target"] == pytest.approx(
-        result["actual"]["used_since_day_start"] + today["remaining_target"]
-    )
-    assert today["target"] <= result["actual"]["used_since_day_start"] + 165.0
-
-
-def test_live_sustainable_rate_responds_to_current_balances() -> None:
-    now = instant(8, 12)
-    low = forecast(
-        [account("a", 20.0, instant(12, 6))],
-        now=now,
-        observations=[
-            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 20.0},
-        ],
-    )
-    high = forecast(
-        [account("a", 80.0, instant(12, 6))],
-        now=now,
-        observations=[
-            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 80.0},
-        ],
-    )
-
-    assert low["status"] == high["status"] == "ready"
-    assert high["today"]["sustainable_daily_rate"] > low["today"][
-        "sustainable_daily_rate"
-    ]
-    assert high["today"]["live_sustainable_remaining"] > low["today"][
-        "live_sustainable_remaining"
-    ]
-
-
-def test_expected_used_by_now_tracks_fixed_day_plan() -> None:
-    now = instant(8, 12)
-    next_reset = instant(15, 6)
-    result = forecast(
-        [account("a", 100.0, next_reset)],
-        now=now,
-        observations=[
-            {"stable_id": "a", "observed_at": instant(8, 6).timestamp(), "remaining_percent": 100.0},
-        ],
-    )
-    today = result["today"]
-
-    assert next_reset.timestamp() > today["end_at"]
-    assert today["reset_events"] == []
-    assert today["expiry_bonus"] == 0.0
-    assert today["expected_used_by_now"] == pytest.approx(today["target"] / 4.0)
-
-
-def test_fully_dead_known_pool_reports_aggregate_exhaustion() -> None:
-    result = forecast(
-        [account("a", 0.0, instant(9, 18))],
-        observations=[
-            {
-                "stable_id": "a",
-                "observed_at": instant(8, 6).timestamp(),
-                "remaining_percent": 0.0,
-            }
-        ],
-    )
-
-    assert result["risk"]["aggregate_exhaustion"] is True
-
-
-def test_materially_dry_pool_before_replenishment_reports_exhaustion() -> None:
-    now = instant(8, 12)
-    result = forecast(
-        [account("a", 0.0, instant(8, 18))],
-        now=now,
-        observations=[
-            {
-                "stable_id": "a",
-                "observed_at": instant(8, 6).timestamp(),
-                "remaining_percent": 0.0,
-            }
-        ],
-    )
-
-    assert result["risk"]["aggregate_exhaustion"] is True
-
-
-@pytest.mark.parametrize(
-    ("remaining", "reset"),
-    [
-        (40.0, instant(9, 12)),  # 24 hours
-        (30.0, instant(14, 12)),  # 144 hours
-    ],
-)
-def test_healthy_reviewer_examples_are_not_aggregate_exhaustion(
-    remaining: float, reset: datetime
-) -> None:
-    result = forecast([account("a", remaining, reset)], now=instant(8, 12))
-
-    assert result["risk"]["aggregate_exhaustion"] is False
-
-
-def test_low_but_alive_pool_is_not_red_from_solver_residue() -> None:
-    now = instant(8, 12)
-    result = forecast([account("a", 1.0, instant(8, 18))], now=now)
-
-    assert result["risk"]["aggregate_exhaustion"] is False
-
-
-def test_continuous_weekly_capacity_is_not_aggregate_exhaustion() -> None:
-    result = forecast(
-        [
-            account("a", 33.333333333, instant(10, 11)),
-            account("b", 66.666666667, instant(13, 17)),
-        ]
-    )
-
-    assert result["risk"]["aggregate_exhaustion"] is False
-
-
-def test_depletion_exactly_at_replenishment_has_no_dry_interval() -> None:
-    now = instant(8, 12)
-    result = forecast(
-        [account("a", 10.0, instant(8, 18))],
-        now=now,
-        observations=[
-            {
-                "stable_id": "a",
-                "observed_at": instant(8, 6).timestamp(),
-                "remaining_percent": 10.0,
-            }
-        ],
-    )
-
-    assert result["today"]["target"] == pytest.approx(
-        result["today"]["baseline_allocation"] + result["today"]["expiry_bonus"]
-    )
-    assert result["risk"]["aggregate_exhaustion"] is False
-
-
-def test_solver_rounding_does_not_report_false_exhaustion() -> None:
-    result = forecast(
-        [
-            account("a", 33.333333333, instant(10, 11)),
-            account("b", 66.666666667, instant(13, 17)),
-        ]
-    )
-
-    assert result["risk"]["aggregate_exhaustion"] is False
-
-
-def test_contributions_sum_to_each_target_and_are_earliest_reset_first() -> None:
-    result = forecast(
-        [
-            account("late", 33.25, instant(12, 6)),
-            account("early", 61.75, instant(9, 18)),
-        ]
-    )
-
-    for day in result["days"]:
-        assert contribution_sum(day) == pytest.approx(day["remaining_target"], abs=1e-7)
-    current_contributions = result["today"]["contributions"]
-    assert current_contributions[0]["account_id"] == "early"
-
-
-def test_result_is_json_safe_and_deterministic() -> None:
-    now = instant(8, 12)
-    accounts = [account("a", 74.375, instant(9, 18))]
-    first = forecast(accounts, now=now)
-    second = forecast(accounts, now=now)
-
-    assert first == second
-    encoded = json.dumps(first, allow_nan=False)
-    assert json.loads(encoded) == first
-
-
-def test_naive_now_is_rejected() -> None:
-    with pytest.raises(ValueError, match="timezone-aware"):
-        build_codex_quota_forecast(
-            accounts=[],
-            now=datetime(2026, 8, 8, 12),
-        )
-
-
-def horizon_events(result: dict[str, object]) -> list[dict[str, object]]:
-    return [event for day in result["days"] for event in day["reset_events"]]
-
-
-def target_total(result: dict[str, object]) -> float:
-    return sum(day["target"] for day in result["days"])
-
-
-def test_every_reset_in_one_quota_day_is_applied_and_reported() -> None:
-    now = instant(8, 12)
-    accounts = [
-        account("a", 5.0, instant(8, 14)),
-        account("b", 5.0, instant(8, 20)),
-        account("c", 90.0, instant(12, 6)),
+        account("identity-1", 61, datetime.fromtimestamp(1789231320, UTC)),
+        account("identity-4", 0, datetime.fromtimestamp(1788747971, UTC)),
     ]
     result = forecast(accounts, now=now)
-    control = forecast(
-        [
-            account("a", 5.0, instant(8, 14)),
-            # The same pool with b's restore pushed outside the event horizon.
-            account("b", 5.0, instant(25, 20)),
-            account("c", 90.0, instant(12, 6)),
-        ],
-        now=now,
-    )
-
-    # The 14:00 target is met from live balances alone, so the 20:00 overwrite
-    # lands after the day's allocation is already complete.
-    assert [
-        (event["account_id"], event["kind"], event["at"])
-        for event in result["today"]["reset_events"]
-    ] == [
-        ("a", "natural", instant(8, 14).timestamp()),
-        ("b", "natural", instant(8, 20).timestamp()),
-    ]
-    # Reporting the event is not enough: the restored balance must stay in the
-    # simulated pool, otherwise every later day silently loses 100 pp.
-    assert target_total(result) > target_total(control)
+    assert result["today"]["sustainable_daily_rate"] == pytest.approx(23.44341030145878, abs=1e-7)
+    assert result["today"]["baseline_allocation"] == pytest.approx(9.887684, abs=1e-5)
+    assert result["today"]["expiry_bonus"] == 0
+    assert result["today"]["segments"][0]["start_at"] == now.timestamp()
 
 
-def test_timed_credit_replaces_the_natural_reset_inside_its_new_window() -> None:
+@pytest.mark.parametrize(("reset_hours", "expected_rate"), [(84, 100 / 7), (168, 50 / 7)])
+def test_finite_week_horizon_cliff_is_not_mistaken_for_repeatable_pace(reset_hours, expected_rate):
+    now = instant(8, 6)
+    result = forecast([account("a", 50, now + timedelta(hours=reset_hours))], now=now)
+    # At84h a finite168h plan can run100/7 pp/day, but the common-period cap
+    # still forbids rates above100/7. At168h the refill cannot fund earlier use.
+    assert result["today"]["sustainable_daily_rate"] == pytest.approx(expected_rate)
+    assert all(day["sustainable_daily_rate"] <= 100 / 7 + 1e-8 for day in result["planning_days"])
+
+
+def test_finite_horizon_windfall_does_not_raise_the_repeatable_cap():
+    now = instant(8, 6)
+    result = forecast([account("a", 100, now + timedelta(hours=84))], now=now)
+    # Finite168h demand can consume200pp at200/7 daily; that rate cannot repeat.
+    assert result["today"]["sustainable_daily_rate"] == pytest.approx(100 / 7)
+
+
+def test_each_day_conserves_inventory_and_contributions():
+    accounts = [account("late", 33.25, instant(12)), account("early", 61.75, instant(9, 18))]
+    result = forecast(accounts)
+    balances = {item["stable_id"]: item["remaining_percent"] for item in accounts}
+    for day in result["planning_days"]:
+        assert day["target"] == pytest.approx(day["baseline_allocation"] + day["expiry_bonus"])
+        assert sum(item["amount"] for item in day["contributions"]) == pytest.approx(day["target"])
+        assert sum(segment["baseline_allocation"] for segment in day["segments"]) == pytest.approx(day["baseline_allocation"])
+        assert sum(item["amount"] for item in day["expiry_deadlines"]) == pytest.approx(day["expiry_bonus"])
+        for event in day["reset_events"]:
+            assert event["kind"] == "natural"
+            assert event["balance_after"] == 100
+            assert event["capacity_added"] == pytest.approx(100 - event["balance_before"])
+            balances[event["account_id"]] += event["capacity_added"]
+        for item in day["contributions"]:
+            assert item["amount"] > 0
+            balances[item["account_id"]] -= item["amount"]
+        assert all(-1e-7 <= value <= 100 + 1e-7 for value in balances.values())
+    assert result["today"]["contributions"] == [{"account_id": "early", "amount": result["today"]["target"]}]
+
+
+def test_expiry_bonus_belongs_only_to_old_generation_and_exact_deadline():
     now = instant(8, 12)
-    credit_at = instant(9, 12)
-    natural_at = instant(14, 12)
-    result = forecast(
-        [
-            account(
-                "a",
-                50.0,
-                natural_at,
-                reset_credits=[{"id": "c1", "auto_redeem_at": credit_at.timestamp()}],
-            )
-        ],
-        now=now,
-    )
-    events = horizon_events(result)
-
-    assert [(event["kind"], event["at"]) for event in events] == [
-        ("credit_auto_redeem", credit_at.timestamp())
-    ]
-    # A redemption restarts the weekly window, so the pre-credit natural reset
-    # is no longer real capacity and must not restore a second full window.
-    assert target_total(result) <= 150.0 + 1e-6
-    # The upstream anchor itself is reported unchanged.
-    assert result["accounts"][0]["natural_reset_at"] == natural_at.timestamp()
+    reset = now + timedelta(seconds=1234.56789)
+    before = forecast([account("a", 100, reset)], now=now)
+    today = before["today"]
+    deadline = today["expiry_deadlines"][0]
+    assert deadline["at"] == reset.timestamp()
+    pre_baseline = today["segments"][0]["baseline_allocation"]
+    assert deadline["amount"] == pytest.approx(100 - pre_baseline)
+    assert all(segment["expiry_bonus"] == 0 for segment in today["segments"] if segment["start_at"] >= reset.timestamp())
+    after = forecast([account("a", 100, reset + timedelta(days=7))], now=reset)
+    assert after["today"]["expiry_bonus"] == 0
+    assert after["today"]["target"] < today["target"]
 
 
-def test_reset_exactly_on_the_boundary_belongs_to_the_day_it_starts() -> None:
-    boundary = instant(9, 6)
-    result = forecast([account("a", 40.0, boundary)], now=instant(8, 12))
-
-    assert result["days"][1]["start_at"] == boundary.timestamp()
-    assert [event["at"] for event in result["days"][0]["reset_events"]] == []
-    assert [
-        (event["account_id"], event["at"])
-        for event in result["days"][1]["reset_events"]
-    ] == [("a", boundary.timestamp())]
+def test_simultaneous_resets_apply_once_per_pool_and_preserve_surplus():
+    reset = instant(8, 18)
+    result = forecast([account("a", 40, reset), account("b", 60, reset)])
+    today = result["today"]
+    assert [(event["account_id"], event["at"]) for event in today["reset_events"]] == [("a", reset.timestamp()), ("b", reset.timestamp())]
+    pre_reset = today["segments"][0]
+    assert pre_reset["baseline_allocation"] + pre_reset["expiry_bonus"] == pytest.approx(100)
+    assert len(today["expiry_deadlines"]) == 2
 
 
-def test_stale_flag_follows_source_age_against_the_threshold() -> None:
+def test_every_same_day_reset_is_applied_and_reported():
+    accounts = [account("a", 5, instant(8, 14)), account("b", 5, instant(8, 20)), account("c", 90, instant(12))]
+    result = forecast(accounts)
+    control = forecast([accounts[0], account("b", 5, instant(15, 12)), accounts[2]])
+    assert [(event["account_id"], event["at"]) for event in result["today"]["reset_events"]] == [("a", instant(8, 14).timestamp()), ("b", instant(8, 20).timestamp())]
+    assert sum(day["target"] for day in result["days"]) > sum(day["target"] for day in control["days"])
+
+
+def test_reset_at_civil_boundary_is_reported_in_new_day_but_old_bonus_is_not():
+    boundary = instant(9)
+    result = forecast([account("a", 40, boundary)])
+    assert result["days"][0]["reset_events"] == []
+    assert result["days"][0]["expiry_deadlines"][0]["at"] == boundary.timestamp()
+    assert [(event["account_id"], event["at"]) for event in result["days"][1]["reset_events"]] == [("a", boundary.timestamp())]
+    assert result["days"][1]["expiry_bonus"] == 0
+
+
+@pytest.mark.parametrize("reset", [instant(8, 18), instant(9, 18)])
+def test_blocked_prefix_does_not_erase_post_reset_plan(reset):
+    result = forecast([account("a", 0, reset)])
+    assert result["status"] == "blocked"
+    assert result["blocked_until"] == reset.timestamp()
+    assert result["risk"]["aggregate_exhaustion"] is True
+    segments = [segment for day in result["days"] for segment in day["segments"]]
+    assert all(segment["baseline_allocation"] == 0 for segment in segments if segment["end_at"] <= reset.timestamp())
+    assert any(segment["baseline_allocation"] > 0 for segment in segments if segment["start_at"] >= reset.timestamp())
+
+
+@pytest.mark.parametrize("remaining", [1e-5, 1, 10, 33.333333333, 40])
+def test_positive_pool_is_not_exhausted_by_rounding_or_solver_residue(remaining):
+    result = forecast([account("a", remaining, instant(8, 18))])
+    assert result["status"] == "ready"
+    assert result["risk"]["aggregate_exhaustion"] is False
+    assert result["today"]["sustainable_daily_rate"] > 0
+
+
+def test_unknown_pool_makes_known_subset_partial_not_complete_or_exhausted():
+    result = forecast([account("known", 0, instant(8, 18)), {"stable_id": "unknown"}])
+    assert result["status"] == "partial"
+    assert result["today"] is not None
+    assert result["risk"]["aggregate_exhaustion"] is None
+    assert result["unknown_accounts"][0]["account_id"] == "unknown"
+    assert result["credit_scenarios"] == []
+
+
+@pytest.mark.parametrize("accounts", [[], [{"stable_id": "unknown"}], [account("a", float("nan"), instant(9))]])
+def test_unavailable_has_no_fabricated_zero_week(accounts):
+    result = forecast(accounts)
+    assert result["status"] == "unavailable"
+    assert result["today"] is None and result["days"] == [] and result["planning_days"] == []
+    assert result["risk"]["aggregate_exhaustion"] is None
+    assert result["reason"]
+    json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.parametrize("reset", [instant(7), instant(8, 12), instant(16)])
+def test_unconfirmed_expired_or_nonweekly_anchor_is_not_rolled_forward(reset):
+    result = forecast([account("a", 80, reset)])
+    assert result["status"] == "unavailable"
+    assert result["accounts"] == []
+    assert result["unknown_accounts"][0]["reasons"]
+
+
+def test_duplicate_credentials_do_not_double_pool_capacity_and_conflicts_are_unknown():
+    single = account("pool", 61, instant(11))
+    result = forecast([single, dict(single)])
+    assert result["days"] == forecast([single])["days"]
+    assert len(result["accounts"]) == 1
+    conflict = forecast([single, dict(single, remaining_percent=60)])
+    assert conflict["status"] == "unavailable"
+    assert "conflicting_duplicate_pool" in conflict["unknown_accounts"][0]["reasons"]
+
+
+def test_current_balances_replan_instead_of_freezing_historical_target():
+    high = forecast([account("a", 80, instant(14, 12))])
+    low = forecast([account("a", 20, instant(14, 12))])
+    assert low["today"]["target"] < high["today"]["target"]
+    assert low["days"][1]["target"] < high["days"][1]["target"]
+
+
+def test_past_history_never_subtracts_debt_or_recreates_missed_expiry():
+    accounts = [account("a", 60, instant(14), history_provenance="trusted_ingestion")]
+    no_history = forecast(accounts)
+    history = [observation(instant(8), 100), observation(instant(8, 9), 20, sequence=2), observation(instant(8, 10), 90, sequence=3)]
+    with_history = forecast(accounts, observations=history)
+    assert with_history["actual"]["status"] == "unavailable"
+    assert with_history["actual"]["reason"] == "reset_history_incomplete"
+    for key in ("today", "days", "planning_days", "post_reset", "risk"):
+        assert with_history[key] == no_history[key]
+
+
+@pytest.mark.parametrize(("start_balance", "end_balance", "resets", "lower", "upper"), [(100, 80.625, [], 19.375, 19.375), (80, 70, [instant(8, 9).timestamp()], 30, 110)])
+def test_historical_usage_requires_explicit_complete_reset_and_precision_assumptions(start_balance, end_balance, resets, lower, upper):
     now = instant(8, 12)
-    accounts = [account("a", 60.0, instant(9, 18))]
-
-    def at_age(age: float | None) -> dict[str, object]:
-        return build_codex_quota_forecast(
-            accounts=accounts,
-            now=now,
-            source_timestamp=None if age is None else now.timestamp() - age,
-            stale_after_seconds=900.0,
-        )
-
-    fresh = at_age(60.0)
-    expired = at_age(1800.0)
-    unknown = at_age(None)
-
-    assert (fresh["age_seconds"], fresh["stale"]) == (60.0, False)
-    assert (expired["age_seconds"], expired["stale"]) == (1800.0, True)
-    assert (unknown["age_seconds"], unknown["stale"]) == (None, True)
-    # A boundary sample must not be reported stale before the threshold passes.
-    assert at_age(900.0)["stale"] is False
+    inputs = [account("a", end_balance, instant(14), source_timestamp=now.timestamp(), history_provenance="trusted_ingestion", event_history_complete=True, confirmed_resets=resets, measurement_model="exact")]
+    result = forecast(inputs, now=now, observations=[observation(instant(8), start_balance)])
+    actual = result["actual"]
+    assert actual["status"] == "estimated"
+    assert (actual["lower_bound"], actual["upper_bound"]) == (lower, upper)
+    assert actual["estimate"] == (lower if lower == upper else None)
+    assert actual["assumptions"]
 
 
-def test_ready_days_publish_only_schema_v2_allocation_fields() -> None:
-    result = forecast(
-        [
-            account("a", 5.0, instant(8, 14)),
-            account("b", 62.5, instant(11, 9)),
-            account("c", 90.0, instant(12, 6)),
-        ],
-        now=instant(8, 12),
-    )
+def test_trusted_samples_without_precision_do_not_claim_exact_usage():
+    now = instant(8, 12)
+    inputs = [account("a", 80, instant(14), source_timestamp=now.timestamp(), history_provenance="trusted_ingestion", event_history_complete=True, confirmed_resets=[])]
+    result = forecast(inputs, observations=[observation(instant(8), 100)])
+    assert result["actual"]["status"] == "unavailable"
+    assert result["actual"]["reason"] == "measurement_precision_unestablished"
 
-    expected_keys = {
-        "index",
-        "start_at",
-        "end_at",
-        "local_date",
-        "target",
-        "remaining_target",
-        "baseline_allocation",
-        "expiry_bonus",
-        "sustainable_daily_rate",
-        "live_sustainable_remaining",
-        "expected_used_by_now",
-        "contributions",
-        "reset_events",
-    }
-    assert result["schema_version"] == 2
-    assert all(set(day) == expected_keys for day in result["days"])
+
+def test_usage_crossing_day_boundary_is_a_range_not_all_charged_to_today():
+    now = instant(8, 12)
+    inputs = [account("a", 60, instant(14), source_timestamp=now.timestamp(), history_provenance="trusted_ingestion", event_history_complete=True, confirmed_resets=[], measurement_model="exact")]
+    result = forecast(inputs, observations=[observation(instant(8, 5), 100)])
+    actual = result["actual"]
+    assert actual["status"] == "estimated"
+    assert (actual["lower_bound"], actual["upper_bound"]) == (0, 40)
+    assert actual["estimate"] is None
+
+
+def test_overlapping_same_time_rounded_samples_remain_feasible():
+    now = instant(8, 12)
+    inputs = [account("a", 60, instant(14), source_timestamp=now.timestamp(), history_provenance="trusted_ingestion", event_history_complete=True, confirmed_resets=[], measurement_error_pp=1)]
+    rows = [observation(instant(8), 90), observation(instant(8, 9), 80, sequence=2), observation(instant(8, 9), 81, sequence=3)]
+    actual = forecast(inputs, observations=rows)["actual"]
+    assert actual["status"] == "estimated"
+    assert (actual["lower_bound"], actual["upper_bound"]) == (28, 32)
+    assert actual["estimate"] is None
+
+
+def test_reset_at_day_boundary_requires_explicit_pre_post_observation_order():
+    now = instant(8, 12)
+    inputs = [account("a", 90, instant(14), source_timestamp=now.timestamp(), history_provenance="trusted_ingestion", event_history_complete=True, confirmed_resets=[instant(8).timestamp()], measurement_model="exact")]
+    ambiguous = observation(instant(8), 100)
+    assert forecast(inputs, observations=[ambiguous])["actual"]["status"] == "unavailable"
+    actual = forecast(inputs, observations=[dict(ambiguous, side="post")])["actual"]
+    assert actual["status"] == "estimated"
+    assert (actual["lower_bound"], actual["upper_bound"]) == (10, 10)
+
+
+def credit_account(now, **extra):
+    return account("a", 10, now + timedelta(hours=100), source_timestamp=now.timestamp(), reset_credits_status="success", reset_credits_stale=False, reset_credits_complete=True, reset_credits=[{"id": "c", "expires_at": now.timestamp() + 8 * 3600, "status": "available", "reset_type": "codex_rate_limits"}], **extra)
+
+
+def test_credit_expiry_is_an_option_not_refill_or_replacement_anchor():
+    now = instant(8, 12)
+    inputs = credit_account(now)
+    result = forecast([inputs], now=now)
+    without = forecast([dict(inputs, reset_credits=[])], now=now)
+    assert result["days"] == without["days"]
+    assert result["accounts"][0]["natural_reset_at"] == inputs["reset_at"]
+    assert result["accounts"][0]["credit_options"][0]["expires_at"] == inputs["reset_credits"][0]["expires_at"]
+    assert len(result["credit_scenarios"]) == 10
+    assert all(item["conditional"] and item["actual_continuous_availability_guarantee"] is False for item in result["credit_scenarios"])
+
+
+@pytest.mark.parametrize(("field", "value"), [("source_timestamp", None), ("source_timestamp", instant(8, 11).timestamp()), ("reset_credits_status", "error"), ("reset_credits_stale", True), ("reset_credits_complete", False)])
+def test_credit_scenarios_require_fresh_complete_successful_inputs(field, value):
+    inputs = dict(credit_account(instant(8, 12)), **{field: value})
+    result = forecast([inputs])
+    assert result["status"] == "ready"
+    assert result["credit_scenarios"] == [] and result["credit_scenarios_reason"]
+
+
+@pytest.mark.parametrize("status", [None, "", False])
+def test_missing_or_invalid_credit_status_never_becomes_available(status):
+    inputs = credit_account(instant(8, 12))
+    if status is None:
+        inputs["reset_credits"][0].pop("status")
+    else:
+        inputs["reset_credits"][0]["status"] = status
+    result = forecast([inputs])
+    assert result["accounts"][0]["credit_options"][0]["status"] is None
+    assert result["credit_scenarios"] == []
+    assert result["credit_scenarios_reason"] == "unknown_credit_status"
+
+
+@pytest.mark.parametrize(("age", "stale"), [(60, False), (900, False), (900.001, True), (None, True), (-1, True)])
+def test_staleness_respects_source_age_and_exact_threshold(age, stale):
+    now = instant(8, 12)
+    result = build_codex_quota_forecast(accounts=[account("a", 60, instant(9, 18))], now=now, source_timestamp=None if age is None else now.timestamp() - age, stale_after_seconds=900)
+    assert result["stale"] is stale
+    if age is None:
+        assert result["age_seconds"] is None
+    else:
+        assert result["age_seconds"] == pytest.approx(max(0, age), rel=0, abs=1e-6)
+
+
+def test_result_is_json_safe_deterministic_and_does_not_mutate_inputs():
+    inputs = [credit_account(instant(8, 12))]
+    original = deepcopy(inputs)
+    first = forecast(inputs)
+    assert forecast(inputs) == first
+    assert inputs == original
+    assert json.loads(json.dumps(first, allow_nan=False)) == first
+    obsolete = {"remaining_target", "expected_used_by_now", "live_sustainable_remaining"}
+    assert all(not obsolete.intersection(day) for day in first["days"])
+
+
+def test_naive_now_is_rejected():
+    with pytest.raises(ValueError, match="timezone-aware"):
+        build_codex_quota_forecast(accounts=[], now=datetime(2026, 8, 8, 12))
+
+
+@pytest.mark.parametrize("threshold", [-1, float("nan"), float("inf"), True])
+def test_invalid_freshness_threshold_is_rejected(threshold):
+    with pytest.raises(ValueError, match="finite non-negative"):
+        build_codex_quota_forecast(accounts=[], now=instant(8), stale_after_seconds=threshold)

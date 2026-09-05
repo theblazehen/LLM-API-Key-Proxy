@@ -25,6 +25,8 @@ def record(store: QuotaObservationStore, account: str = "account-a", **changes: 
         "observed_at": 1_700_000_001.0,
     }
     values.update(changes)
+    if "observed_at" in changes and "source_timestamp" not in changes:
+        values["source_timestamp"] = changes["observed_at"]
     return store.record(**values)  # type: ignore[arg-type]
 
 
@@ -46,13 +48,14 @@ def test_first_observation_inserts_and_duplicate_dedupes(tmp_path):
 
 def test_each_meaningful_quota_reset_or_credit_change_inserts(tmp_path):
     store = QuotaObservationStore(tmp_path / "quota.sqlite3")
-    assert record(store) is True
+    assert record(store, observed_at=1) is True
 
-    assert record(store, used_percent="25.7250", observed_at=2) is True
-    assert record(store, remaining_percent="74.2750", observed_at=3) is True
-    assert record(store, reset_at=1_700_100_001.25, observed_at=4) is True
+    assert record(store, used_percent="25.7250", remaining_percent="74.2750", observed_at=2) is True
+    assert record(store, used_percent="25.8250", remaining_percent="74.1750", observed_at=3) is True
+    assert record(store, used_percent="25.8250", remaining_percent="74.1750", reset_at=1_700_100_001.25, observed_at=4) is True
     assert record(
         store,
+        used_percent="25.8250", remaining_percent="74.1750", reset_at=1_700_100_001.25,
         reset_credit_metadata={
             "available_count": 2,
             "credits": [{"expires_at": 1_700_200_000.5, "status": "available"}],
@@ -61,6 +64,7 @@ def test_each_meaningful_quota_reset_or_credit_change_inserts(tmp_path):
     ) is True
     assert record(
         store,
+        used_percent="25.8250", remaining_percent="74.1750", reset_at=1_700_100_001.25,
         reset_credit_metadata={
             "credits": [{"status": "redeemed", "expires_at": 1_700_200_000.5}],
             "available_count": 2,
@@ -74,7 +78,7 @@ def test_each_meaningful_quota_reset_or_credit_change_inserts(tmp_path):
 def test_credit_metadata_key_order_does_not_create_change(tmp_path):
     store = QuotaObservationStore(tmp_path / "quota.sqlite3")
     metadata = {"available_count": 1, "credits": [{"status": "available", "expires_at": 12}]}
-    assert record(store, reset_credit_metadata=metadata) is True
+    assert record(store, reset_credit_metadata=metadata, observed_at=1) is True
     assert record(
         store,
         reset_credit_metadata={"credits": [{"expires_at": 12, "status": "available"}], "available_count": 1},
@@ -234,3 +238,116 @@ def test_boundary_read_never_invents_missing_baseline(tmp_path):
     around = store.observations_around_boundary("account-a", 360)
     assert around.baseline is None
     assert [item.observed_at for item in around.changes] == [361.0]
+
+
+def test_legacy_migration_preserves_rows_and_is_idempotent(tmp_path):
+    path = tmp_path / "quota.sqlite3"
+    original = [
+        (7, "account-a", "old@example.test", "0.00", "100.00", 0, 100, 1000, "null", 9, 10, "first-fingerprint"),
+        (12, "account-a", None, "10.00", "90.00", 10, 90, 1000, "{}", 11, 10, "second-fingerprint"),
+    ]
+    with sqlite3.connect(path) as connection:
+        connection.execute("""
+            CREATE TABLE codex_weekly_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                stable_account_id TEXT NOT NULL, email TEXT,
+                used_percent_text TEXT NOT NULL, remaining_percent_text TEXT NOT NULL,
+                used_percent REAL NOT NULL, remaining_percent REAL NOT NULL,
+                reset_at REAL NOT NULL, reset_credit_json TEXT NOT NULL,
+                source_timestamp REAL NOT NULL, observed_at REAL NOT NULL,
+                fingerprint TEXT NOT NULL
+            )
+        """)
+        connection.executemany(
+            "INSERT INTO codex_weekly_observations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            original,
+        )
+
+    store = QuotaObservationStore(path)
+    migrated = store.history("account-a")
+    assert [row.id for row in migrated] == [7, 12]
+    assert [row.source for row in migrated] == ["legacy", "legacy"]
+    assert [row.pool_id for row in migrated] == [None, None]
+    assert [row.confirmed_at for row in migrated] == [10, 11]
+    assert QuotaObservationStore(path).history("account-a") == migrated
+    with sqlite3.connect(path) as connection:
+        preserved = connection.execute("""
+            SELECT id, stable_account_id, email, used_percent_text,
+                   remaining_percent_text, used_percent, remaining_percent,
+                   reset_at, reset_credit_json, source_timestamp, observed_at, fingerprint
+            FROM codex_weekly_observations ORDER BY id
+        """).fetchall()
+        assert preserved == original
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    assert record(store, observed_at=12, source="api", pool_id="account-a")
+    assert store.latest("account-a").id > 12
+    assert store.history("account-a")[:2] == migrated
+
+
+def test_same_time_transitions_keep_authoritative_insertion_order(tmp_path):
+    store = QuotaObservationStore(tmp_path / "quota.sqlite3")
+    for balance in (100, 90, 80):
+        assert record(store, used_percent=100 - balance, remaining_percent=balance,
+                      observed_at=10, source="headers", pool_id="account-a")
+    history = store.history("account-a")
+    assert [row.remaining_percent for row in history] == [100, 90, 80]
+    assert [row.id for row in history] == sorted({row.id for row in history})
+    assert store.latest("account-a") == history[-1]
+    assert store.latest_at_or_before("account-a", 10) == history[-1]
+    assert store.observations_around_boundary("account-a", 10).baseline == history[-1]
+
+
+def test_unchanged_confirmation_preserves_original_boundary_evidence(tmp_path):
+    path = tmp_path / "quota.sqlite3"
+    store = QuotaObservationStore(path)
+    assert record(store, observed_at=10, source="api", pool_id="account-a")
+    original = store.latest("account-a")
+    assert not record(store, observed_at=20, confirmed_at=25, source="api", pool_id="account-a")
+    latest = QuotaObservationStore(path).latest("account-a")
+    assert latest.id == original.id
+    assert latest.source_timestamp == original.source_timestamp == 10
+    assert latest.observed_at == original.observed_at == 10
+    assert latest.confirmed_at == 25
+    assert store.latest_at_or_before("account-a", 15) == latest
+    assert len(store.history("account-a")) == 1
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_older_acquisition_cannot_rewrite_confirmed_history(tmp_path, changed):
+    store = QuotaObservationStore(tmp_path / "quota.sqlite3")
+    assert record(store, observed_at=10, confirmed_at=20)
+    original = store.history("account-a")
+    change = {"used_percent": 30, "remaining_percent": 70} if changed else {}
+    with pytest.raises(ValueError, match="out-of-order"):
+        record(store, observed_at=19, **change)
+    assert store.history("account-a") == original
+
+
+def test_new_provenance_does_not_relabel_legacy_or_other_source_rows(tmp_path):
+    store = QuotaObservationStore(tmp_path / "quota.sqlite3")
+    assert record(store, observed_at=10)
+    assert record(store, observed_at=11, source="api", pool_id="account-a")
+    assert record(store, observed_at=12, source="headers", pool_id="account-a")
+    history = store.history("account-a")
+    assert [row.source for row in history] == ["legacy", "api", "headers"]
+    assert [row.pool_id for row in history] == [None, "account-a", "account-a"]
+    assert [row.confirmed_at for row in history] == [10, 11, 12]
+
+
+@pytest.mark.parametrize("changes, reason", [
+    ({"source": "api"}, "matching quota pool"),
+    ({"source": "headers", "pool_id": "other-pool"}, "matching quota pool"),
+    ({"source": "guessed"}, "source must"),
+    ({"pool_id": ""}, "nonempty"),
+    ({"used_percent": 101, "remaining_percent": -1}, "percentages"),
+    ({"used_percent": 20, "remaining_percent": 70}, "sum to 100"),
+    ({"observed_at": float("nan")}, "finite"),
+    ({"reset_at": float("inf")}, "finite"),
+    ({"confirmed_at": 9}, "confirmation cannot precede"),
+])
+def test_invalid_evidence_is_rejected_without_inserting(tmp_path, changes, reason):
+    store = QuotaObservationStore(tmp_path / "quota.sqlite3")
+    values = {"observed_at": 10, **changes}
+    with pytest.raises(ValueError, match=reason):
+        record(store, **values)
+    assert store.history("account-a") == []

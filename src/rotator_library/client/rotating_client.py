@@ -325,6 +325,10 @@ class RotatingClient:
             )
             self._usage_managers[provider] = manager
 
+        # Bind before any background refresh or request can publish quota.
+        if "codex" in self.all_credentials:
+            self._get_provider_instance("codex")
+
         # Initialize executor with new usage managers
         self._executor = RequestExecutor(
             usage_managers=self._usage_managers,
@@ -953,7 +957,11 @@ class RotatingClient:
         if provider not in self._provider_instances:
             plugin_class = self._provider_plugins.get(provider)
             if plugin_class:
-                self._provider_instances[provider] = plugin_class()
+                plugin = plugin_class()
+                if provider == "codex":
+                    plugin.set_quota_observer(self._observe_codex_quota)
+                    plugin.set_usage_manager(self._usage_managers.get(provider))
+                self._provider_instances[provider] = plugin
             else:
                 return None
 
@@ -1232,215 +1240,142 @@ class RotatingClient:
     def _attach_codex_reset_stats(stats: Dict[str, Any], plugin: Any) -> None:
         """Attach cached reset details without any provider network access."""
         total_resets = 0
-        next_auto_redeem_at = None
+        next_expiry_at = None
+        counted_pools = set()
         for credential_stats in stats.get("credentials", {}).values():
             info = plugin.get_reset_credit_info(credential_stats.get("full_path", ""))
             credential_stats["reset_credits"] = info
             if not info:
                 continue
+            snapshot = plugin.get_cached_quota(credential_stats.get("full_path", ""))
+            pool_id = snapshot.quota_pool_id if snapshot else None
+            if pool_id is None or pool_id in counted_pools:
+                continue
+            counted_pools.add(pool_id)
             total_resets += info.get("available_count", 0)
-            candidate = info.get("next_auto_redeem_at")
+            candidate = info.get("next_expiry_at")
             if candidate and (
-                next_auto_redeem_at is None or candidate < next_auto_redeem_at
+                next_expiry_at is None or candidate < next_expiry_at
             ):
-                next_auto_redeem_at = candidate
+                next_expiry_at = candidate
         stats["reset_credits"] = {
             "mode": os.getenv("CODEX_RESET_MODE", "observe"),
             "available_count": total_resets,
-            "next_auto_redeem_at": next_auto_redeem_at,
+            "next_expiry_at": next_expiry_at,
         }
+
+    def _observe_codex_quota(self, snapshot: Any) -> None:
+        """Ingestion owns history. GET only projects already-published evidence."""
+        window = snapshot.weekly_window
+        pool_id = snapshot.quota_pool_id
+        if snapshot.status != "success" or snapshot.weekly_unknown_reason or not pool_id or window is None:
+            return
+        self._quota_observation_store.record(
+            stable_account_id=pool_id, pool_id=pool_id, email=None,
+            used_percent=window.used_percent, remaining_percent=window.remaining_percent,
+            reset_at=window.reset_at, reset_credit_metadata=None,
+            source_timestamp=snapshot.fetched_at, observed_at=snapshot.fetched_at,
+            confirmed_at=snapshot.fetched_at, source=snapshot.source,
+        )
 
     def _attach_codex_quota_forecast(
         self, stats: Dict[str, Any], plugin: Any
     ) -> None:
-        """Persist current weekly state and attach a cached-data forecast."""
+        """Project coherent cached pool snapshots without writing history."""
         now = datetime.now(_system_local_timezone())
-        now_timestamp = now.timestamp()
-        source_timestamps: List[float] = []
         accounts: List[Dict[str, Any]] = []
-
+        source_timestamps: List[float] = []
         try:
+            pools: Dict[str, Dict[str, Any]] = {}
             for credential in stats.get("credentials", {}).values():
-                stable_id = credential.get("stable_id")
-                weekly = (
-                    credential.get("group_usage", {})
-                    .get("weekly-limit", {})
-                    .get("windows", {})
-                    .get("daily", {})
-                )
-                remaining = weekly.get("remaining_percent")
-                used = weekly.get("used_percent")
-                reset_at = weekly.get("reset_at")
+                path = credential.get("full_path", "")
+                snapshot = plugin.get_cached_quota(path)
+                pool_id = snapshot.quota_pool_id if snapshot else None
+                credential["quota_pool_id"] = pool_id
+                credential["quota_source_error"] = plugin.get_quota_error(path)
+                history_error = plugin.get_quota_history_error(path)
+                credential["quota_history_error"] = history_error
+                window = snapshot.weekly_window if snapshot else None
+                reason = snapshot.weekly_unknown_reason if snapshot else "quota_snapshot_unavailable"
                 reset_info = credential.get("reset_credits") or {}
                 credits = reset_info.get("credits") or []
-
-                source_timestamp = self._codex_quota_source_timestamp(
-                    plugin, credential
-                )
-                if source_timestamp is not None:
-                    source_timestamps.append(source_timestamp)
-
+                source_timestamp = snapshot.fetched_at if snapshot else None
                 account = {
-                    "stable_id": stable_id,
+                    "stable_id": pool_id or f"unknown:{credential.get('stable_id', path)}",
                     "email": credential.get("email"),
-                    "remaining_percent": remaining,
-                    "reset_at": reset_at,
+                    "remaining_percent": window.remaining_percent if window and not reason else None,
+                    "reset_at": window.reset_at if window and not reason else None,
+                    "source_timestamp": source_timestamp,
+                    "history_provenance": "trusted_ingestion" if snapshot and not reason and not history_error else "unknown",
+                    "history_error": history_error,
+                    "unknown_reason": reason,
                     "reset_credits": [
-                        {
-                            "id": credit.get("id"),
-                            "auto_redeem_at": credit.get("auto_redeems_at"),
-                            "expires_at": credit.get("expires_at"),
-                        }
-                        for credit in credits
-                        if isinstance(credit, dict)
-                        and credit.get("status", "available") == "available"
+                        {"id": credit.get("id"), "expires_at": credit.get("expires_at"),
+                         "status": credit.get("status"), "reset_type": credit.get("reset_type")}
+                        for credit in credits if isinstance(credit, dict)
+                        and credit.get("status") == "available"
                     ],
+                    "reset_credits_status": reset_info.get("status", "unavailable"),
+                    "reset_credits_stale": reset_info.get("stale", True),
+                    "reset_credits_complete": reset_info.get("details_complete", False),
                 }
-                accounts.append(account)
-
-                if (
-                    stable_id
-                    and isinstance(used, (int, float))
-                    and not isinstance(used, bool)
-                    and isinstance(remaining, (int, float))
-                    and not isinstance(remaining, bool)
-                    and isinstance(reset_at, (int, float))
-                    and not isinstance(reset_at, bool)
-                    and source_timestamp is not None
-                ):
-                    self._quota_observation_store.record(
-                        stable_account_id=str(stable_id),
-                        email=credential.get("email"),
-                        used_percent=used,
-                        remaining_percent=remaining,
-                        reset_at=reset_at,
-                        reset_credit_metadata=account["reset_credits"],
-                        source_timestamp=source_timestamp,
-                        observed_at=source_timestamp,
-                    )
-
-            boundary = now.replace(
-                hour=QUOTA_DAY_START_HOUR, minute=0, second=0, microsecond=0
-            )
+                if pool_id is None:
+                    accounts.append(account)
+                    continue
+                previous = pools.get(pool_id)
+                if previous is None or (source_timestamp or 0) > (previous["source_timestamp"] or 0):
+                    pools[pool_id] = account
+                elif source_timestamp == previous["source_timestamp"] and (
+                    account["remaining_percent"], account["reset_at"]
+                ) != (previous["remaining_percent"], previous["reset_at"]):
+                    previous.update(unknown_reason="conflicting_pool_snapshots", remaining_percent=None, reset_at=None)
+            accounts.extend(pools.values())
+            for account in accounts:
+                if account["source_timestamp"] is not None:
+                    source_timestamps.append(account["source_timestamp"])
+            boundary = now.replace(hour=QUOTA_DAY_START_HOUR, minute=0, second=0, microsecond=0)
             if now < boundary:
                 boundary -= timedelta(days=1)
             observations: List[Dict[str, Any]] = []
-            for account in accounts:
-                stable_id = account.get("stable_id")
-                if not stable_id:
+            for pool_id in pools:
+                if pools[pool_id]["history_provenance"] != "trusted_ingestion":
                     continue
                 around = self._quota_observation_store.observations_around_boundary(
-                    str(stable_id), boundary.timestamp(), end_at=now_timestamp
+                    pool_id, boundary.timestamp(), end_at=now.timestamp(),
                 )
                 for observation in ((around.baseline,) if around.baseline else ()) + around.changes:
-                    observations.append(
-                        self._forecast_observation(str(stable_id), observation)
-                    )
-
-            source_timestamp = min(source_timestamps) if source_timestamps else None
+                    observations.append(self._forecast_observation(pool_id, observation))
             stats["forecast"] = build_codex_quota_forecast(
-                accounts=accounts,
-                observations=observations,
-                now=now,
-                source_timestamp=source_timestamp,
+                accounts=accounts, observations=observations, now=now,
+                source_timestamp=min(source_timestamps) if source_timestamps else None,
             )
         except Exception:
             lib_logger.exception("Failed to build Codex quota forecast")
             source_timestamp = min(source_timestamps) if source_timestamps else None
-            age_seconds = (
-                max(0.0, now_timestamp - source_timestamp)
-                if source_timestamp is not None
-                else None
-            )
-            boundary = now.replace(
-                hour=QUOTA_DAY_START_HOUR, minute=0, second=0, microsecond=0
-            )
-            if now < boundary:
-                boundary -= timedelta(days=1)
-            boundaries = [
-                (boundary + timedelta(days=offset)).replace(
-                    hour=QUOTA_DAY_START_HOUR, minute=0, second=0, microsecond=0
-                )
-                for offset in range(15)
-            ]
-            days = [
-                {
-                    "index": index,
-                    "start_at": boundaries[index].timestamp(),
-                    "end_at": boundaries[index + 1].timestamp(),
-                    "local_date": boundaries[index].date().isoformat(),
-                    "target": 0.0,
-                    "remaining_target": 0.0,
-                    "baseline_allocation": 0.0,
-                    "expiry_bonus": 0.0,
-                    "sustainable_daily_rate": 0.0,
-                    "live_sustainable_remaining": 0.0,
-                    "expected_used_by_now": 0.0,
-                    "contributions": [],
-                    "reset_events": [],
-                }
-                for index in range(14)
-            ]
+            age = max(0.0, now.timestamp() - source_timestamp) if source_timestamp is not None else None
             stats["forecast"] = {
-                "schema_version": 2,
-                "status": "unavailable",
-                "unit": "weekly_quota_percentage_points",
-                "generated_at": now_timestamp,
-                "source_timestamp": source_timestamp,
-                "age_seconds": age_seconds,
-                "stale": age_seconds is None
-                or age_seconds > STALE_AFTER_SECONDS,
-                "timezone": str(now.tzinfo),
-                "quota_day_start_hour": QUOTA_DAY_START_HOUR,
-                "horizon": {
-                    "start_at": boundaries[0].timestamp(),
-                    "end_at": boundaries[7].timestamp(),
-                    "day_count": 7,
-                },
-                "planning_horizon": {
-                    "start_at": boundaries[0].timestamp(),
-                    "end_at": boundaries[14].timestamp(),
-                    "day_count": 14,
-                    "rolling_window_seconds": 7 * 24 * 60 * 60,
-                },
-                "reason": "forecast_composition_failed",
-                "actual": {"status": "unavailable", "used_since_day_start": None},
-                "risk": {
-                    "aggregate_exhaustion": False,
-                    "basis": "forecast_targets",
-                },
-                "today": days[0],
-                "days": days[:7],
-                "planning_days": days,
-                "post_reset": {
-                    "after_at": None,
-                    "day_start_at": None,
-                    "daily_sustainable_pace": None,
-                },
-                "accounts": [],
-                "unknown_accounts": [],
+                "schema_version": 3, "status": "unavailable",
+                "unit": "weekly_quota_percentage_points", "generated_at": now.timestamp(),
+                "source_timestamp": source_timestamp, "age_seconds": age,
+                "stale": age is None or age > STALE_AFTER_SECONDS,
+                "timezone": str(now.tzinfo), "quota_day_start_hour": QUOTA_DAY_START_HOUR,
+                "reason": "forecast_composition_failed", "today": None, "days": [], "planning_days": [],
+                "horizon": None, "planning_horizon": None,
+                "actual": {"status": "unavailable", "estimate": None, "lower_bound": None,
+                           "upper_bound": None, "reason": "forecast_composition_failed", "assumptions": []},
+                "risk": {"aggregate_exhaustion": None, "basis": "weekly_natural_resets"},
+                "accounts": [], "unknown_accounts": [], "assumptions": [],
+                "credit_scenarios": [], "credit_scenarios_reason": "forecast_composition_failed",
             }
 
     @staticmethod
-    def _codex_quota_source_timestamp(
-        plugin: Any, credential: Dict[str, Any]
-    ) -> Optional[float]:
-        if hasattr(plugin, "get_cached_quota"):
-            snapshot = plugin.get_cached_quota(credential.get("full_path", ""))
-            fetched_at = getattr(snapshot, "fetched_at", None)
-            if isinstance(fetched_at, (int, float)) and not isinstance(fetched_at, bool):
-                return float(fetched_at)
-        return None
-
-    @staticmethod
-    def _forecast_observation(
-        stable_id: str, observation: CodexWeeklyObservation
-    ) -> Dict[str, Any]:
+    def _forecast_observation(stable_id: str, observation: CodexWeeklyObservation) -> Dict[str, Any]:
         return {
-            "stable_id": stable_id,
-            "observed_at": observation.source_timestamp,
-            "remaining_percent": observation.remaining_percent,
-            "reset_at": observation.reset_at,
+            "stable_id": stable_id, "id": observation.id,
+            "observed_at": observation.observed_at, "source_timestamp": observation.source_timestamp,
+            "remaining_percent": observation.remaining_percent, "reset_at": observation.reset_at,
+            "source": observation.source, "pool_id": observation.pool_id,
+            "confirmed_at": observation.confirmed_at,
         }
 
     async def redeem_codex_reset_credit(

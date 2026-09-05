@@ -289,22 +289,22 @@ def test_external_quota_reset_is_honored_from_current_snapshot():
     assert strategy.select(context("reset_account", "deadline_account"), states) == "deadline_account"
 
 
-def test_imminent_credit_auto_redemption_prioritizes_capacity_drain():
+def test_imminent_credit_expiry_prioritizes_capacity_drain():
     now = time.time()
     states = {
         "normal": credential("normal", remaining=60, reset_at=now + 3 * 86400),
-        "auto_redeem": credential(
-            "auto_redeem", remaining=25, reset_at=now + 6 * 86400
+        "expiring_credit": credential(
+            "expiring_credit", remaining=25, reset_at=now + 6 * 86400
         ),
     }
-    states["auto_redeem"].reset_credit_count = 1
-    states["auto_redeem"].reset_auto_redeem_at = now + 30 * 3600
+    states["expiring_credit"].reset_credit_count = 1
+    states["expiring_credit"].reset_credit_expiry_at = now + 30 * 3600
 
     selected = SequentialStrategy().select(
-        context("normal", "auto_redeem"), states
+        context("normal", "expiring_credit"), states
     )
 
-    assert selected == "auto_redeem"
+    assert selected == "expiring_credit"
 
 
 def test_missing_weekly_quota_preserves_sequential_priority_order():
