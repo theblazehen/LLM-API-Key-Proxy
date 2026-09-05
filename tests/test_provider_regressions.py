@@ -877,6 +877,12 @@ def test_completion_context_uses_concrete_model_resolved_from_alias():
     assert resolver.resolve_model_id("alias/glm", "ollama_cloud") == "ollama_cloud/glm-5.2"
 
 
+def test_gpt_alias_routes_only_to_astra_low():
+    resolver = ModelResolver(provider_plugins={})
+
+    assert resolver.resolve_model_chain("alias/gpt") == ["codex/gpt-6-astra:low"]
+
+
 def test_reviewer_alias_exposes_and_selects_both_review_models(monkeypatch):
     resolver = ModelResolver(provider_plugins={})
     selections = iter(["alias/gemma-reviewer", "alias/deepseek-flash"])
