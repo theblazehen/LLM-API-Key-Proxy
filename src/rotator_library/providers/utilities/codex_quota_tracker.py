@@ -373,12 +373,15 @@ def parse_rate_limit_headers(headers: Dict[str, str]) -> CodexQuotaSnapshot:
     credits = _parse_credits_from_headers(headers)
 
     malformed = False
+    has_inactive_window = False
     for used_key, minutes_key, reset_key, window in (
         (HEADER_PRIMARY_USED_PERCENT, HEADER_PRIMARY_WINDOW_MINUTES, HEADER_PRIMARY_RESET_AT, primary),
         (HEADER_SECONDARY_USED_PERCENT, HEADER_SECONDARY_WINDOW_MINUTES, HEADER_SECONDARY_RESET_AT, secondary),
     ):
         present = any(key in headers for key in (used_key, minutes_key, reset_key))
-        if present and (window is None or window.window_minutes is None or window.window_minutes <= 0 or window.reset_at is None):
+        inactive = _inactive_header_window(headers, used_key, minutes_key, reset_key)
+        has_inactive_window = has_inactive_window or inactive
+        if present and not inactive and (window is None or window.window_minutes is None or window.window_minutes <= 0 or window.reset_at is None):
             malformed = True
 
     return CodexQuotaSnapshot(
@@ -389,7 +392,7 @@ def parse_rate_limit_headers(headers: Dict[str, str]) -> CodexQuotaSnapshot:
         secondary=secondary,
         credits=credits,
         fetched_at=time.time(),
-        status="error" if malformed else ("success" if (primary or secondary or credits) else "no_data"),
+        status="error" if malformed else ("success" if (primary or secondary or credits or has_inactive_window) else "no_data"),
         error="invalid_quota_headers" if malformed else None,
         families=parse_all_rate_limit_families(headers),
     )
@@ -445,6 +448,23 @@ def parse_all_rate_limit_families(
     return families
 
 
+def _inactive_header_window(
+    headers: Dict[str, str], used_key: str, minutes_key: str, reset_key: str,
+) -> bool:
+    """Recognize the provider's explicit disabled-window sentinel, not missing data."""
+    if used_key not in headers or minutes_key not in headers:
+        return False
+    if headers.get(reset_key) not in (None, ""):
+        return False
+    try:
+        if float(headers[used_key]) != 0 or float(headers[minutes_key]) != 0:
+            return False
+        after_key = reset_key.removesuffix("-reset-at") + "-reset-after-seconds"
+        return after_key not in headers or float(headers[after_key]) == 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _parse_window_from_headers(
     headers: Dict[str, str],
     used_percent_header: str,
@@ -452,6 +472,8 @@ def _parse_window_from_headers(
     reset_at_header: str,
 ) -> Optional[RateLimitWindow]:
     """Parse a single rate limit window from headers."""
+    if _inactive_header_window(headers, used_percent_header, window_minutes_header, reset_at_header):
+        return None
     used_percent_str = headers.get(used_percent_header)
     if not used_percent_str:
         return None

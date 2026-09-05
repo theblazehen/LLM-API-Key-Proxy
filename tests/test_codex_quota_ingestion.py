@@ -216,6 +216,90 @@ async def test_explicitly_absent_window_can_remove_prior_routing_constraint(http
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("include_empty_reset", [True, False], ids=["empty-reset", "missing-reset"])
+async def test_real_headers_with_explicit_inactive_secondary_are_ingested(include_empty_reset):
+    tracker = Tracker()
+    real_headers = {
+        "x-codex-primary-used-percent": "37",
+        "x-codex-primary-window-minutes": "10080",
+        "x-codex-primary-reset-at": "1788019973",
+        "x-codex-secondary-used-percent": "0",
+        "x-codex-secondary-window-minutes": "0",
+        "x-codex-secondary-reset-after-seconds": "0",
+    }
+    if include_empty_reset:
+        real_headers["x-codex-secondary-reset-at"] = ""
+    real_headers.update({key.replace("x-codex-", "x-extra-"): value
+                         for key, value in list(real_headers.items())})
+
+    snapshot = tracker.update_quota_from_headers("a", real_headers)
+    await asyncio.gather(*tuple(tracker._quota_push_tasks))
+
+    assert snapshot.status == "success"
+    assert snapshot.primary.remaining_percent == 63
+    assert snapshot.secondary is None
+    assert snapshot.weekly_window is snapshot.primary
+    assert snapshot.families["codex"][1] is None
+    assert snapshot.families["extra"][1] is None
+    assert tracker.get_cached_quota("a") is snapshot
+    assert tracker.observations == [snapshot]
+    assert tracker.get_quota_error("a") is None
+    assert tracker.manager.windows[("a", "weekly-limit")]["quota_remaining_percent"] == 63
+    assert ("a", "5h-limit") not in tracker.manager.windows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_secondary", [
+    {"used-percent": "1", "window-minutes": "0", "reset-at": ""},
+    {"used-percent": "0", "window-minutes": "0", "reset-at": str(OLD_RESET)},
+    {"used-percent": "0", "window-minutes": "0", "reset-at": "not-a-time"},
+    {"used-percent": "0", "window-minutes": "0", "reset-at": "", "reset-after-seconds": "1"},
+    {"window-minutes": "0", "reset-at": ""},
+    {"used-percent": "0", "window-minutes": "300", "reset-at": ""},
+])
+async def test_inactive_secondary_sentinel_does_not_accept_malformed_windows(http_queue, invalid_secondary):
+    tracker = Tracker()
+    http_queue.append((payload(100, OLD_RESET), None, None))
+    exhausted = await tracker.fetch_quota_from_api("a")
+    state = deepcopy(tracker.manager.windows)
+    candidate = {
+        "x-codex-primary-used-percent": "37",
+        "x-codex-primary-window-minutes": "10080",
+        "x-codex-primary-reset-at": str(NEW_RESET),
+        **{f"x-codex-secondary-{key}": value for key, value in invalid_secondary.items()},
+    }
+
+    assert tracker.update_quota_from_headers("a", candidate) is None
+    assert tracker.get_cached_quota("a") is exhausted
+    assert tracker.observations == [exhausted]
+    assert tracker.manager.windows == state
+    assert ("a", "weekly-limit") in tracker.manager.cooldowns
+    assert tracker.get_quota_error("a") == "invalid_quota_headers"
+
+
+@pytest.mark.asyncio
+async def test_explicit_inactive_only_headers_remove_a_disabled_constraint(http_queue):
+    tracker = Tracker()
+    http_queue.append((payload(100, OLD_RESET), None, None))
+    await tracker.fetch_quota_from_api("a")
+
+    disabled = tracker.update_quota_from_headers("a", {
+        "x-codex-secondary-used-percent": "0",
+        "x-codex-secondary-window-minutes": "0",
+        "x-codex-secondary-reset-at": "",
+    })
+    await asyncio.gather(*tuple(tracker._quota_push_tasks))
+
+    assert disabled.status == "success"
+    assert disabled.secondary is None
+    assert disabled.weekly_window is None
+    assert tracker.get_cached_quota("a") is disabled
+    assert tracker.observations[-1] is disabled
+    assert ("a", "weekly-limit") not in tracker.manager.windows
+    assert ("a", "weekly-limit") not in tracker.manager.cooldowns
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["api", "headers"])
 async def test_observer_failure_cannot_abort_success_or_skip_routing_reconciliation(http_queue, source):
     tracker = Tracker()
