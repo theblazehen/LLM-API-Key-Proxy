@@ -1774,6 +1774,35 @@ async def setup_new_credential(provider_name: str):
             else:
                 # OAuth authentication
                 result = await auth_instance.setup_credential(_get_oauth_base_dir())
+        elif provider_name == "codex":
+            console.print(
+                Panel(
+                    Text.from_markup(
+                        "[bold]Choose authentication method:[/bold]\n\n"
+                        "  [cyan]1.[/cyan] Device Code [green](Recommended)[/green]\n"
+                        "     Enter one-time code at https://auth.openai.com/codex/device\n"
+                        "     Works anywhere (SSH, remote, headless, or local)\n\n"
+                        "  [cyan]2.[/cyan] Browser OAuth\n"
+                        "     Opens browser and listens for callback on local port 1455"
+                    ),
+                    title="[bold blue]OpenAI Codex Authentication Method[/bold blue]",
+                    border_style="blue",
+                )
+            )
+
+            auth_choice = Prompt.ask(
+                "[bold]Select method[/bold] (or 'b' to go back)",
+                choices=["1", "2", "b"],
+                default="1",
+            )
+
+            if auth_choice.lower() == "b":
+                return
+
+            login_method = "device" if auth_choice == "1" else "browser"
+            result = await auth_instance.setup_credential(
+                _get_oauth_base_dir(), login_method=login_method
+            )
         else:
             # Other providers - use OAuth
             result = await auth_instance.setup_credential(_get_oauth_base_dir())

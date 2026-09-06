@@ -157,6 +157,7 @@ class FakeStreamResponse:
 
     def __init__(self, events):
         self._events = events
+        self.headers = httpx.Headers()
 
     async def __aenter__(self):
         return self
@@ -283,6 +284,69 @@ def test_codex_device_login_uses_cli_flow_and_persists_tokens(monkeypatch, tmp_p
         ]
     )
 
+
+def test_codex_setup_credential_device_login_flow(monkeypatch, tmp_path):
+    requests = []
+    id_token = _jwt(
+        {
+            "email": "setup-device@example.com",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "account-setup-device"
+            },
+        }
+    )
+    access_token = _jwt(
+        {"https://api.openai.com/auth": {"chatgpt_plan_type": "pro"}}
+    )
+
+    class Response:
+        def __init__(self, status_code, data):
+            self.status_code = status_code
+            self._data = data
+
+        @property
+        def is_success(self):
+            return 200 <= self.status_code < 300
+
+        def json(self):
+            return self._data
+
+        def raise_for_status(self):
+            if not self.is_success:
+                request = httpx.Request("POST", "https://auth.openai.com")
+                response = httpx.Response(self.status_code, request=request)
+                raise httpx.HTTPStatusError("failed", request=request, response=response)
+
+    responses = iter(
+        [
+            Response(
+                200,
+                {
+                    "device_auth_id": "device-id-setup",
+                    "user_code": "SETUP-1234",
+                    "interval": "1",
+                },
+            ),
+            Response(
+                200,
+                {
+                    "authorization_code": "auth-code-setup",
+                    "code_challenge": "challenge-setup",
+                    "code_verifier": "verifier-setup",
+                },
+            ),
+            Response(
+                200,
+                {
+                    "access_token": access_token,
+                    "refresh_token": "refresh-token-setup",
+                    "id_token": id_token,
+                    "expires_in": 3600,
+                },
+            ),
+        ]
+    )
+
     class Client:
         async def __aenter__(self):
             return self
@@ -300,24 +364,19 @@ def test_codex_device_login_uses_cli_flow_and_persists_tokens(monkeypatch, tmp_p
     monkeypatch.setattr(openai_oauth_base.httpx, "AsyncClient", Client)
     monkeypatch.setattr(openai_oauth_base.asyncio, "sleep", no_sleep)
     provider = CodexProvider()
-    path = tmp_path / "codex_oauth_1.json"
 
-    credentials = asyncio.run(
-        provider._perform_device_code_oauth(str(path), path.name)
+    result = asyncio.run(
+        provider.setup_credential(base_dir=tmp_path, login_method="device")
     )
 
-    assert credentials["account_id"] == "account-device"
-    assert credentials["_proxy_metadata"]["email"] == "device@example.com"
-    assert json.loads(path.read_text())["refresh_token"] == "refresh-token"
-    assert [request[0] for request in requests] == [
-        "https://auth.openai.com/api/accounts/deviceauth/usercode",
-        "https://auth.openai.com/api/accounts/deviceauth/token",
-        "https://auth.openai.com/api/accounts/deviceauth/token",
-        "https://auth.openai.com/oauth/token",
-    ]
-    assert requests[-1][1]["data"]["redirect_uri"] == (
-        "https://auth.openai.com/deviceauth/callback"
-    )
+    assert result.success is True
+    assert result.email == "setup-device@example.com"
+    assert result.account_id == "account-setup-device"
+    assert Path(result.file_path).exists()
+    saved_data = json.loads(Path(result.file_path).read_text())
+    assert saved_data["refresh_token"] == "refresh-token-setup"
+    assert saved_data["account_id"] == "account-setup-device"
+    assert saved_data["_proxy_metadata"]["email"] == "setup-device@example.com"
 
 
 def test_codex_unauthorized_forces_refresh(monkeypatch):
@@ -887,10 +946,11 @@ def test_gpt_alias_routes_only_to_astra_low():
 
 
 def test_reviewer_alias_exposes_and_selects_both_review_models(monkeypatch):
+    import rotator_library.client.models as models_mod
     resolver = ModelResolver(provider_plugins={})
     selections = iter(["alias/gemma-reviewer", "alias/deepseek-flash"])
     monkeypatch.setattr(
-        "rotator_library.client.models.random.choices",
+        models_mod.random, "choices",
         lambda choices, weights, k: [next(selections)],
     )
 

@@ -179,6 +179,8 @@ class OpenAIOAuthBase:
     @property
     def oauth_login_method(self) -> str:
         """Select browser or device-code login for interactive authentication."""
+        if self._oauth_login_method_override:
+            return self._oauth_login_method_override
         value = os.getenv(f"{self.ENV_PREFIX}_OAUTH_LOGIN_METHOD", "auto").strip().lower()
         if value not in {"auto", "browser", "device"}:
             lib_logger.warning(
@@ -209,6 +211,7 @@ class OpenAIOAuthBase:
 
     def __init__(self):
         self._credentials_cache: Dict[str, Dict[str, Any]] = {}
+        self._oauth_login_method_override: Optional[str] = None
         self._refresh_locks: Dict[str, asyncio.Lock] = {}
         self._locks_lock = asyncio.Lock()
 
@@ -716,7 +719,7 @@ class OpenAIOAuthBase:
                         self._unavailable_credentials.pop(path, None)
 
     async def _perform_interactive_oauth(
-        self, path: str, creds: Dict[str, Any], display_name: str
+        self, path: Optional[str], creds: Dict[str, Any], display_name: str
     ) -> Dict[str, Any]:
         """
         Perform interactive OAuth flow (browser-based authentication).
@@ -921,7 +924,7 @@ class OpenAIOAuthBase:
             return new_creds
 
     async def _perform_device_code_oauth(
-        self, path: str, display_name: str
+        self, path: Optional[str], display_name: str
     ) -> Dict[str, Any]:
         """Authenticate with the device-code flow used by the Codex CLI."""
         issuer = OPENAI_ISSUER_URL.rstrip("/")
@@ -964,21 +967,25 @@ class OpenAIOAuthBase:
 
             deadline = time.monotonic() + 15 * 60
             code_data: Optional[Dict[str, Any]] = None
-            while time.monotonic() < deadline:
-                poll = await client.post(
-                    f"{accounts_url}/deviceauth/token",
-                    json={
-                        "device_auth_id": device_auth_id,
-                        "user_code": user_code,
-                    },
-                    timeout=30.0,
-                )
-                if poll.is_success:
-                    code_data = poll.json()
-                    break
-                if poll.status_code not in (403, 404):
-                    poll.raise_for_status()
-                await asyncio.sleep(min(interval, max(0, deadline - time.monotonic())))
+            with console.status(
+                "[bold green]Waiting for you to complete authentication in the browser...[/bold green]",
+                spinner="dots",
+            ):
+                while time.monotonic() < deadline:
+                    poll = await client.post(
+                        f"{accounts_url}/deviceauth/token",
+                        json={
+                            "device_auth_id": device_auth_id,
+                            "user_code": user_code,
+                        },
+                        timeout=30.0,
+                    )
+                    if poll.is_success:
+                        code_data = poll.json()
+                        break
+                    if poll.status_code not in (403, 404):
+                        poll.raise_for_status()
+                    await asyncio.sleep(min(interval, max(0, deadline - time.monotonic())))
 
             if code_data is None:
                 raise TimeoutError("Device-code authentication timed out after 15 minutes")
@@ -1139,8 +1146,6 @@ class OpenAIOAuthBase:
                 coordinator = get_reauth_coordinator()
 
                 async def _do_interactive_oauth():
-                    if path is None:
-                        raise ValueError("Interactive OAuth requires a credential path")
                     return await self._perform_interactive_oauth(
                         path, creds, display_name
                     )
@@ -1280,13 +1285,18 @@ class OpenAIOAuthBase:
         return base_dir / filename
 
     async def setup_credential(
-        self, base_dir: Optional[Path] = None
+        self,
+        base_dir: Optional[Path] = None,
+        login_method: Optional[str] = None,
     ) -> CredentialSetupResult:
         """Complete credential setup flow: OAuth -> save -> discovery."""
         if base_dir is None:
             base_dir = self._get_oauth_base_dir()
 
         base_dir.mkdir(exist_ok=True)
+
+        if login_method:
+            self._oauth_login_method_override = login_method
 
         try:
             temp_creds = {
