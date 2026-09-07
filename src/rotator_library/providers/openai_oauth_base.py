@@ -399,9 +399,10 @@ class OpenAIOAuthBase:
         return expiry_timestamp < time.time()
 
     async def _refresh_token(
-        self, path: str, creds: Dict[str, Any], force: bool = False
+        self, path: str, creds: Dict[str, Any], force: bool = False,
+        *, allow_reauth: bool = True,
     ) -> Dict[str, Any]:
-        """Refresh access token using refresh token."""
+        """Refresh access token; optionally forbid queued interactive recovery."""
         async with await self._get_lock(path):
             if not force and not self._is_token_expired(
                 self._credentials_cache.get(path, creds)
@@ -443,6 +444,15 @@ class OpenAIOAuthBase:
                         last_error = e
                         status_code = e.response.status_code
                         error_body = e.response.text
+
+                        if not allow_reauth and (
+                            status_code in (401, 403)
+                            or (status_code == 400 and "invalid_grant" in error_body.lower())
+                        ):
+                            raise CredentialNeedsReauthError(
+                                credential_path=path,
+                                message="OAuth refresh rejected; interactive recovery is disabled.",
+                            ) from None
 
                         if status_code == 400 and "invalid_grant" in error_body.lower():
                             lib_logger.info(

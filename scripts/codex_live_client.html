@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex Live — manual gateway client</title>
+<style>
+:root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; }
+body { max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+h1 { font-size: 1.6rem; }
+fieldset { margin: 1rem 0; border: 1px solid #888; border-radius: 5px; }
+label { display: block; margin: .6rem 0; }
+input:not([type=checkbox]), textarea, select { box-sizing: border-box; width: 100%; padding: .45rem; font: inherit; }
+textarea { min-height: 5rem; }
+button { padding: .5rem 1rem; margin: .3rem .4rem .3rem 0; font: inherit; }
+.note { font-size: .9rem; }
+#status { font-weight: 600; }
+#log { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 30rem; overflow: auto; border: 1px solid #888; padding: .75rem; font: .85rem/1.5 monospace; }
+audio { width: 100%; }
+</style>
+</head>
+<body>
+<h1>Codex Live: manual gateway client</h1>
+<p>Experimental, source-derived protocol. Audio uses native WebRTC directly with OpenAI; the proxy WebSocket carries JSON events, not PCM audio. Only a proxy API key is needed here, never an upstream OAuth credential.</p>
+<p class="note">Reference sources: OMP <code>6d3bc569d16cd7351073eaa767caed51021befbb</code> and Codex <code>d30f9cc72a25d4f3d59f50a7766b6b032e3c7329</code>. This page does not execute an agent or tools. Human-entered context is a manual delegation test, not proof of backend agent execution.</p>
+<p class="note">Serve this page over HTTPS or localhost for microphone access. Prefer serving from the proxy origin. Cross-origin use requires the proxy to permit this origin, Authorization/Content-Type, POST/DELETE, and expose Location, Link, and X-Live-WebSocket-Token response headers. Keys stay in page memory only. Closing this page is not a substitute for Stop.</p>
+<fieldset id="settings">
+<legend>Connection</legend>
+<label>Proxy base URL (origin or deployment prefix, without /v1)<input id="base" type="url" placeholder="https://proxy.example.com" autocomplete="off" spellcheck="false"></label>
+<label>Proxy API key<input id="key" type="password" autocomplete="off" spellcheck="false"></label>
+<label>Instructions<textarea id="instructions">Be concise. Delegate tasks to the client when needed.</textarea></label>
+<label>Voice (free-form upstream voice identifier)<input id="voice" value="sol" autocomplete="off"></label>
+<p class="note">Codex live voices: arbor, breeze, cove, ember, juniper, maple, sol, spruce, vale. This mode does not use standard Realtime voices such as marin; an incompatible voice can return a misleading 403 “Voice session access denied.”</p>
+</fieldset>
+<button id="start" type="button">Start microphone call</button>
+<button id="stop" type="button" disabled>Stop and delete call</button>
+<label><input id="mute" type="checkbox" disabled> Mute microphone</label>
+<p id="status" role="status" aria-live="polite">Idle</p>
+<audio id="audio" autoplay controls></audio>
+<p class="note">If autoplay is blocked, press Play above. A disconnected sideband ends the call: create a new call rather than reconnecting.</p>
+<fieldset id="context" disabled>
+<legend>Manual context injection</legend>
+<label>Target<select id="target"><option value="session">Session</option><option value="delegation">Delegation</option></select></label>
+<label>Delegation item ID (received IDs appear in suggestions and the event log)<input id="delegation" list="delegation-ids" autocomplete="off" spellcheck="false"><datalist id="delegation-ids"></datalist></label>
+<label>Channel<select id="channel"><option value="speakable">speakable</option><option value="commentary">commentary</option></select></label>
+<label>Context text<textarea id="text" placeholder="Enter human-provided context; this does not run an agent."></textarea></label>
+<button id="send" type="button">Send context</button>
+<p class="note">Sent as session.context.append or delegation.context.append, with input_text content. Text is split at Unicode codepoint boundaries into chunks of at most 500 UTF-8 bytes.</p>
+</fieldset>
+<h2>Transcript and raw events</h2>
+<button id="clear" type="button">Clear log</button>
+<pre id="log" role="log" aria-label="Live event log"></pre>
+<script>
+'use strict';
+const el = id => document.getElementById(id);
+let active = null;
+const encoder = new TextEncoder();
+function log(label, value = '') {
+  // Never interpret server or user content as HTML; redact our credentials even in errors.
+  let text = typeof value === 'string' ? value : JSON.stringify(value);
+  for (const secret of [el('key').value, active?.key, active?.ticket]) {
+    if (secret) text = text.split(secret).join('[redacted]');
+  }
+  const line = document.createElement('span');
+  line.textContent = `${new Date().toLocaleTimeString()} ${label} ${text}\n`;
+  el('log').append(line);
+  while (el('log').childNodes.length > 300) el('log').firstChild.remove();
+  el('log').scrollTop = el('log').scrollHeight;
+}
+function status(text) { el('status').textContent = text; }
+function assertRunning(c) { if (c.stopped) throw new Error('Call stopped by user.'); }
+function waitFor(c, target, event, ready, timeout, description) {
+  if (ready()) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const finish = error => {
+      clearTimeout(timer);
+      target.removeEventListener(event, check);
+      c.cancel.signal.removeEventListener('abort', abort);
+      error ? reject(error) : resolve();
+    };
+    const check = () => { if (ready()) finish(); };
+    const abort = () => finish(new Error('Call stopped.'));
+    const timer = setTimeout(() => finish(new Error(`${description} timed out.`)), timeout);
+    target.addEventListener(event, check);
+    c.cancel.signal.addEventListener('abort', abort, {once: true});
+    if (c.cancel.signal.aborted) abort();
+    else check();
+  });
+}
+function stopLocal(c) {
+  if (c.ws?.readyState === WebSocket.OPEN) {
+    try { c.ws.send(JSON.stringify({type: 'session.close'})); }
+    catch (error) { log('Close event error:', error.message); }
+  }
+  c.ws?.close();
+  c.dc?.close();
+  for (const track of c.stream?.getTracks() || []) track.stop();
+  c.pc?.close();
+  el('audio').srcObject = null;
+}
+async function cleanup(c) {
+  if (c.cleanup) return c.cleanup;
+  c.cleanup = (async () => {
+    c.stopped = true;
+    c.cancel.abort();
+    stopLocal(c);
+    if (c.location) {
+      try {
+        const response = await fetch(c.location, {
+          method: 'DELETE', headers: {Authorization: `Bearer ${c.key}`},
+          signal: AbortSignal.timeout(20000), credentials: 'omit', redirect: 'error'
+        });
+        const body = await response.text();
+        log(`DELETE ${response.status}`, body);
+        if (response.status === 404) log('Cleanup:', 'Call already closed/removed.');
+        else if (!response.ok) throw new Error(`Call deletion returned HTTP ${response.status}.`);
+      } catch (error) {
+        c.failed = true;
+        log('Cleanup error (remote deletion unconfirmed):', error.message);
+      }
+    }
+    if (active === c) {
+      active = null;
+      el('settings').disabled = false;
+      el('start').disabled = false;
+      el('stop').disabled = true;
+      el('mute').disabled = true;
+      el('mute').checked = false;
+      el('context').disabled = true;
+      status(c.failed ? 'Stopped with errors — see log.' : 'Stopped');
+    }
+    c.key = ''; c.ticket = '';
+  })();
+  return c.cleanup;
+}
+async function stop() {
+  const c = active;
+  if (!c) return;
+  c.stopped = true;
+  status('Stopping; finishing any pending signaling request before deletion…');
+  el('stop').disabled = true;
+  el('context').disabled = true;
+  c.cancel.abort();
+  stopLocal(c);
+  await c.done;
+  await cleanup(c);
+}
+function sameOriginURL(value, base) {
+  const url = new URL(value, base);
+  if (url.origin !== base.origin || url.username || url.password) {
+    throw new Error('Refusing cross-origin or credential-bearing call/sideband URL.');
+  }
+  return url;
+}
+function receiveEvent(c, event, source) {
+  try {
+    const message = JSON.parse(event.data);
+    log(`${source} event:`, message);
+    if (message.type === 'delegation.created' && message.item?.id) {
+      const id = String(message.item.id);
+      if (!c.ids.has(id)) {
+        c.ids.add(id);
+        const option = document.createElement('option');
+        option.value = id;
+        el('delegation-ids').append(option);
+      }
+      el('delegation').value = id;
+      log('Manual delegation available:', id);
+    }
+    if (message.type === 'error' || message.type?.endsWith('.error')) {
+      status('Upstream error event — see log.');
+    }
+  } catch (error) { log(`${source} non-JSON event:`, event.data); }
+}
+async function setup(c) {
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone API unavailable: use HTTPS or localhost.');
+    status('Waiting for microphone permission…');
+    c.stream = await navigator.mediaDevices.getUserMedia({audio: true});
+    assertRunning(c);
+    c.pc = new RTCPeerConnection();
+    c.pc.ontrack = event => {
+      el('audio').srcObject = event.streams[0] || new MediaStream([event.track]);
+      el('audio').play().catch(error => log('Audio playback blocked; press Play:', error.message));
+    };
+    c.pc.onconnectionstatechange = () => {
+      log('WebRTC:', c.pc.connectionState);
+      if (c.pc.connectionState === 'failed' && !c.stopped) {
+        c.failed = true;
+        void stop();
+      }
+    };
+    for (const track of c.stream.getTracks()) c.pc.addTrack(track, c.stream);
+    // Match the pinned native peer: negotiate oai-events in the initial SDP.
+    c.dc = c.pc.createDataChannel('oai-events');
+    c.dc.onmessage = event => receiveEvent(c, event, 'WebRTC');
+    c.dc.onerror = event => {
+      log('WebRTC data channel error:', event.error?.message || 'Data channel failed.');
+      if (!c.stopped) { c.failed = true; void stop(); }
+    };
+    c.dc.onclose = () => {
+      log('WebRTC data channel:', 'closed');
+      if (!c.stopped) { c.failed = true; void stop(); }
+    };
+    status('Gathering ICE candidates…');
+    await c.pc.setLocalDescription(await c.pc.createOffer());
+    await waitFor(c, c.pc, 'icegatheringstatechange', () => c.pc.iceGatheringState === 'complete', 30000, 'ICE gathering');
+    assertRunning(c);
+    status('Creating proxy call…');
+    // Do not cancel an in-flight POST on Stop: retain its Location so we can DELETE it.
+    const response = await fetch(c.endpoint, {
+      method: 'POST', credentials: 'omit', redirect: 'error',
+      signal: AbortSignal.timeout(75000),
+      headers: {Authorization: `Bearer ${c.key}`, 'Content-Type': 'application/json'},
+      body: JSON.stringify({sdp: c.pc.localDescription.sdp, session: {
+        model: 'gpt-live-1-codex', instructions: el('instructions').value,
+        audio: {output: {voice: el('voice').value}},
+        delegation: {type: 'client'}
+      }})
+    });
+    const location = response.headers.get('Location');
+    if (location) c.location = sameOriginURL(location, c.endpoint);
+    c.ticket = response.headers.get('X-Live-WebSocket-Token') || '';
+    const body = await response.text();
+    log(`POST ${response.status}`, response.ok ? 'Received SDP answer.' : body);
+    if (!response.ok) throw new Error(`Call creation returned HTTP ${response.status}.`);
+    if (!c.location) throw new Error('Missing/excluded Location header; remote cleanup cannot be confirmed.');
+    assertRunning(c);
+    const link = response.headers.get('Link') || '';
+    const match = link.match(/<([^>]+)>\s*;\s*rel\s*=\s*(?:"live-sideband"|live-sideband)(?:\s*(?:,|;|$))/i);
+    if (!match || !c.ticket) throw new Error('Missing/excluded live-sideband Link or X-Live-WebSocket-Token header.');
+    const sideband = sameOriginURL(match[1], c.endpoint);
+    sideband.protocol = sideband.protocol === 'https:' ? 'wss:' : 'ws:';
+    await c.pc.setRemoteDescription({type: 'answer', sdp: body});
+    assertRunning(c);
+    status('Waiting for WebRTC data channel…');
+    await waitFor(c, c.dc, 'open', () => c.dc.readyState === 'open', 20000, 'WebRTC data channel');
+    assertRunning(c);
+    log('WebRTC data channel:', 'oai-events open');
+    status('Connecting live sideband…');
+    c.ws = new WebSocket(sideband, ['codex-live', `proxy-ticket.${c.ticket}`]);
+    c.ws.onmessage = event => receiveEvent(c, event, 'Sideband');
+    c.ws.onerror = () => {
+      log('WebSocket error:', 'Browser hides handshake response bodies; inspect proxy logs/network panel.');
+      c.failed = true;
+      void stop();
+    };
+    c.ws.onclose = event => {
+      log('WebSocket closed:', {code: event.code, reason: event.reason, clean: event.wasClean});
+      if (!c.stopped) { c.failed = true; void stop(); }
+    };
+    await waitFor(c, c.ws, 'open', () => c.ws.readyState === WebSocket.OPEN, 20000, 'Sideband connection');
+    assertRunning(c);
+    el('context').disabled = false;
+    el('mute').disabled = false;
+    status('Call active — sideband connected; see WebRTC state in log.');
+  } catch (error) {
+    if (!c.stopped) c.failed = true;
+    log('Setup:', error.message);
+    c.stopped = true;
+  }
+}
+el('start').onclick = () => {
+  if (active) return;
+  try {
+    const base = new URL(el('base').value);
+    if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.search || base.hash) {
+      throw new Error('Use an HTTP(S) proxy base URL without credentials, query, or fragment.');
+    }
+    if (!el('key').value.trim()) throw new Error('Enter a proxy API key.');
+    const c = {key: el('key').value.trim(), endpoint: new URL(base.href.replace(/\/$/, '') + '/v1/codex/realtime/calls'),
+      cancel: new AbortController(), stopped: false, failed: false, ids: new Set()};
+    active = c;
+    el('settings').disabled = true;
+    el('start').disabled = true;
+    el('stop').disabled = false;
+    el('delegation-ids').replaceChildren();
+    el('delegation').value = '';
+    c.done = setup(c);
+    c.done.then(() => { if (c.stopped) return cleanup(c); });
+  } catch (error) { status('Cannot start — see log.'); log('Input error:', error.message); }
+};
+el('stop').onclick = () => void stop();
+el('mute').onchange = () => {
+  for (const track of active?.stream?.getAudioTracks() || []) track.enabled = !el('mute').checked;
+  log('Microphone:', el('mute').checked ? 'muted' : 'unmuted');
+};
+function utf8Chunks(text) {
+  const chunks = [];
+  let chunk = '', bytes = 0;
+  for (const codepoint of text) {
+    const size = encoder.encode(codepoint).length;
+    if (bytes + size > 500) { chunks.push(chunk); chunk = ''; bytes = 0; }
+    chunk += codepoint; bytes += size;
+  }
+  if (chunk) chunks.push(chunk);
+  return chunks;
+}
+el('send').onclick = () => {
+  try {
+    const c = active;
+    if (!c || c.stopped || c.ws?.readyState !== WebSocket.OPEN) throw new Error('No connected sideband.');
+    const delegated = el('target').value === 'delegation';
+    const id = el('delegation').value.trim();
+    if (delegated && !id) throw new Error('Select or enter a delegation item ID.');
+    const chunks = utf8Chunks(el('text').value);
+    if (!chunks.length) throw new Error('Enter context text.');
+    for (const text of chunks) {
+      const message = {type: delegated ? 'delegation.context.append' : 'session.context.append',
+        channel: el('channel').value, content: [{type: 'input_text', text}]};
+      if (delegated) message.delegation_item_id = id;
+      c.ws.send(JSON.stringify(message));
+      log('Sent:', message);
+    }
+    log('Context queued (not an upstream acknowledgement):', `${chunks.length} chunk(s)`);
+  } catch (error) { log('Context error:', error.message); }
+};
+el('clear').onclick = () => el('log').replaceChildren();
+if (['http:', 'https:'].includes(location.protocol)) el('base').value = location.origin;
+window.addEventListener('beforeunload', event => {
+  if (active) { event.preventDefault(); event.returnValue = ''; }
+});
+</script>
+</body>
+</html>

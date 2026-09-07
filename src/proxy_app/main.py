@@ -632,6 +632,10 @@ async def lifespan(app: FastAPI):
     # print(f"🔑 Credentials loaded: {_total_summary} (API: {_api_summary} | OAuth: {_oauth_summary})")
     client.background_refresher.start()  # Start the background task
     app.state.rotating_client = client
+    from proxy_app.codex_live import CodexLiveGateway
+    from rotator_library.client.codex_live import CodexLiveBackend
+
+    app.state.codex_live = CodexLiveGateway(CodexLiveBackend(client), PROXY_API_KEYS)
 
     # Warn if no provider credentials are configured
     if not client.all_credentials:
@@ -664,6 +668,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    await app.state.codex_live.close()
     await client.background_refresher.stop()  # Stop the background task on shutdown
     if app.state.embedding_batcher:
         await app.state.embedding_batcher.stop()
@@ -681,6 +686,9 @@ async def lifespan(app: FastAPI):
 
 # --- FastAPI App Setup ---
 app = FastAPI(lifespan=lifespan)
+from proxy_app.codex_live import router as codex_live_router
+
+app.include_router(codex_live_router)
 
 # Add CORS middleware to allow all origins, methods, and headers
 app.add_middleware(
@@ -689,6 +697,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],  # Allows all methods
     allow_headers=["*"],  # Allows all headers
+    expose_headers=["Location", "Link", "X-Live-WebSocket-Token"],
 )
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 

@@ -42,7 +42,11 @@ import httpx
 import litellm
 
 from .provider_interface import ProviderInterface, UsageResetConfigDef, QuotaGroupMap
-from .openai_oauth_base import OpenAIOAuthBase
+from .openai_oauth_base import (
+    OpenAIOAuthBase,
+    _extract_openai_auth_claims,
+    _parse_jwt_claims,
+)
 from .utilities.codex_quota_tracker import CodexQuotaTracker
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
@@ -1152,6 +1156,28 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                 if category:
                     return category
         return "upstream_http_error"
+
+    async def get_live_oauth_identity(self, credential_path: str) -> Tuple[str, str]:
+        """Return a current OAuth access token and its account, never an API key.
+
+        Unlike completion authentication, live authentication cannot fall back to
+        a stale token or trigger interactive login. The caller bounds refresh time.
+        """
+        creds = await self._load_credentials(credential_path)
+        if self._is_token_expired(creds):
+            creds = await self._refresh_token(credential_path, creds, allow_reauth=False)
+        token = creds.get("access_token")
+        if not isinstance(token, str) or not token or self._is_token_truly_expired(creds):
+            raise ValueError("Codex live requires a current OAuth access token")
+        claims = _parse_jwt_claims(token)
+        token_account = _extract_openai_auth_claims(claims).get("chatgpt_account_id")
+        account = creds.get("account_id") or creds.get("_proxy_metadata", {}).get("account_id")
+        if token_account and account and token_account != account:
+            raise ValueError("Codex OAuth account identity changed")
+        account = token_account or account
+        if not isinstance(account, str) or not account:
+            raise ValueError("Codex live requires a ChatGPT account identity")
+        return token, account
 
     async def _recover_unauthorized_credential(
         self, credential_path: str, status_code: int

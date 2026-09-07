@@ -1656,6 +1656,203 @@ QUOTA_GROUPS_GEMINI_CLI_3_FLASH="gemini-3-flash-preview"
 
 ---
 
+## Codex live gateway v1 (experimental)
+
+This is **this proxy's experimental client contract**, based on pinned Codex/OMP source, **not an official public OpenAI Realtime API standard**. It exposes native Codex live WebRTC signaling and a credential-affine sideband WebSocket. It does not translate live requests into Chat Completions or Responses, normalize native events, or execute an agent.
+
+**Verification status:** a finite HTTP/WebSocket smoke against a controlled upstream, compilation, and 38 focused regression tests have passed. Full-suite collection remains blocked by nine collection errors that also reproduce with the new live tests excluded; this is not a full-suite pass.
+
+Real upstream setup through the proxy using the minimal OMP payload (`voice: "sol"`, `delegation: {"type":"client"}` without `ack_filler`) returned HTTP `201`, attached the sideband, received native transcript/turn/usage events, and received **965 real WebRTC audio frames**. A subsequent spoken-input probe (`run_c20ba2d16c8d`) sent generated eSpeak WAV audio over WebRTC and observed an actual input transcript and client-targeted `delegation.created`. The probe's client performed the fixed local computation `17 * 23 = 391`, sent commentary and speakable context, received native `delegation.context.appended` acknowledgments, and received nonzero output audio plus a final transcript. While that work was pending, a second spoken input asking to add ten was transcribed; the final output transcript was “The result is three hundred ninety one, plus ten makes four hundred one.” The live model applied that addition itself: there was **no second backend delegation**, so this does not prove backend-agent steering. This exercises generated spoken input and client-owned delegation end to end, **not a physical microphone, human-listened playback, or verified playback-interruption/barge-in UX**.
+
+The reference HTML was also exercised in native Chromium 152 inside Crabbox with a **fake microphone fed generated WAV, not a physical microphone**. Real setup returned `201`; WebRTC, the `oai-events` data channel, and sideband connected. A real delegation was answered manually through the page's context UI, acknowledged upstream, and followed by the assistant transcript “The result is 391.” The audio element was playing with readiness level 4; inbound WebRTC statistics showed 3,319 packets, 66,879 bytes, and nonzero total audio energy (`0.157981`). Local mute set the microphone track's `enabled` to `false`. Stop detached media and disabled controls; DELETE returned the expected `404` after call cleanup. Starting again created a fresh call ID with `201` and connected successfully. An invalid key produced `401` and local-media cleanup. This verifies browser playback state and transport statistics, **not human listening**, and manual context entry is not browser-side agent execution.
+
+Earlier probes preserved upstream HTTP `429` (`usage_limit_reached`) and `403` (`Voice session access denied.`, code `forbidden`). Follow-up isolation returned `201` for `sol` with `ack_filler: false`, but `403` for `marin` without `ack_filler`: the earlier rejection was a **voice mismatch, not missing account entitlement or the acknowledgment flag**. This is not a deployment or production-readiness claim. Voice values remain free-form and upstream-validated; the observed acceptance of `sol` does not establish acceptance of every source-listed voice or access for other accounts.
+
+### Prerequisites and endpoint boundaries
+
+* Configure proxy API keys and compatible Codex **ChatGPT OAuth** credentials on the server. The OpenAI API-key backend is not supported for this route. Clients use only their **proxy** key, never the upstream OAuth token or account headers.
+* Live routes always require authentication, even if other endpoints permit anonymous use. A server with no configured proxy keys rejects live access with `503`.
+* `session.model` must be exactly `gpt-live-1-codex` (no `codex/` prefix here). Server model/tier/quota policy still applies. Any `/v1/models` catalog visibility for `codex/gpt-live-1-codex` is discovery only: it does **not** imply `/v1/chat/completions` or `/v1/responses` support for this model. Use the dedicated routes below.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/v1/codex/realtime/calls` | Send JSON containing an SDP offer and native session; receive raw SDP answer |
+| WebSocket | `/v1/codex/realtime/calls/{call_id}/events` | One sideband attachment per call; bidirectional native events |
+| DELETE | `/v1/codex/realtime/calls/{call_id}` | End an owned call; success is `204` |
+
+Follow the returned `Location` and `Link` rather than constructing call URLs. They include the configured deployment root path. All three requests must reach the worker that created the call.
+
+### Create a call: HTTP and WebRTC
+
+1. Ask for microphone permission and create a WebRTC peer connection. Add the microphone track, create an SDP offer, and complete local ICE gathering before sending the offer. This contract has no separate trickle-ICE endpoint.
+2. POST the offer as JSON. The following is the HTTP shape; replace the illustrative SDP with the complete SDP produced by your WebRTC implementation:
+
+```http
+POST /v1/codex/realtime/calls HTTP/1.1
+Host: proxy.example.com
+Authorization: Bearer YOUR_PROXY_KEY
+Content-Type: application/json
+
+{
+  "sdp": "v=0\r\n...complete local WebRTC SDP offer...\r\n",
+  "session": {
+    "model": "gpt-live-1-codex",
+    "instructions": "Be concise. Delegate tasks to the client when needed.",
+    "audio": {"output": {"voice": "sol"}},
+    "delegation": {"type": "client"},
+    "initial_items": [
+      {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "The client must approve tool execution."}]},
+      {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Help me review my project."}]},
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "What should we review first?"}]}
+    ]
+  }
+}
+```
+
+`sol` matches the pinned OMP default and was accepted in the successful real upstream probe described above. Omit `initial_items` for the minimal OMP-style setup: it is optional native starting context, not Chat Completions `messages`. User/developer text uses `input_text`; assistant text uses `output_text`. The native `delegation.ack_filler` boolean is optional and is omitted from the minimal baseline above; `false` was also accepted in a separate real setup with `sol`. Additional native fields are forwarded without gateway schema translation. An optional `x-oai-attestation` header is forwarded as supplied; send it only if you possess a genuine attestation. The gateway does not synthesize an attestation or bypass upstream requirements.
+
+For `gpt-live-1-codex`, current Codex source validates the V3 conversation against its **v1 voice set**: `juniper`, `maple`, `spruce`, `ember`, `vale`, `breeze`, `arbor`, `sol`, and `cove`. OMP explicitly defaults to `sol`; official Codex's v1 voice default is `cove`. These defaults are client choices, not a gateway-injected default. `marin` belongs to the separate v2 voice set and was rejected with `403` in the isolation probe above. Do not copy voice identifiers from a broader Realtime voice enum without checking the model's set. The gateway intentionally keeps voice values opaque rather than adding a static allowlist: an incompatible value's upstream rejection is preserved. Only `sol` has been demonstrated accepted here; the source list is not an exhaustive runtime availability test.
+
+3. Check HTTP status before parsing the body. Successful setup preserves the upstream success status and **raw SDP bytes**, not a JSON wrapper. An illustrative response is:
+
+```http
+HTTP/1.1 201 Created
+Content-Type: application/sdp
+Cache-Control: no-store
+Location: /v1/codex/realtime/calls/rtc_EXAMPLE
+Link: </v1/codex/realtime/calls/rtc_EXAMPLE/events>; rel="live-sideband"
+X-Live-WebSocket-Token: ONE_USE_PROXY_TICKET
+
+v=0
+...complete upstream SDP answer...
+```
+
+The success status is not necessarily `201`. The SDP and content type are upstream-owned. Safe upstream HTTP headers (`Content-Type`, `Retry-After`, `X-Request-Id`, `OpenAI-Request-Id`) are retained when present; the gateway supplies its own proxy-relative `Location`, `Link` with `rel="live-sideband"`, ticket, and `Cache-Control: no-store`. It does not expose the upstream Location or OAuth credentials. Resolve relative references against the creation URL, require the expected proxy origin, and convert `https` to `wss` (or local `http` to `ws`) for the sideband.
+
+4. Apply the entire response body as the WebRTC remote description with type `answer`. Attach the sideband promptly (within 60 seconds). Play the incoming remote audio track; handle browser autoplay policy with an explicit user playback action if needed.
+
+### Sideband authentication: native and browser clients
+
+**Native clients** can set `Authorization: Bearer YOUR_PROXY_KEY` on the WebSocket upgrade to the returned sideband URL. They may offer `codex-live` as a WebSocket subprotocol. The authenticated principal must own the call; a different principal receives `404` rather than information about somebody else's call. The same ownership rule applies to DELETE.
+
+**Browsers** cannot set an Authorization header on `new WebSocket`. Use the single-use ticket from the authenticated setup response instead:
+
+```javascript
+const link = response.headers.get('Link'); // parse the live-sideband relation
+const target = /<([^>]+)>;\s*rel="live-sideband"/.exec(link)[1];
+const url = new URL(target, creationURL);
+if (url.origin !== new URL(creationURL).origin) throw new Error('Unexpected sideband origin');
+url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+const ticket = response.headers.get('X-Live-WebSocket-Token');
+const ws = new WebSocket(url, ['codex-live', `proxy-ticket.${ticket}`]);
+```
+
+The server selects `codex-live`, not the ticket subprotocol. The ticket is a proxy capability tied to this call and its creating key, not an upstream token or a general API key. It is consumed by the first claimed attachment, including an attachment whose upstream handshake then fails. The creating key must still be configured when the ticket is used. A native bearer attachment also consumes the ticket. Never place keys/tickets in query strings, persistent browser storage, or logs. HTTP POST and DELETE still use the proxy Bearer key; the ticket cannot authorize them. If both credentials are sent on an upgrade, the Authorization header takes precedence.
+
+### Native event reference and client-owned delegation
+
+Send one JSON object per text WebSocket message. The gateway preserves event payloads and unknown fields in both directions; it does not map them to OpenAI SSE, Chat chunks, or Responses events. Binary messages are relayed opaquely as well, but this is **not** a PCM-upload WebSocket API. Clients should tolerate unfamiliar native event types without treating them as known commands. Examples below are source-derived shapes, not recordings of a verified real voice session.
+
+| Server event | Fields used by clients | Handling |
+|---|---|---|
+| `session.started`, `session.updated` | `session.id`, optional `session.instructions` | Record session state |
+| `input_transcript.added` | `item.text` | Append user transcript text |
+| `output_transcript.added` | `item.text` | Append assistant transcript text |
+| `turn.done` | `turn.role` (`user` or `assistant`), `turn.transcript` | Use the completed transcript as the final turn text, rather than duplicating accumulated fragments |
+| `delegation.created` | `item.type`, `item.target`, `item.id`, `item.content` | Dispatch client-targeted work under the client's own permissions and policy |
+| `output_audio.delta` | `audio` | Native event may be observed; do not mistake its existence for a supported proxy audio-input API or duplicate WebRTC playback |
+| `error` | Native error payload, including `message` where present | Surface the upstream error; preserve additional fields for diagnosis |
+
+For example, transcript and delegation messages arriving from the server can look like:
+
+```json
+{"type":"input_transcript.added","item":{"text":"Check the build"}}
+{"type":"turn.done","turn":{"role":"user","transcript":"Check the build."}}
+{"type":"delegation.created","item":{"type":"delegation","target":"client","id":"delegation_1","content":[{"type":"input_text","text":"Inspect the latest build result."}]}}
+```
+
+On a `delegation.created` event, validate that the item is a client-targeted delegation, retain its `item.id`, and extract its `input_text` content as the request. The **client** decides whether/how to invoke its agent or tools, obtains any required approval, and manages cancellation, concurrency, and result correlation. Treat model-generated requests as untrusted input, not permission to execute arbitrary commands. Return progress or final results on the same call using the exact delegation ID:
+
+```json
+{"type":"delegation.context.append","delegation_item_id":"delegation_1","channel":"commentary","content":[{"type":"input_text","text":"Checking the build result now."}]}
+{"type":"delegation.context.append","delegation_item_id":"delegation_1","channel":"speakable","content":[{"type":"input_text","text":"The build passed."}]}
+```
+
+`commentary` is the progress/background channel; `speakable` is context intended for a spoken response. These are upstream semantic hints, not a proxy guarantee that every chunk is spoken verbatim or that commentary is a local mute switch. For context not associated with a delegation, omit the delegation ID and use:
+
+```json
+{"type":"session.context.append","channel":"speakable","content":[{"type":"input_text","text":"The user has switched to the documentation project."}]}
+```
+
+**Chunk context text to at most 500 UTF-8 bytes per append, without splitting a Unicode codepoint.** This is a native protocol requirement, separate from the gateway's 1 MiB message cap; the gateway does not chunk or repair messages for you. Send each chunk in order as its own append with one `input_text` entry, the same channel, and (where applicable) the same delegation ID. Do not split by JavaScript string length or cut arbitrary encoded bytes. For valid Unicode text:
+
+```javascript
+function* contextChunks(text) {
+  const encoder = new TextEncoder();
+  let chunk = '', bytes = 0;
+  for (const codepoint of text) {
+    const size = encoder.encode(codepoint).length;
+    if (bytes + size > 500) { yield chunk; chunk = ''; bytes = 0; }
+    chunk += codepoint;
+    bytes += size;
+  }
+  if (chunk) yield chunk;
+}
+```
+
+Session updates are forwarded as native messages. For example:
+
+```json
+{"type":"session.update","session":{"instructions":"Focus on the current project.","audio":{"output":{"voice":"sol"}},"delegation":{"type":"client"},"initial_items":[{"type":"message","role":"user","content":[{"type":"input_text","text":"We are reviewing documentation now."}]}]}}
+```
+
+Only send fields you intend to update. The gateway does not emulate update semantics, validate a voice catalog, or promise that every field may be changed mid-call; the upstream accepts or rejects them. `initial_items` and `session.update` are passed through, not converted to append events. There is no gateway-defined delegation-completed acknowledgment, agent runner, transcript persistence, or replay protocol.
+
+### Media, mute, interruption, and teardown
+
+WebRTC media travels **directly between the client and the upstream**, not through this proxy. The client owns microphone capture, device selection, track lifetime, playback, local mute (`track.enabled = false`, for example), acoustic echo handling, and any barge-in/interruption UX. Muting microphone capture is different from muting speaker playback. The gateway does not implement voice activity detection, cancel audio playback, interrupt an agent, or guarantee upstream barge-in behavior. Do not advertise these as proxy features.
+
+* One call leases one upstream OAuth credential/account for its lifetime. Refresh stays on that account; the gateway never rotates a live call to another account or transparently retries/replays setup or event messages.
+* Sideband disconnection, upstream termination, explicit `{"type":"session.close"}`, DELETE, or expiry ends local call ownership and triggers upstream close/credential cleanup. Upstream closure is best-effort during a network failure; clients must also stop microphone tracks and close their WebRTC connection. Do not rely on closing a tab alone to confirm remote media shutdown.
+* For explicit stop, close local capture/playback, send `session.close` if the sideband is open, and/or issue authenticated `DELETE` to the returned Location. DELETE returns `204` for an owned live call; `404` after prior cleanup is expected and is not an idempotent `204`. If setup is still in flight, retain its eventual Location so that the created call can be deleted.
+* Reconnect means **create a new call with a new SDP offer and a new ticket**. There is no reattachment/resume of the old call and no event replay. Do not reuse the old call ID or ticket. The client decides what starting context to supply for the new session and whether previously delegated work should be cancelled; never blindly replay tool execution.
+
+### Limits, errors, and deployment requirements
+
+| Limit | Gateway behavior |
+|---|---|
+| Concurrent calls | 64 per process, including pending setups; capacity exhaustion is `503` |
+| Sideband attachment deadline | 60 seconds after setup registration; unattached calls are cleaned up |
+| Call lifetime | Hard limit of 2 hours from claimed sideband attachment, not an idle timeout |
+| Offer body | 1 MiB maximum; nonempty `sdp` and exact `session.model` required |
+| WebSocket message | 1 MiB maximum; oversized client messages close with `1009` (upstream limits also apply) |
+| Context append text | 500 UTF-8 bytes, enforced by client chunking for native protocol compatibility |
+
+Call ownership, timers, and tickets are **process-local**. Use one worker or ensure sticky routing for setup, sideband, and DELETE to the same worker. Sticky routing does not survive worker restart: a restart invalidates calls and tickets. There is no distributed call registry or automatic migration. Ensure the reverse proxy supports WebSocket upgrades and does not impose shorter connection timeouts than intended.
+
+Local HTTP errors use a JSON `detail` field. Common statuses are `400` (invalid JSON/offer/model), `401` (missing/invalid proxy authentication or ticket), `403` (model disabled by policy), `404` (unknown/unowned/closed call), `408` (offer body timeout), `409` (sideband already attached or account identity changed), `410` (call released during attachment), `413` (offer too large), `502` (upstream transport/invalid setup response), `503` (configuration, credentials, capacity, cooldown, or shutdown), and `504` (OAuth/setup timeout). A non-success upstream setup response preserves its status and body with safe headers; do not assume all failures are JSON or rewrite an upstream entitlement rejection into a success.
+
+WebSocket upgrade rejection preserves an HTTP error response where the ASGI server supports denial responses. Otherwise it is rejected with a policy close (`1008`); browsers may expose only a generic handshake failure. Upstream handshake errors and native `error` events remain upstream-owned. After attachment, upstream close codes/reasons are forwarded where available; transport failure can produce `1011`. Handle all close paths, release local media, and show a useful failure rather than retrying the same sideband. There are **no transparent gateway retries**; any new-call retry is an explicit client decision, respecting `Retry-After` and avoiding duplicate side effects when setup outcome is uncertain.
+
+### Browser reference and source provenance
+
+[`scripts/codex_live_client.html`](scripts/codex_live_client.html) is a manual reference client with WebRTC microphone/playback, ticket authentication, raw event/transcript logging, local mute, stop/DELETE, and codepoint-safe context injection. It accepts a free-form voice string and **does not execute an agent or tools**; manually replying to a delegation is not proof of backend agent execution. Serve it over **HTTPS or localhost** for microphone access, preferably from the proxy origin. The gateway does not automatically serve this file. Cross-origin hosting must allow the page origin, `Authorization`/`Content-Type`, POST/DELETE, and expose `Location`, `Link`, and `X-Live-WebSocket-Token`; do not weaken origin policy to make a demo work. Use `wss` when the page/proxy is HTTPS to avoid mixed-content blocking.
+
+OpenAI's [GPT Live system-card introduction](https://deploymentsafety.openai.com/gpt-live/introduction) documents the **model family**. It is distinct from this gateway's source-derived wire protocol and does not establish access for the credentials tested here.
+
+The upstream protocol reference is pinned, rather than inferred from the public Realtime API:
+
+* OMP [`protocol.ts`](https://github.com/can1357/oh-my-pi/blob/6d3bc569d16cd7351073eaa767caed51021befbb/packages/coding-agent/src/live/protocol.ts): native event types, context channels, and UTF-8 chunking.
+* OMP [`voices.ts`](https://github.com/can1357/oh-my-pi/blob/6d3bc569d16cd7351073eaa767caed51021befbb/packages/coding-agent/src/live/voices.ts): source default `sol` and source UI choices `arbor`, `breeze`, `cove`, `ember`, `juniper`, `maple`, `sol`, `spruce`, and `vale`. These are pinned client choices, **not a verified upstream availability list**.
+* OMP [`transport.ts`](https://github.com/can1357/oh-my-pi/blob/6d3bc569d16cd7351073eaa767caed51021befbb/packages/coding-agent/src/live/transport.ts), [`controller.ts`](https://github.com/can1357/oh-my-pi/blob/6d3bc569d16cd7351073eaa767caed51021befbb/packages/coding-agent/src/live/controller.ts), and [`attestation.ts`](https://github.com/can1357/oh-my-pi/blob/6d3bc569d16cd7351073eaa767caed51021befbb/packages/coding-agent/src/live/attestation.ts): WebRTC transport, client-side delegation, and genuine attestation integration.
+* Codex [`realtime_call.rs`](https://github.com/openai/codex/blob/ad931a45b201e3877d6ba542ba5dbbd85e7e31b4/codex-rs/codex-api/src/endpoint/realtime_call.rs): native call setup.
+* Codex [`protocol_frameless_bidi.rs`](https://github.com/openai/codex/blob/ad931a45b201e3877d6ba542ba5dbbd85e7e31b4/codex-rs/codex-api/src/endpoint/realtime_websocket/protocol_frameless_bidi.rs) and [`methods_frameless_bidi.rs`](https://github.com/openai/codex/blob/ad931a45b201e3877d6ba542ba5dbbd85e7e31b4/codex-rs/codex-api/src/endpoint/realtime_websocket/methods_frameless_bidi.rs): native session/update/initial-item and sideband messages.
+* Current Codex [`protocol.rs`](https://github.com/openai/codex/blob/d30f9cc72a25d4f3d59f50a7766b6b032e3c7329/codex-rs/protocol/src/protocol.rs) and [`realtime_conversation.rs`](https://github.com/openai/codex/blob/d30f9cc72a25d4f3d59f50a7766b6b032e3c7329/codex-rs/core/src/realtime_conversation.rs): separate v1/v2 built-in voice sets, v1 default `cove`, and V3 validation/default selection against the v1 set for `gpt-live-1-codex`. This newer pin supplements the wire-protocol pins above.
+
+These pins explain upstream payload shapes; this section defines the **proxy JSON setup wrapper, routes, authentication, ownership, and limits**. Native payload pass-through is not a promise that future upstream revisions remain compatible.
+
+---
+
 ## 4. Logging & Debugging
 
 ### `detailed_logger.py`

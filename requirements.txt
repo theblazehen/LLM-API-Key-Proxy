@@ -15,6 +15,7 @@ filelock
 httpx
 aiofiles
 aiohttp
+websockets>=15,<17
 
 colorlog
 
