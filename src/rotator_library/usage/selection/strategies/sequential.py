@@ -9,6 +9,7 @@ Good for providers that benefit from request caching.
 """
 
 import logging
+import math
 import time
 from typing import Dict, List, Optional
 
@@ -19,10 +20,6 @@ lib_logger = logging.getLogger("rotator_library")
 
 _CODEX_QUOTA_GROUP = "codex-global"
 _WEEKLY_QUOTA_GROUP = "weekly-limit"
-_EFFECTIVE_DEADLINE_LEAD_HOURS = 24.0
-_MIN_PRESSURE_HOURS = 0.25
-_PRESSURE_HYSTERESIS = 1.25
-_MATERIAL_RESET_CHANGE_SECONDS = 6 * 60 * 60
 
 
 class SequentialStrategy:
@@ -47,7 +44,6 @@ class SequentialStrategy:
         self.fallback_multiplier = fallback_multiplier
         # Track current "sticky" credential per (provider, model_group)
         self._current: Dict[tuple, str] = {}
-        self._codex_weekly_generation: Dict[tuple, float] = {}
 
     @property
     def name(self) -> str:
@@ -175,56 +171,17 @@ class SequentialStrategy:
                 or remaining is None
                 or not 0.0 <= remaining <= 100.0
                 or reset_at is None
+                or not math.isfinite(reset_at)
                 or reset_at <= now
             ):
                 return None
 
-            effective_hours = (reset_at - now) / 3600.0 - _EFFECTIVE_DEADLINE_LEAD_HOURS
-            credit_expiry_at = states[candidate].reset_credit_expiry_at
-            if (
-                states[candidate].reset_credit_count > 0
-                and credit_expiry_at is not None
-                and credit_expiry_at > now
-            ):
-                # Preserve the existing routing preference toward an expiring
-                # credit option; this is not a forecast of an automatic refill.
-                effective_hours = min(
-                    effective_hours,
-                    (credit_expiry_at - now) / 3600.0
-                    - _EFFECTIVE_DEADLINE_LEAD_HOURS,
-                )
-            snapshots[candidate] = (
-                remaining / max(effective_hours, _MIN_PRESSURE_HOURS),
-                effective_hours <= 0.0,
-                reset_at,
-            )
+            snapshots[candidate] = reset_at
 
-        current = self._current.get(key)
-        most_urgent = max(context.candidates, key=lambda c: snapshots[c][0])
-        selected = most_urgent
-        if current in context.candidates:
-            current_pressure, _, current_reset = snapshots[current]
-            other_pressure, other_past_deadline, _ = snapshots[most_urgent]
-            prior_reset = self._codex_weekly_generation.get(key)
-            generation_changed = (
-                prior_reset is not None
-                and abs(current_reset - prior_reset) >= _MATERIAL_RESET_CHANGE_SECONDS
-            )
-            if (
-                most_urgent == current
-                or (
-                    not generation_changed
-                    and not other_past_deadline
-                    and (
-                        other_pressure == current_pressure
-                        or other_pressure < current_pressure * _PRESSURE_HYSTERESIS
-                    )
-                )
-            ):
-                selected = current
-
+        # Actual weekly reset only: remaining capacity and reset-credit expiry
+        # do not change the drain order. Stable IDs break equal-reset ties.
+        selected = min(context.candidates, key=lambda c: (snapshots[c], c))
         self._current[key] = selected
-        self._codex_weekly_generation[key] = snapshots[selected][2]
         return selected
 
     def mark_exhausted(self, provider: str, model_or_group: str) -> None:
@@ -239,7 +196,6 @@ class SequentialStrategy:
         if key in self._current:
             old = self._current[key]
             del self._current[key]
-            self._codex_weekly_generation.pop(key, None)
             lib_logger.debug(
                 f"Sequential: marked {mask_credential(old, style='full')} exhausted for {key}"
             )
@@ -316,7 +272,5 @@ class SequentialStrategy:
             keys_to_remove = [k for k in self._current if k[0] == provider]
             for key in keys_to_remove:
                 del self._current[key]
-                self._codex_weekly_generation.pop(key, None)
         else:
             self._current.clear()
-            self._codex_weekly_generation.clear()

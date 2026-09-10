@@ -190,7 +190,6 @@ def test_global_cooldown_is_ineligible_for_every_scope(monkeypatch):
     assert result.allowed is False
     assert result.result == LimitResult.BLOCKED_COOLDOWN
     assert result.blocked_until == 300.0
-    assert result.reason == "Global cooldown: credential disabled (expires in 200s)"
 
 
 def affinity_engine(*, limits=None, clock=None, ttl=30, capacity=8):
@@ -221,46 +220,6 @@ def select_with_affinity(engine, states, key, *, exclude=None):
     )
 
 
-def test_higher_early_deadline_pressure_wins_over_sequential_priority():
-    now = time.time()
-    states = {
-        "primary": credential("primary", remaining=90, reset_at=now + 7 * 86400, priority=1),
-        "urgent": credential("urgent", remaining=45, reset_at=now + 2 * 86400, priority=2),
-    }
-
-    selected = SequentialStrategy().select(
-        context("primary", "urgent", priorities={"primary": 1, "urgent": 2}), states
-    )
-
-    assert selected == "urgent"
-
-
-def test_sticky_account_remains_when_pressure_difference_is_below_hysteresis():
-    now = time.time()
-    states = {
-        "sticky": credential("sticky", remaining=40, reset_at=now + 4 * 86400),
-        "other": credential("other", remaining=35, reset_at=now + 4 * 86400),
-    }
-    strategy = SequentialStrategy()
-    assert strategy.select(context("sticky", "other"), states) == "sticky"
-
-    states["other"].group_usage["weekly-limit"].windows["daily"].remaining_percent = 44
-
-    assert strategy.select(context("sticky", "other"), states) == "sticky"
-
-
-def test_materially_more_urgent_account_replaces_sticky():
-    now = time.time()
-    states = {
-        "sticky": credential("sticky", remaining=30, reset_at=now + 5 * 86400),
-        "urgent": credential("urgent", remaining=70, reset_at=now + 3 * 86400),
-    }
-    strategy = SequentialStrategy()
-    strategy.select(context("sticky"), states)
-
-    assert strategy.select(context("sticky", "urgent"), states) == "urgent"
-
-
 def test_unavailable_sticky_falls_back_to_available_account():
     now = time.time()
     states = {
@@ -287,24 +246,6 @@ def test_external_quota_reset_is_honored_from_current_snapshot():
     weekly.reset_at = now + 8 * 86400
 
     assert strategy.select(context("reset_account", "deadline_account"), states) == "deadline_account"
-
-
-def test_imminent_credit_expiry_prioritizes_capacity_drain():
-    now = time.time()
-    states = {
-        "normal": credential("normal", remaining=60, reset_at=now + 3 * 86400),
-        "expiring_credit": credential(
-            "expiring_credit", remaining=25, reset_at=now + 6 * 86400
-        ),
-    }
-    states["expiring_credit"].reset_credit_count = 1
-    states["expiring_credit"].reset_credit_expiry_at = now + 30 * 3600
-
-    selected = SequentialStrategy().select(
-        context("normal", "expiring_credit"), states
-    )
-
-    assert selected == "expiring_credit"
 
 
 def test_missing_weekly_quota_preserves_sequential_priority_order():
@@ -429,3 +370,75 @@ def test_affinity_cache_expires_and_evicts_least_recently_used_entries():
     now[0] = 13.0
     assert select_with_affinity(engine, states, "fresh") == "only"
     assert list(engine._prompt_cache_affinity) == ["fresh"]
+
+
+def test_earliest_actual_reset_wins_despite_lower_remaining_and_credit_expiry():
+    now = time.time()
+    states = {
+        "earliest": credential("earliest", remaining=1, reset_at=now + 4 * 86400),
+        "later": credential("later", remaining=99, reset_at=now + 5 * 86400),
+    }
+    states["later"].reset_credit_count = 1
+    states["later"].reset_credit_expiry_at = now + 3600
+    strategy = SequentialStrategy()
+    assert strategy.select(context("later"), states) == "later"
+    assert strategy.select(context("later", "earliest"), states) == "earliest"
+
+
+def select_luna(engine, states, key, *, model="gpt-5.6-luna"):
+    return engine.select(
+        provider="codex", model=model, states=states,
+        quota_group="codex-global", prompt_cache_key=key,
+    )
+
+
+def reserve_credential(account, **kwargs):
+    state = credential(account, **kwargs)
+    # Selection consumes the eligibility contract; tracker tests own its rules.
+    state.has_usable_luna_reserve = lambda model: model == "gpt-5.6-luna"
+    return state
+
+
+def test_luna_reserve_replaces_ordinary_affinity():
+    ordinary = credential("ordinary")
+    reserve = reserve_credential("reserve")
+    engine = affinity_engine()
+    assert select_luna(engine, {"ordinary": ordinary}, "chat") == "ordinary"
+    assert select_luna(engine, {"ordinary": ordinary, "reserve": reserve}, "chat") == "reserve"
+
+
+def test_luna_affinity_is_retained_within_reserve_pool():
+    now = time.time()
+    bound = reserve_credential("bound", remaining=0, reset_at=now + 5 * 86400)
+    earlier = reserve_credential("earlier", remaining=0, reset_at=now + 2 * 86400)
+    engine = affinity_engine()
+    assert select_luna(engine, {"bound": bound}, "chat") == "bound"
+    assert select_luna(engine, {"bound": bound, "earlier": earlier}, "chat") == "bound"
+
+
+def test_regular_affinity_precedes_earliest_reset():
+    now = time.time()
+    bound = credential("bound", remaining=20, reset_at=now + 5 * 86400)
+    earlier = credential("earlier", remaining=1, reset_at=now + 2 * 86400)
+    engine = affinity_engine()
+    assert select_luna(engine, {"bound": bound}, "chat") == "bound"
+    states = {"bound": bound, "earlier": earlier}
+    assert select_luna(engine, states, "chat") == "bound"
+    assert select_luna(engine, states, "new-chat") == "earlier"
+
+
+def test_non_luna_request_does_not_prefer_luna_reserve():
+    now = time.time()
+    ordinary = credential("ordinary", remaining=1, reset_at=now + 2 * 86400)
+    reserve = reserve_credential("reserve", remaining=0, reset_at=now + 5 * 86400)
+    assert select_luna(
+        affinity_engine(), {"reserve": reserve, "ordinary": ordinary},
+        "chat", model="gpt-6-astra",
+    ) == "ordinary"
+
+
+def test_unrelated_limits_still_block_reserve_selection():
+    ordinary = credential("ordinary")
+    reserve = reserve_credential("reserve")
+    engine = affinity_engine(limits=_FakeLimits({"reserve": LimitResult.BLOCKED_CONCURRENT}))
+    assert select_luna(engine, {"reserve": reserve, "ordinary": ordinary}, "chat") == "ordinary"

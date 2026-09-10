@@ -53,6 +53,11 @@ class CooldownChecker(LimitChecker):
             cooldown = state.cooldowns.get(scope)
             if not cooldown or cooldown.until <= now:
                 continue
+            if (scope in {"5h-limit", "weekly-limit"}
+                    and cooldown.source == "api_quota"
+                    and cooldown.reason == "quota_exhausted"
+                    and state.has_usable_luna_reserve(model)):
+                continue
 
             label = "Global cooldown" if scope == "_global_" else f"Cooldown for '{scope}'"
             return LimitCheckResult.blocked(
@@ -63,6 +68,20 @@ class CooldownChecker(LimitChecker):
                 ),
                 blocked_until=cooldown.until,
             )
+
+        # A shorter provider/error cooldown may occupy a main-window scope.
+        # Its expiry must not erase the independent authoritative exhaustion.
+        quota = state.codex_quota
+        if (state.provider == "codex" and quota_group == "codex-global"
+                and quota is not None and not state.has_usable_luna_reserve(model)):
+            for window in (quota.primary, quota.secondary):
+                if (window is not None and window.is_exhausted
+                        and window.reset_at is not None and window.reset_at > now):
+                    return LimitCheckResult.blocked(
+                        result=LimitResult.BLOCKED_COOLDOWN,
+                        reason="Codex main quota exhausted",
+                        blocked_until=window.reset_at,
+                    )
 
         return LimitCheckResult.ok()
 

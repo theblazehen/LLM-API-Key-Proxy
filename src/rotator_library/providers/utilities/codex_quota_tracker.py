@@ -155,6 +155,23 @@ class CreditsInfo:
 
 
 @dataclass(frozen=True)
+class LunaReserve:
+    """Separately timestamped allowance from the authoritative usage API."""
+
+    allowed: bool
+    limit_reached: bool
+    windows: Tuple[RateLimitWindow, ...]
+    fetched_at: float
+
+    def usable(self, now: float) -> bool:
+        return (self.allowed and not self.limit_reached
+                and 0 <= now - self.fetched_at <= QUOTA_STALE_THRESHOLD_SECONDS
+                and bool(self.windows)
+                and all(not w.is_exhausted and w.reset_at is not None
+                        and w.reset_at > now for w in self.windows))
+
+
+@dataclass(frozen=True)
 class CodexQuotaSnapshot:
     """Complete quota snapshot for a Codex credential."""
 
@@ -175,6 +192,24 @@ class CodexQuotaSnapshot:
     )
     account_id: Optional[str] = None
     source: str = "headers"
+    luna_reserve: Optional[LunaReserve] = None
+    main_allowed: Optional[bool] = None
+    main_limit_reached: Optional[bool] = None
+
+    @property
+    def has_usable_luna_reserve(self) -> bool:
+        now = time.time()
+        if (self.status != "success" or not 0 <= now - self.fetched_at <= QUOTA_STALE_THRESHOLD_SECONDS
+                or self.luna_reserve is None or not self.luna_reserve.usable(now)):
+            return False
+        windows = tuple(w for w in (self.primary, self.secondary) if w is not None)
+        # Never spend reserve while ordinary quota remains. Expired anchors
+        # cannot prove exhaustion in the newly started regular generation.
+        if not any(w.is_exhausted and w.reset_at is not None and w.reset_at > now for w in windows):
+            return False
+        if self.source == "api":
+            return self.main_allowed is False and self.main_limit_reached is True
+        return self.source == "headers"
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.fetched_at) or self.fetched_at <= 0:
@@ -276,6 +311,26 @@ def _window_to_dict(window: RateLimitWindow) -> Dict[str, Any]:
         "reset_in_seconds": window.seconds_until_reset(),
         "is_exhausted": window.is_exhausted,
     }
+
+
+def _parse_luna_reserve(data: Any, fetched_at: float) -> Optional[LunaReserve]:
+    if not isinstance(data, list):
+        return None
+    entries = [entry for entry in data if isinstance(entry, dict)
+               and entry.get("limit_name") == "gpt-reserve"
+               and entry.get("metered_feature") == "base_model_inference"
+               and entry.get("normal_model_slug") == "gpt-5.6-luna"]
+    if len(entries) != 1:
+        return None
+    rate = entries[0].get("rate_limit")
+    if not isinstance(rate, dict) or type(rate.get("allowed")) is not bool or type(rate.get("limit_reached")) is not bool:
+        return None
+    try:
+        windows = tuple(w for key in ("primary_window", "secondary_window")
+                        if (w := _parse_api_window(rate.get(key))) is not None)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return LunaReserve(rate["allowed"], rate["limit_reached"], windows, fetched_at)
 
 
 def _classify_quota_windows(*windows: Any) -> Dict[str, Any]:
@@ -607,6 +662,13 @@ class CodexQuotaTracker:
         if snapshot.account_id:
             self._advance_quota_epoch(f"account:{snapshot.account_id}")
         self._quota_cache[snapshot.credential_path] = snapshot
+        if snapshot.account_id:
+            for path, previous in tuple(self._quota_cache.items()):
+                if path != snapshot.credential_path and previous.account_id == snapshot.account_id:
+                    self._quota_cache[path] = replace(
+                        snapshot, credential_path=path, identifier=previous.identifier,
+                    )
+        self._publish_reserve_state(snapshot)
         self._quota_errors.pop(snapshot.credential_path, None)
         if self._quota_observer is None:
             self._quota_history_errors[snapshot.credential_path] = "quota_observer_unavailable"
@@ -624,6 +686,37 @@ class CodexQuotaTracker:
 
     def get_quota_error(self, credential_path: str) -> Optional[str]:
         return self._quota_errors.get(credential_path)
+
+    def _publish_reserve_state(self, snapshot: CodexQuotaSnapshot) -> None:
+        if self._usage_manager is not None:
+            for state in self._usage_manager._states.values():
+                credential = self._credentials_cache.get(state.accessor, {})
+                account_id = credential.get("account_id") or credential.get("_proxy_metadata", {}).get("account_id")
+                if (state.accessor == snapshot.credential_path or
+                        snapshot.account_id is not None and account_id == snapshot.account_id):
+                    state.codex_quota = snapshot
+
+    def _cached_account_quota(self, credential_path: str) -> Optional[CodexQuotaSnapshot]:
+        credential = self._credentials_cache.get(credential_path, {})
+        account_id = credential.get("account_id") or credential.get("_proxy_metadata", {}).get("account_id")
+        existing = self._quota_cache.get(credential_path)
+        if existing is not None and existing.account_id == account_id:
+            return existing
+        if account_id is not None:
+            return next((quota for quota in self._quota_cache.values()
+                         if quota.account_id == account_id), None)
+        return None
+
+    def _invalidate_reserve(self, credential_path: str) -> None:
+        snapshot = self._cached_account_quota(credential_path)
+        if snapshot is not None and snapshot.luna_reserve is not None:
+            snapshot = replace(snapshot, luna_reserve=None)
+            self._quota_cache[snapshot.credential_path] = snapshot
+            if snapshot.account_id:
+                for path, previous in tuple(self._quota_cache.items()):
+                    if previous.account_id == snapshot.account_id:
+                        self._quota_cache[path] = replace(previous, luna_reserve=None)
+            self._publish_reserve_state(snapshot)
 
     def get_quota_history_error(self, credential_path: str) -> Optional[str]:
         return self._quota_history_errors.get(credential_path)
@@ -646,6 +739,8 @@ class CodexQuotaTracker:
     def set_usage_manager(self, usage_manager: "UsageManager") -> None:
         """Set the UsageManager reference for pushing quota updates."""
         self._usage_manager = usage_manager
+        for snapshot in self._quota_cache.values():
+            self._publish_reserve_state(snapshot)
 
     # =========================================================================
     # QUOTA API FETCHING
@@ -1016,6 +1111,7 @@ class CodexQuotaTracker:
                     balance=credits_data.get("balance"),
                 )
 
+            fetched_at = time.time()
             snapshot = CodexQuotaSnapshot(
                 credential_path=credential_path,
                 identifier=identifier,
@@ -1023,9 +1119,12 @@ class CodexQuotaTracker:
                 primary=primary,
                 secondary=secondary,
                 credits=credits,
-                fetched_at=time.time(),
+                fetched_at=fetched_at,
                 status="success",
                 error=None,
+                luna_reserve=_parse_luna_reserve(data.get("additional_rate_limits"), fetched_at),
+                main_allowed=rate_limit.get("allowed") if isinstance(rate_limit, dict) else None,
+                main_limit_reached=rate_limit.get("limit_reached") if isinstance(rate_limit, dict) else None,
             )
 
             snapshot = replace(snapshot, account_id=account_id, source="api")
@@ -1046,6 +1145,7 @@ class CodexQuotaTracker:
             error_msg = f"HTTP {e.response.status_code}: {e.response.text[:200]}"
             if self._quota_guard_current(request_guard):
                 self._quota_errors[credential_path] = error_msg
+                self._invalidate_reserve(credential_path)
             lib_logger.warning(
                 f"Failed to fetch Codex quota for {identifier}: {error_msg}"
             )
@@ -1065,6 +1165,7 @@ class CodexQuotaTracker:
             error_msg = str(e)
             if self._quota_guard_current(request_guard):
                 self._quota_errors[credential_path] = error_msg
+                self._invalidate_reserve(credential_path)
             lib_logger.warning(
                 f"Failed to fetch Codex quota for {identifier}: {error_msg}"
             )
@@ -1102,15 +1203,17 @@ class CodexQuotaTracker:
 
         if snapshot.status == "error":
             self._quota_errors[credential_path] = snapshot.error
+            self._invalidate_reserve(credential_path)
             lib_logger.warning("Rejected malformed Codex quota headers")
             return None
         if snapshot.status == "no_data":
             if any(key.lower().endswith("-used-percent") for key in headers):
                 self._quota_errors[credential_path] = "invalid_quota_headers"
+                self._invalidate_reserve(credential_path)
                 lib_logger.warning("Rejected invalid Codex quota headers")
             return None
 
-        existing = self._quota_cache.get(credential_path)
+        existing = self._cached_account_quota(credential_path)
         credential = self._credentials_cache.get(credential_path, {})
         account_id = credential.get("account_id") or credential.get("_proxy_metadata", {}).get("account_id")
         snapshot = replace(
@@ -1118,6 +1221,7 @@ class CodexQuotaTracker:
             identifier=_get_credential_identifier(credential_path),
             plan_type=existing.plan_type if existing else None,
             account_id=account_id, source="headers",
+            luna_reserve=existing.luna_reserve if existing and existing.account_id == account_id else None,
         )
         self._publish_quota_snapshot(snapshot)
 
@@ -1198,6 +1302,7 @@ class CodexQuotaTracker:
             # Queued work never replays its old payload over a newer publication.
             snapshot = self._quota_cache.get(credential_path)
             while snapshot is not None:
+                self._publish_reserve_state(snapshot)
                 provider = getattr(self, "provider_env_name", "codex")
                 windows = _classify_quota_windows(snapshot.primary, snapshot.secondary)
                 for group, model in (("5h-limit", "_5h_window"), ("weekly-limit", "_weekly_window")):
@@ -1205,10 +1310,16 @@ class CodexQuotaTracker:
                     if window is None or window.reset_at is None:
                         await usage_manager.clear_quota_group_state(credential_path, group)
                         continue
+                    state = next((s for s in usage_manager._states.values()
+                                  if s.accessor == credential_path), None)
+                    cooldown = state.cooldowns.get(group) if state is not None else None
+                    apply_exhaustion = window.is_exhausted and not (
+                        cooldown is not None and cooldown.is_active and cooldown.source != "api_quota"
+                    )
                     await usage_manager.update_quota_baseline(
                         accessor=credential_path, model=f"{provider}/{model}",
                         quota_reset_ts=window.reset_at, quota_group=group,
-                        force=True, apply_exhaustion=window.is_exhausted,
+                        force=True, apply_exhaustion=apply_exhaustion,
                         quota_used_percent=window.used_percent,
                         quota_remaining_percent=window.remaining_percent,
                         quota_window_minutes=window.window_minutes, quota_source="codex",

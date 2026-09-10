@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set, Tuple
 
 if TYPE_CHECKING:
     from .config import WindowDefinition
+    from ..providers.utilities.codex_quota_tracker import CodexQuotaSnapshot
 
 
 # =============================================================================
@@ -342,6 +343,24 @@ class CredentialState:
     # Transient provider hints, refreshed outside the request path.
     reset_credit_count: int = 0
     reset_credit_expiry_at: Optional[float] = None
+    # Runtime-only authoritative provider state; never restored from disk.
+    codex_quota: Optional["CodexQuotaSnapshot"] = field(default=None, repr=False)
+
+    def has_usable_luna_reserve(self, model: str) -> bool:
+        """Reserve applies only to exact Luna requests, never model substitution."""
+        if self.provider != "codex" or self.codex_quota is None:
+            return False
+        name = model.removeprefix("codex/")
+        if name != "gpt-5.6-luna":
+            for separator in (":", "-", "_"):
+                base, _, effort = name.rpartition(separator)
+                if base == "gpt-5.6-luna" and effort in {
+                    "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
+                }:
+                    break
+            else:
+                return False
+        return self.codex_quota.has_usable_luna_reserve
 
     # Metadata
     created_at: Optional[float] = None

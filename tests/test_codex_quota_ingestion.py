@@ -20,6 +20,7 @@ class RecordingUsageManager:
     """Observable routing state driven by the real tracker reconciler."""
 
     def __init__(self):
+        self._states = {}
         self.windows = {}
         self.cooldowns = set()
         self.updates = []

@@ -15,6 +15,9 @@ on:
       - "src/proxy_app/**"
       - "src/rotator_library/**"
       - "scripts/**"
+      - "tests/test_sequential_quota_routing.py"
+      - "tests/test_codex_quota_ingestion.py"
+      - "tests/test_codex_luna_reserve.py"
       - ".github/workflows/docker-build.yml"
       - "Dockerfile"
       - "requirements.txt"
@@ -40,6 +43,19 @@ jobs:
         uses: actions/checkout@v5
         with:
           ref: ${{ github.event.inputs.ref || '' }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Verify Codex routing policy
+        env:
+          PYTHONPATH: src
+        run: |
+          uv venv --python 3.12
+          uv pip install -r requirements.txt pytest pytest-asyncio
+          .venv/bin/python -m pytest -q tests/test_sequential_quota_routing.py
+          .venv/bin/python -m pytest -q tests/test_codex_quota_ingestion.py
+          .venv/bin/python -m pytest -q tests/test_codex_luna_reserve.py
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

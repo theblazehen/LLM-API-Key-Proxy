@@ -129,6 +129,15 @@ class SelectionEngine:
             if result.allowed:
                 available.append(stable_id)
 
+        # Reserve outranks ordinary affinity, but never bypasses eligibility.
+        if provider == "codex":
+            reserve = [
+                stable_id for stable_id in available
+                if states[stable_id].has_usable_luna_reserve(model)
+            ]
+            if reserve:
+                available = reserve
+
         affinity_credential = self._get_prompt_cache_affinity(
             provider, prompt_cache_key
         )

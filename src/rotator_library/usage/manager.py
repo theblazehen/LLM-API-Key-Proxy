@@ -933,6 +933,22 @@ class UsageManager:
                 "cooldowns": {},
                 "fair_cycle": {},
             }
+            if state.provider == "codex":
+                quota = state.codex_quota
+                reserve = quota.luna_reserve if quota is not None else None
+                cred_stats["luna_reserve"] = {
+                    "model": "gpt-5.6-luna",
+                    "available": state.has_usable_luna_reserve("gpt-5.6-luna"),
+                    "allowed": reserve.allowed if reserve else None,
+                    "limit_reached": reserve.limit_reached if reserve else None,
+                    "fetched_at": reserve.fetched_at if reserve else None,
+                    "stale": reserve is None or time.time() - reserve.fetched_at > 900,
+                    "windows": [
+                        {"used_percent": w.used_percent, "remaining_percent": w.remaining_percent,
+                         "window_minutes": w.window_minutes, "reset_at": w.reset_at}
+                        for w in reserve.windows
+                    ] if reserve else [],
+                }
 
             stats["total_requests"] += state.totals.request_count
             stats["tokens"]["output"] += state.totals.output_tokens
@@ -1799,6 +1815,8 @@ class UsageManager:
         cooldown = state.cooldowns.get(key)
 
         if cooldown and cooldown.is_active:
+            if self.provider == "codex" and cooldown.source != "api_quota":
+                return False
             await self._tracking.clear_cooldown(state, model_or_group)
             lib_logger.info(
                 f"Cleared cooldown for {key} on "
@@ -1832,7 +1850,8 @@ class UsageManager:
             if remove_usage and quota_group in state.group_usage:
                 del state.group_usage[quota_group]
                 changed = True
-            if quota_group in state.cooldowns:
+            cooldown = state.cooldowns.get(quota_group)
+            if cooldown is not None and (self.provider != "codex" or cooldown.source == "api_quota"):
                 del state.cooldowns[quota_group]
                 changed = True
             fair_cycle = state.fair_cycle.get(quota_group)

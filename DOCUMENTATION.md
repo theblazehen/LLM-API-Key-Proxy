@@ -1167,6 +1167,18 @@ ROTATION_MODE_OPENAI=balanced
 ROTATION_MODE_ANTIGRAVITY=balanced  # Override default
 ```
 
+#### Codex Sequential Routing
+
+With `ROTATION_MODE_CODEX=sequential`, eligible credentials are selected in this order:
+
+1. **Usable Luna reserve**, for `gpt-5.6-luna` requests only. The regular allowance must already be exhausted, and the usage API must have advertised an allowed, unexhausted reserve with a future reset. Reserve evidence expires after 15 minutes; ordinary response headers do not extend its freshness. Missing, malformed, or revoked reserve evidence fails closed.
+2. **Existing prompt-cache affinity**. Conversations keep their credential while it remains eligible. If a usable reserve pool exists for Luna, affinity is honored within that pool rather than keeping the conversation on regular allowance.
+3. **Earliest actual weekly reset**. Unpinned or reassigned traffic drains the eligible account whose weekly quota resets first, rather than balancing remaining allowance over time. Reset-credit expiry, artificial reset lead time, and pressure hysteresis do not influence this ordering. Unknown weekly quota retains the ordinary sticky fallback.
+
+Reserve routing never substitutes Luna for another requested model. It bypasses only authoritative main-quota exhaustion: provider errors, real rate-limit cooldowns, concurrency limits, and custom caps still apply. Account aliases share reserve evidence only when their upstream account identity is verified.
+
+`GET /v1/quota-stats?provider=codex` exposes separate per-credential `luna_reserve` eligibility and window metadata. Reserve does not inflate the regular weekly allowance or forecast.
+
 #### Per-Model Quota Tracking
 
 Instead of tracking usage at the credential level, the system now supports granular per-model tracking:
