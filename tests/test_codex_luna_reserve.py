@@ -305,6 +305,26 @@ async def test_unparked_credential_stays_routable_across_header_refreshes(http_q
 
 
 @pytest.mark.asyncio
+async def test_observed_denial_preserves_luna_reserve(http_queue):
+    """A 429 withdraws admission, not the account's Luna reserve.
+
+    ``main_allowed``/``main_limit_reached`` gate the reserve's *permission*, so
+    clearing them on denial would suspend reserve routing until the next fetch
+    and contradict draining the reserve before ordinary quota.
+    """
+    tracker = Tracker()
+    state = tracked_state(tracker)
+    http_queue.append((reserve_payload(), None, None))
+    await tracker.fetch_quota_from_api("a")
+    assert state.has_usable_luna_reserve("gpt-5.6-luna")
+
+    tracker.revoke_main_admission("a")
+
+    assert not state.has_main_quota_admission()
+    assert state.has_usable_luna_reserve("gpt-5.6-luna")
+
+
+@pytest.mark.asyncio
 async def test_observed_denial_revokes_admission_and_restores_parking(http_queue):
     """A stale admission must not outlive the 429 that disproves it."""
     tracker = Tracker()

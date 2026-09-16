@@ -774,16 +774,20 @@ class CodexQuotaTracker:
         so it must not outlive the denial it predicts. Without this, an account
         that starts returning 429 ``usage_limit_reached`` keeps being re-admitted
         from a still-fresh admission until the next refresh, producing exactly
-        the 429 storm the admission exists to avoid. The replacement snapshot
-        also drops the stale ``allowed`` fields, so nothing else can read a
-        withdrawn admission as consent.
+        the 429 storm the admission exists to avoid.
+
+        Only ``main_admission`` is withdrawn. ``main_allowed``/
+        ``main_limit_reached`` are not consent flags — they are read solely by
+        the ``source == "api"`` branch of ``has_usable_luna_reserve``, where
+        ``False``/``True`` is what *permits* the reserve. Clearing them here
+        would make one observed 429 silently suspend that account's Luna reserve
+        until the next usage-API fetch, defeating the policy of draining the
+        reserve before ordinary quota.
         """
         snapshot = self._cached_account_quota(credential_path)
         if snapshot is None or snapshot.main_admission is None:
             return
-        withdrawn = replace(
-            snapshot, main_admission=None, main_allowed=None, main_limit_reached=None
-        )
+        withdrawn = replace(snapshot, main_admission=None)
         self._quota_cache[withdrawn.credential_path] = withdrawn
         if withdrawn.account_id:
             for path, previous in tuple(self._quota_cache.items()):
