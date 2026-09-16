@@ -166,3 +166,157 @@ async def test_cold_alias_receives_and_revokes_account_reserve(http_queue):
     await tracker.fetch_quota_from_api("b")
     assert not alias.has_usable_luna_reserve("gpt-5.6-luna")
     assert not state.has_usable_luna_reserve("gpt-5.6-luna")
+
+
+def main_admission_payload(used, allowed, limit_reached):
+    return {
+        "rate_limit": {
+            "allowed": allowed, "limit_reached": limit_reached,
+            "primary_window": {"used_percent": used,
+                               "limit_window_seconds": 604800, "reset_at": NEW_RESET},
+        }
+    }
+
+
+def main_cooldown():
+    return CooldownInfo("quota_exhausted", NEW_RESET, NOW, "api_quota", "weekly-limit")
+
+
+@pytest.mark.asyncio
+async def test_admitted_main_quota_outranks_header_exhaustion(http_queue):
+    """Upstream serves a 100%-reported weekly window, so parking it strands the router."""
+    tracker = Tracker()
+    state = tracked_state(tracker)
+    checker = CooldownChecker()
+    state.cooldowns["weekly-limit"] = main_cooldown()
+    assert not checker.check(state, "codex/gpt-6-astra", "codex-global").allowed
+
+    http_queue.append((main_admission_payload(100, True, False), None, None))
+    await tracker.fetch_quota_from_api("a")
+
+    assert state.has_main_quota_admission()
+    assert checker.check(state, "codex/gpt-6-astra", "codex-global").allowed
+    # Applies to every model, unlike the Luna-only reserve.
+    assert checker.check(state, "codex/gpt-5.6-luna", "codex-global").allowed
+
+
+@pytest.mark.asyncio
+async def test_header_refresh_cannot_forge_admission(http_queue):
+    """Header percentages never carry allowed/limit_reached, so they must not admit."""
+    tracker = Tracker()
+    state = tracked_state(tracker)
+    checker = CooldownChecker()
+    state.cooldowns["weekly-limit"] = main_cooldown()
+
+    tracker.update_quota_from_headers("a", headers(100, NEW_RESET))
+    await asyncio.gather(*tuple(tracker._quota_push_tasks))
+
+    assert not state.has_main_quota_admission()
+    assert not checker.check(state, "codex/gpt-6-astra", "codex-global").allowed
+
+
+@pytest.mark.asyncio
+async def test_admission_survives_header_refresh_but_expires(http_queue, monkeypatch):
+    tracker = Tracker()
+    state = tracked_state(tracker)
+    checker = CooldownChecker()
+    state.cooldowns["weekly-limit"] = main_cooldown()
+    http_queue.append((main_admission_payload(100, True, False), None, None))
+    await tracker.fetch_quota_from_api("a")
+
+    tracker.update_quota_from_headers("a", headers(100, NEW_RESET))
+    await asyncio.gather(*tuple(tracker._quota_push_tasks))
+    assert checker.check(state, "codex/gpt-6-astra", "codex-global").allowed
+
+    # A stale admission is not consent: parking returns once it ages out.
+    monkeypatch.setattr(quota.time, "time", lambda: NOW + 901)
+    assert not state.has_main_quota_admission()
+    assert not checker.check(state, "codex/gpt-6-astra", "codex-global").allowed
+
+
+@pytest.mark.asyncio
+async def test_denied_main_quota_never_admits(http_queue):
+    tracker = Tracker()
+    state = tracked_state(tracker)
+    checker = CooldownChecker()
+    state.cooldowns["weekly-limit"] = main_cooldown()
+
+    http_queue.append((main_admission_payload(100, False, True), None, None))
+    await tracker.fetch_quota_from_api("a")
+
+    assert not state.has_main_quota_admission()
+    assert not checker.check(state, "codex/gpt-6-astra", "codex-global").allowed
+
+
+@pytest.mark.asyncio
+async def test_header_refreshes_do_not_renew_the_admission_clock(http_queue, monkeypatch):
+    """Only a wham fetch may refresh admission; headers must not extend it.
+
+    Header refreshes republish the weekly window on every response. If they also
+    renewed the admission's freshness, a credential upstream has started denying
+    would stay admitted forever, and the 429 storm the admission guards against
+    would return one request at a time.
+    """
+    tracker = Tracker()
+    state = tracked_state(tracker)
+    checker = CooldownChecker()
+    state.cooldowns["weekly-limit"] = main_cooldown()
+    http_queue.append((main_admission_payload(100, True, False), None, None))
+    await tracker.fetch_quota_from_api("a")
+    assert checker.check(state, "codex/gpt-6-astra", "codex-global").allowed
+
+    # A later header refresh still carries the verdict, but not a new clock.
+    monkeypatch.setattr(quota.time, "time", lambda: NOW + 800)
+    tracker.update_quota_from_headers("a", headers(100, NEW_RESET))
+    await asyncio.gather(*tuple(tracker._quota_push_tasks))
+    assert checker.check(state, "codex/gpt-6-astra", "codex-global").allowed
+
+    # Re-parking is measured from the wham verdict, not the last header.
+    monkeypatch.setattr(quota.time, "time", lambda: NOW + 901)
+    tracker.update_quota_from_headers("a", headers(100, NEW_RESET))
+    await asyncio.gather(*tuple(tracker._quota_push_tasks))
+    assert not state.has_main_quota_admission()
+    assert not checker.check(state, "codex/gpt-6-astra", "codex-global").allowed
+
+
+@pytest.mark.asyncio
+async def test_unparked_credential_stays_routable_across_header_refreshes(http_queue):
+    """The reconciler re-applies weekly exhaustion from headers; admission must outrank it.
+
+    After an unpark the very next response publishes headers whose window still
+    reads 100%, which re-applies the ``api_quota`` cooldown. The admission is
+    what keeps that re-application from immediately re-parking the credential and
+    collapsing the fix to one request per refresh cycle.
+    """
+    tracker = Tracker()
+    state = tracked_state(tracker)
+    checker = CooldownChecker()
+    state.cooldowns["weekly-limit"] = main_cooldown()
+    http_queue.append((main_admission_payload(100, True, False), None, None))
+    await tracker.fetch_quota_from_api("a")
+
+    for _ in range(3):
+        tracker.update_quota_from_headers("a", headers(100, NEW_RESET))
+        await asyncio.gather(*tuple(tracker._quota_push_tasks))
+        # Headers still force exhaustion onto the manager...
+        assert ("a", "weekly-limit") in tracker.manager.cooldowns
+        # ...but the fresh admission keeps the credential selectable.
+        assert checker.check(state, "codex/gpt-6-astra", "codex-global").allowed
+
+
+@pytest.mark.asyncio
+async def test_observed_denial_revokes_admission_and_restores_parking(http_queue):
+    """A stale admission must not outlive the 429 that disproves it."""
+    tracker = Tracker()
+    state = tracked_state(tracker)
+    checker = CooldownChecker()
+    state.cooldowns["weekly-limit"] = main_cooldown()
+    http_queue.append((main_admission_payload(100, True, False), None, None))
+    await tracker.fetch_quota_from_api("a")
+    assert checker.check(state, "codex/gpt-6-astra", "codex-global").allowed
+
+    tracker.revoke_main_admission("a")
+
+    assert not state.has_main_quota_admission()
+    assert not checker.check(state, "codex/gpt-6-astra", "codex-global").allowed
+

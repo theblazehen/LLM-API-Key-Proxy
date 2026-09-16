@@ -57,6 +57,8 @@ class LiveCallResult:
 
 
 class CodexLiveBackend:
+    _quota_group: str | None = None
+
     def __init__(self, client: RotatingClient):
         self._client = client
 
@@ -116,6 +118,62 @@ class CodexLiveBackend:
             )
         await asyncio.shield(binding._release_task)
 
+    async def acquire(self, model: str, attestation: str | None = None):
+        """Lease one OAuth identity for a voice session, without starting a call."""
+        binding = None
+        retained = False
+        try:
+            async with asyncio.timeout(_SETUP_TIMEOUT):
+                provider = self._provider()
+                policy_model = model if model.startswith("codex/") else f"codex/{model}"
+                if not self._client._model_resolver.is_model_allowed(policy_model, "codex"):
+                    raise LiveBackendError(403, "Codex voice model is disabled")
+                manager = self._client._usage_managers.get("codex")
+                if manager is None:
+                    raise LiveBackendError(503, "Codex credential usage manager is unavailable")
+                all_credentials = self._client.all_credentials.get("codex", [])
+                filters = self._client._credential_filter.filter_by_tier(
+                    all_credentials, policy_model, "codex"
+                )
+                if not manager.initialized:
+                    await manager.initialize(
+                        all_credentials, priorities=filters.priorities, tiers=filters.tier_names
+                    )
+                oauth = set(self._client.oauth_credentials.get("codex", []))
+                candidates = [cred for cred in filters.all_usable
+                              if cred in oauth and provider.is_credential_available(cred)]
+                if not candidates:
+                    raise LiveBackendError(503, "No compatible Codex OAuth credentials")
+                remaining = await self._client.cooldown_manager.get_remaining_cooldown("codex")
+                if remaining > 0:
+                    if remaining >= _SETUP_TIMEOUT:
+                        raise LiveBackendError(503, "Codex provider is cooling down")
+                    await asyncio.sleep(remaining)
+                lease = await manager.acquire_credential(
+                    model=policy_model,
+                    quota_group=self._quota_group or manager.get_model_quota_group(policy_model),
+                    candidates=candidates, priorities=filters.priorities,
+                    deadline=time.time() + _SETUP_TIMEOUT,
+                )
+                session_id = str(uuid.uuid4())
+                binding = LiveBinding(
+                    call_id="", credential=lease.credential, account_id="",
+                    session_id=session_id, thread_id=session_id,
+                    x_session_id=str(uuid.uuid4()), attestation=attestation, _lease=lease,
+                )
+                lease.mark_failure(classify_error(LiveBackendError(502, "Voice setup failed")))
+                token, binding.account_id = await self._identity(lease.credential)
+                headers = self._headers(binding, token)
+            retained = True
+            return binding, headers
+        except NoAvailableKeysError:
+            raise LiveBackendError(503, "No Codex OAuth credential is available") from None
+        except (TimeoutError, httpx.TimeoutException):
+            raise LiveBackendError(504, "Codex OAuth acquisition timed out") from None
+        finally:
+            if binding is not None and not retained:
+                await self.release(binding)
+
     async def create(self, payload: dict, attestation: str | None = None) -> LiveCallResult:
         """Send one setup POST, preserving its response and leasing its account."""
         binding = None
@@ -129,52 +187,12 @@ class CodexLiveBackend:
                     raise LiveBackendError(400, "Codex live session.model is required")
                 if not isinstance(payload.get("sdp"), str) or not payload["sdp"]:
                     raise LiveBackendError(400, "Codex live sdp is required")
-                policy_model = model if model.startswith("codex/") else f"codex/{model}"
-                if not self._client._model_resolver.is_model_allowed(policy_model, "codex"):
-                    raise LiveBackendError(403, "Codex live model is disabled")
-                manager = self._client._usage_managers.get("codex")
-                if manager is None:
-                    raise LiveBackendError(503, "Codex credential usage manager is unavailable")
-                all_credentials = self._client.all_credentials.get("codex", [])
-                filters = self._client._credential_filter.filter_by_tier(
-                    all_credentials, policy_model, "codex"
-                )
-                if not manager.initialized:
-                    await manager.initialize(
-                        all_credentials, priorities=filters.priorities, tiers=filters.tier_names
-                    )
-                oauth = set(self._client.oauth_credentials.get("codex", []))
-                candidates = [
-                    cred for cred in filters.all_usable
-                    if cred in oauth and provider.is_credential_available(cred)
-                ]
-                if not candidates:
-                    raise LiveBackendError(503, "No compatible Codex OAuth credentials")
-                remaining = await self._client.cooldown_manager.get_remaining_cooldown("codex")
-                if remaining > 0:
-                    if remaining >= _SETUP_TIMEOUT:
-                        raise LiveBackendError(503, "Codex provider is cooling down")
-                    await asyncio.sleep(remaining)
-                lease = await manager.acquire_credential(
-                    model=policy_model,
-                    quota_group=manager.get_model_quota_group(policy_model),
-                    candidates=candidates,
-                    priorities=filters.priorities,
-                    deadline=time.time() + _SETUP_TIMEOUT,
-                )
-                session_id = str(uuid.uuid4())
-                binding = LiveBinding(
-                    call_id="", credential=lease.credential, account_id="",
-                    session_id=session_id, thread_id=session_id,
-                    x_session_id=str(uuid.uuid4()), attestation=attestation, _lease=lease,
-                )
-                # Until a valid setup response is accepted, cleanup records failure.
-                lease.mark_failure(classify_error(LiveBackendError(502, "Codex live setup failed")))
-                token, binding.account_id = await self._identity(lease.credential)
+                binding, headers = await self.acquire(model, attestation)
+                lease = binding._lease
                 response = await self._client.http_client.post(
                     f"{codex_provider.CODEX_API_BASE.rstrip('/')}/realtime/calls",
                     params={"intent": "quicksilver", "architecture": "avas"},
-                    json=payload, headers=self._headers(binding, token),
+                    json=payload, headers=headers,
                     timeout=httpx.Timeout(30.0), follow_redirects=False,
                 )
                 response_headers = dict(response.headers)

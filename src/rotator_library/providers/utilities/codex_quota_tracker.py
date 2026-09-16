@@ -172,6 +172,25 @@ class LunaReserve:
 
 
 @dataclass(frozen=True)
+class MainQuotaAdmission:
+    """Authoritative main-limit admission from the usage API.
+
+    Carries its own clock. Header refreshes republish the same windows on every
+    response with ``fetched_at`` renewed, so an admission timestamped from the
+    snapshot would never look stale and a dead credential would be retried
+    forever.
+    """
+
+    allowed: bool
+    limit_reached: bool
+    fetched_at: float
+
+    def admits(self, now: float) -> bool:
+        return (self.allowed and not self.limit_reached
+                and 0 <= now - self.fetched_at <= QUOTA_STALE_THRESHOLD_SECONDS)
+
+
+@dataclass(frozen=True)
 class CodexQuotaSnapshot:
     """Complete quota snapshot for a Codex credential."""
 
@@ -195,6 +214,23 @@ class CodexQuotaSnapshot:
     luna_reserve: Optional[LunaReserve] = None
     main_allowed: Optional[bool] = None
     main_limit_reached: Optional[bool] = None
+    # Authoritative main-limit admission, carried across header refreshes with
+    # its own clock. `main_allowed`/`main_limit_reached` above are the same
+    # upstream fields but are rewritten to None by every header publication, so
+    # they cannot answer "may this account still be used?" between refreshes.
+    main_admission: Optional[MainQuotaAdmission] = None
+
+    @property
+    def main_quota_admits(self) -> bool:
+        """True only while the usage API authoritatively admits ordinary traffic.
+
+        Header-derived snapshots never populate this, so the conservative
+        ``used_percent >= 100`` parking still applies when no authoritative
+        admission is fresh. An unreadable or stale admission is not consent.
+        """
+        if self.status != "success" or self.main_admission is None:
+            return False
+        return self.main_admission.admits(time.time())
 
     @property
     def has_usable_luna_reserve(self) -> bool:
@@ -311,6 +347,19 @@ def _window_to_dict(window: RateLimitWindow) -> Dict[str, Any]:
         "reset_in_seconds": window.seconds_until_reset(),
         "is_exhausted": window.is_exhausted,
     }
+
+
+def _parse_main_admission(
+    rate_limit: Any, fetched_at: float
+) -> Optional[MainQuotaAdmission]:
+    """Read the authoritative main admission, rejecting anything unreadable."""
+    if not isinstance(rate_limit, dict):
+        return None
+    allowed = rate_limit.get("allowed")
+    limit_reached = rate_limit.get("limit_reached")
+    if type(allowed) is not bool or type(limit_reached) is not bool:
+        return None
+    return MainQuotaAdmission(allowed, limit_reached, fetched_at)
 
 
 def _parse_luna_reserve(data: Any, fetched_at: float) -> Optional[LunaReserve]:
@@ -717,6 +766,32 @@ class CodexQuotaTracker:
                     if previous.account_id == snapshot.account_id:
                         self._quota_cache[path] = replace(previous, luna_reserve=None)
             self._publish_reserve_state(snapshot)
+
+    def revoke_main_admission(self, credential_path: str) -> None:
+        """Withdraw authoritative admission after upstream actually denies traffic.
+
+        A fresh usage-API admission permits routing into a 100%-reported window,
+        so it must not outlive the denial it predicts. Without this, an account
+        that starts returning 429 ``usage_limit_reached`` keeps being re-admitted
+        from a still-fresh admission until the next refresh, producing exactly
+        the 429 storm the admission exists to avoid. The replacement snapshot
+        also drops the stale ``allowed`` fields, so nothing else can read a
+        withdrawn admission as consent.
+        """
+        snapshot = self._cached_account_quota(credential_path)
+        if snapshot is None or snapshot.main_admission is None:
+            return
+        withdrawn = replace(
+            snapshot, main_admission=None, main_allowed=None, main_limit_reached=None
+        )
+        self._quota_cache[withdrawn.credential_path] = withdrawn
+        if withdrawn.account_id:
+            for path, previous in tuple(self._quota_cache.items()):
+                if previous.account_id == withdrawn.account_id:
+                    self._quota_cache[path] = replace(
+                        withdrawn, credential_path=path, identifier=previous.identifier,
+                    )
+        self._publish_reserve_state(withdrawn)
 
     def get_quota_history_error(self, credential_path: str) -> Optional[str]:
         return self._quota_history_errors.get(credential_path)
@@ -1125,6 +1200,7 @@ class CodexQuotaTracker:
                 luna_reserve=_parse_luna_reserve(data.get("additional_rate_limits"), fetched_at),
                 main_allowed=rate_limit.get("allowed") if isinstance(rate_limit, dict) else None,
                 main_limit_reached=rate_limit.get("limit_reached") if isinstance(rate_limit, dict) else None,
+                main_admission=_parse_main_admission(rate_limit, fetched_at),
             )
 
             snapshot = replace(snapshot, account_id=account_id, source="api")
@@ -1222,6 +1298,7 @@ class CodexQuotaTracker:
             plan_type=existing.plan_type if existing else None,
             account_id=account_id, source="headers",
             luna_reserve=existing.luna_reserve if existing and existing.account_id == account_id else None,
+            main_admission=existing.main_admission if existing and existing.account_id == account_id else None,
         )
         self._publish_quota_snapshot(snapshot)
 

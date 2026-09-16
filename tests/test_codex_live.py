@@ -507,6 +507,7 @@ def oauth_modules(modules, monkeypatch):
     stub("rotator_library.utils.reauth_coordinator", get_reauth_coordinator=Mock())
     stub("rotator_library.utils.resilient_io", safe_write_json=Mock())
     stub("litellm")
+    stub("litellm.types.utils", ModelResponseStream=object)
     base = load_module(monkeypatch, "rotator_library.providers.openai_oauth_base",
                        "rotator_library/providers/openai_oauth_base.py")
     provider = load_module(monkeypatch, "rotator_library.providers._live_test_provider",
@@ -587,3 +588,173 @@ async def test_client_session_close_is_not_duplicated_by_cleanup(live):
     assert live.upstreams[0].closed
     live.backend.release.assert_awaited_once()
     assert not live.gateway.calls
+
+
+@pytest.fixture
+def realtime_modules(modules, monkeypatch):
+    monkeypatch.setitem(sys.modules, "proxy_app.codex_live", modules[1])
+    backend = load_module(monkeypatch, "rotator_library.client.realtime", "rotator_library/client/realtime.py")
+    gateway = load_module(monkeypatch, "_test_realtime_gateway", "proxy_app/realtime.py")
+    return backend, gateway
+
+
+@pytest.fixture
+def realtime_gateway(setup_backend, realtime_modules):
+    bm, gm = realtime_modules
+    fixture = setup_backend
+    fixture.backend = bm.RealtimeBackend(fixture.client)
+    fixture.gateway = gm.RealtimeGateway(fixture.backend, {"alice-key": "alice", "bob-key": "bob"})
+    fixture.module = gm
+    app = FastAPI()
+    app.state.realtime = fixture.gateway
+    app.include_router(gm.router)
+    fixture.app = app
+    return fixture
+
+
+@pytest.mark.asyncio
+async def test_realtime_call_owner_controls_hangup_and_lease(realtime_gateway):
+    f = realtime_gateway
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=f.app), base_url="http://test") as client:
+        offer = {"sdp": (None, "v=0\r\n", "application/sdp"),
+                 "session": (None, json.dumps({"model": "gpt-realtime-2.1"}), "application/json")}
+        unauthorized = await client.post("/v1/realtime/calls", files=offer)
+        assert unauthorized.status_code == 401
+        f.manager.acquire_credential.assert_not_awaited()
+        response = await client.post("/v1/realtime/calls", files=offer, headers={"Authorization": "Bearer alice-key"})
+        assert response.status_code == 201
+        location = response.headers["location"]
+        f.lease.__aexit__.assert_not_awaited()
+        denied = await client.post(location + "/hangup", headers={"Authorization": "Bearer bob-key"})
+        assert denied.status_code == 404
+        f.lease.__aexit__.assert_not_awaited()
+        f.client.http_client.post.return_value = httpx.Response(200)
+        closed = await client.post(location + "/hangup", headers={"Authorization": "Bearer alice-key"})
+        assert closed.status_code == 200
+        f.lease.__aexit__.assert_awaited_once()
+        assert not f.gateway.sessions
+
+
+@pytest.mark.asyncio
+async def test_cancelled_realtime_offer_hangs_up_late_success(realtime_gateway):
+    f = realtime_gateway
+    entered, proceed = asyncio.Event(), asyncio.Event()
+    hung_up = []
+    async def post(url, **kwargs):
+        if url.endswith("/hangup"):
+            hung_up.append(url)
+            return httpx.Response(200)
+        entered.set()
+        await proceed.wait()
+        return httpx.Response(201, content=SDP, headers={"location": "/v1/realtime/calls/rtc_late"})
+    f.client.http_client.post.side_effect = post
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=f.app), base_url="http://test") as client:
+        task = asyncio.create_task(client.post("/v1/realtime/calls", json={"sdp": "v=0\r\n"},
+                                               headers={"Authorization": "Bearer alice-key"}))
+        await asyncio.wait_for(entered.wait(), 1)
+        task.cancel()
+        proceed.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+    assert hung_up == ["https://api.openai.com/v1/realtime/calls/rtc_late/hangup"]
+    f.lease.__aexit__.assert_awaited_once()
+    assert not f.gateway.sessions
+
+
+@pytest.mark.asyncio
+async def test_realtime_duplicate_and_foreign_sidebands_cannot_close_owner(realtime_gateway, monkeypatch):
+    f = realtime_gateway
+    class RealtimeUpstream(Upstream):
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            return await self.recv()
+    upstream = RealtimeUpstream()
+    monkeypatch.setattr(f.module, "_LiveConnect", lambda *a, **kw: Connection(upstream))
+    session = await f.gateway.acquire("gpt-realtime-2.1", "alice")
+    await f.gateway.create_call(session, "v=0\r\n", {"model": "gpt-realtime-2.1"})
+    def socket(key):
+        result = Socket(None, authorization=f"Bearer {key}")
+        result.app = f.app
+        result.query_params = {"call_id": session.id}
+        return result
+    owner = socket("alice-key")
+    owner_task = asyncio.create_task(f.module.realtime(owner))
+    await asyncio.wait_for(owner.accepted.wait(), 1)
+    try:
+        for key, status in [("alice-key", 409), ("bob-key", 404)]:
+            rejected = socket(key)
+            await f.module.realtime(rejected)
+            assert rejected.denial.status_code == status
+        assert not upstream.closed
+        f.lease.__aexit__.assert_not_awaited()
+    finally:
+        f.client.http_client.post.return_value = httpx.Response(200)
+        await owner.incoming.put({"type": "websocket.disconnect"})
+        await asyncio.wait_for(owner_task, 1)
+    assert upstream.closed
+    f.lease.__aexit__.assert_awaited_once()
+    assert not f.gateway.sessions
+
+
+@pytest.mark.asyncio
+async def test_realtime_rejected_mint_preserves_error_without_retaining_capacity(realtime_gateway):
+    f = realtime_gateway
+    body = b'{"error":{"code":"rate_limit_exceeded","message":"Try later"}}'
+    f.client.http_client.post.return_value = httpx.Response(429, content=body,
+        headers={"retry-after": "17", "content-type": "application/json", "set-cookie": "private"})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=f.app), base_url="http://test") as client:
+        response = await client.post("/v1/realtime/client_secrets", json={"session": {"model": "gpt-realtime-2.1"}},
+                                     headers={"Authorization": "Bearer alice-key"})
+    assert response.status_code == 429
+    assert response.content == body
+    assert response.headers["retry-after"] == "17"
+    assert "set-cookie" not in response.headers
+    assert not f.gateway.sessions
+    f.lease.__aexit__.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_realtime_admits_text_exhaustion_but_respects_global_failure(realtime_gateway, monkeypatch):
+    f = realtime_gateway
+    # Exercise the real scoped cooldown checker rather than pinning a group name
+    # or replacing quota admission with an always-successful lease mock.
+    limits = types.ModuleType("rotator_library.usage.limits")
+    limits.__path__ = [str(SRC / "rotator_library/usage/limits")]
+    monkeypatch.setitem(sys.modules, limits.__name__, limits)
+    state_types = load_module(monkeypatch, "rotator_library.usage.types", "rotator_library/usage/types.py")
+    load_module(monkeypatch, "rotator_library.usage.limits.base", "rotator_library/usage/limits/base.py")
+    cooldowns = load_module(monkeypatch, "rotator_library.usage.limits.cooldowns", "rotator_library/usage/limits/cooldowns.py")
+    state = state_types.CredentialState(stable_id="account", provider="codex", accessor="fixture-oauth")
+    state.cooldowns["weekly-limit"] = state_types.CooldownInfo(
+        reason="quota_exhausted", until=float("inf"), started_at=0, model_or_group="weekly-limit")
+    checker = cooldowns.CooldownChecker()
+    unavailable = sys.modules["rotator_library.error_handler"].NoAvailableKeysError
+
+    async def acquire(**kwargs):
+        if not checker.check(state, kwargs["model"], kwargs["quota_group"]).allowed:
+            raise unavailable("Credential quota scope is blocked")
+        return f.lease
+
+    f.manager.acquire_credential.side_effect = acquire
+    f.manager.get_model_quota_group.return_value = "codex-global"
+    native = sys.modules["rotator_library.client.codex_live"].CodexLiveBackend(f.client)
+    with pytest.raises(Exception) as rejected:
+        await native.create(OFFER)
+    assert rejected.value.status_code == 503
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=f.app), base_url="http://test") as client:
+        auth = {"Authorization": "Bearer alice-key"}
+        response = await client.post("/v1/realtime/calls", headers=auth,
+            json={"sdp": OFFER["sdp"], "session": {"model": "gpt-realtime-2.1"}})
+        assert response.status_code == 201
+        f.client.http_client.post.return_value = httpx.Response(200)
+        ended = await client.delete(response.headers["location"], headers=auth)
+        assert ended.status_code == 204
+        state.cooldowns["_global_"] = state_types.CooldownInfo(
+            reason="authentication_failure", until=float("inf"), started_at=0, model_or_group="_global_")
+        blocked = await client.post("/v1/realtime/client_secrets", headers=auth,
+            json={"session": {"model": "gpt-realtime-2.1"}})
+        assert blocked.status_code == 503
+    assert not f.gateway.sessions
+    f.lease.__aexit__.assert_awaited_once()

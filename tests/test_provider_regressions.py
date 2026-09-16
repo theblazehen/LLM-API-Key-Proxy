@@ -4,6 +4,7 @@ import base64
 import sys
 import time
 import types
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
@@ -133,6 +134,11 @@ for _name in (
 
 sys.modules.setdefault("litellm", fake_litellm)
 sys.modules.setdefault("litellm.exceptions", fake_litellm_exceptions)
+fake_litellm_types = types.ModuleType("litellm.types")
+fake_litellm_utils = types.ModuleType("litellm.types.utils")
+fake_litellm_utils.ModelResponseStream = _FakeModelResponse
+sys.modules.setdefault("litellm.types", fake_litellm_types)
+sys.modules.setdefault("litellm.types.utils", fake_litellm_utils)
 
 
 
@@ -219,6 +225,225 @@ class FakeStreamClient:
 def _jwt(claims):
     encoded = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
     return f"e30.{encoded}.signature"
+
+
+async def _capture_codex_completion_payload(monkeypatch, **kwargs):
+    provider = CodexProvider()
+    requests = []
+
+    async def get_auth_header(_credential):
+        return {"Authorization": "Bearer test-token"}
+
+    async def get_account_id(_credential):
+        return None
+
+    def handle(request):
+        assert request.method == "POST"
+        assert str(request.url) == codex_provider.CODEX_RESPONSES_ENDPOINT
+        requests.append(json.loads(request.content))
+        events = [
+            {"type": "response.output_text.delta", "delta": "{}"},
+            {"type": "response.completed", "response": {"id": "resp_format"}},
+        ]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content="".join(f"data: {json.dumps(event)}\n\n" for event in events),
+        )
+
+    monkeypatch.setattr(provider, "get_auth_header", get_auth_header)
+    monkeypatch.setattr(provider, "get_account_id", get_account_id)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        result = await provider.acompletion(
+            client,
+            model="codex/gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Return JSON."}],
+            **kwargs,
+        )
+        if kwargs.get("stream"):
+            async for _chunk in result:
+                pass
+    assert len(requests) == 1
+    return requests[0]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_codex_acompletion_preserves_strict_response_schema(monkeypatch, stream):
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "strict_result",
+            "description": "A closed result with a referenced child",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"child": {"$ref": "#/$defs/Child"}},
+                "required": ["child"],
+                "additionalProperties": False,
+                "$defs": {
+                    "Child": {
+                        "type": "object",
+                        "properties": {"value": {"type": ["string", "null"]}},
+                        "required": ["value"],
+                        "additionalProperties": False,
+                    }
+                },
+            },
+        },
+    }
+    original = deepcopy(response_format)
+    payload = asyncio.run(_capture_codex_completion_payload(
+        monkeypatch, response_format=response_format, stream=stream
+    ))
+    assert payload["text"] == {
+        "verbosity": "medium",
+        "format": {"type": "json_schema", **original["json_schema"]},
+    }
+    assert "response_format" not in payload
+    assert response_format == original
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"response_format": None}])
+def test_codex_acompletion_without_response_format_is_unchanged(monkeypatch, kwargs):
+    payload = asyncio.run(_capture_codex_completion_payload(monkeypatch, **kwargs))
+    assert payload["text"] == {"verbosity": "medium"}
+    assert "response_format" not in payload
+
+
+@pytest.mark.parametrize("format_type", ["text", "json_object"])
+def test_codex_acompletion_maps_simple_response_formats(monkeypatch, format_type):
+    response_format = {"type": format_type}
+    payload = asyncio.run(_capture_codex_completion_payload(
+        monkeypatch, response_format=response_format
+    ))
+    assert payload["text"] == {"verbosity": "medium", "format": response_format}
+    assert response_format == {"type": format_type}
+
+
+@pytest.mark.parametrize("optional", [{}, {"strict": False}, {"strict": None}, {"type": "json_schema"}])
+def test_codex_acompletion_preserves_optional_schema_fields(monkeypatch, optional):
+    specification = {"name": "result", "schema": {}, **optional}
+    payload = asyncio.run(_capture_codex_completion_payload(
+        monkeypatch, response_format={"type": "json_schema", "json_schema": specification}
+    ))
+    assert payload["text"]["format"] == {"type": "json_schema", **specification}
+    assert "description" not in payload["text"]["format"]
+
+
+@pytest.mark.parametrize("response_format", [
+    "json_object", [], {}, {"type": []}, {"type": "xml"},
+    {"type": "text", "schema": {}},
+    {"type": "json_schema"},
+    {"type": "json_schema", "json_schema": []},
+    *[
+        {"type": "json_schema", "json_schema": specification}
+        for specification in [
+            {}, {"name": "result"}, {"name": "result", "schema": []},
+            {"name": "", "schema": {}}, {"name": 1, "schema": {}},
+            {"name": "bad name", "schema": {}}, {"name": "x" * 65, "schema": {}},
+            {"name": "result", "schema": {}, "strict": "true"},
+            {"name": "result", "schema": {}, "strict": 1},
+            {"name": "result", "schema": {}, "description": []},
+            {"name": "result", "schema": {}, "type": "text"},
+            {"name": "result", "schema": {}, "unsupported": True},
+        ]
+    ],
+])
+def test_codex_acompletion_rejects_invalid_response_formats_before_io(monkeypatch, response_format):
+    async def exercise():
+        provider = CodexProvider()
+        original = deepcopy(response_format)
+
+        async def unexpected_auth(_credential):
+            pytest.fail("invalid format reached credential I/O")
+
+        def unexpected_request(_request):
+            pytest.fail("invalid format reached upstream")
+
+        monkeypatch.setattr(provider, "get_auth_header", unexpected_auth)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(unexpected_request)) as client:
+            with pytest.raises(ValueError, match="response_format"):
+                await provider.acompletion(client, response_format=response_format)
+        assert response_format == original
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("with_tools", [False, True])
+@pytest.mark.parametrize("tool_choice, expected", [
+    ("auto", "auto"),
+    ("none", "none"),
+    ("required", "required"),
+    ({"type": "function", "function": {"name": "report_result"}},
+     {"type": "function", "name": "report_result"}),
+])
+def test_codex_acompletion_preserves_tool_choice(
+    monkeypatch, stream, with_tools, tool_choice, expected
+):
+    original = deepcopy(tool_choice)
+    kwargs = {"stream": stream, "tool_choice": tool_choice}
+    if with_tools:
+        kwargs["tools"] = [{"type": "function", "function": {
+            "name": "report_result", "parameters": {"type": "object", "properties": {}}
+        }}]
+    payload = asyncio.run(_capture_codex_completion_payload(monkeypatch, **kwargs))
+    assert payload["tool_choice"] == expected
+    if with_tools:
+        assert payload["tools"][0]["name"] == "report_result"
+    assert tool_choice == original
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("with_tools", [False, True])
+def test_codex_acompletion_default_tool_choice(monkeypatch, stream, with_tools):
+    kwargs = {"stream": stream}
+    if with_tools:
+        kwargs["tools"] = [{"type": "function", "function": {
+            "name": "report_result", "parameters": {"type": "object", "properties": {}}
+        }}]
+    payload = asyncio.run(_capture_codex_completion_payload(monkeypatch, **kwargs))
+    if with_tools:
+        assert payload["tool_choice"] == "auto"
+    else:
+        assert "tool_choice" not in payload
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("tool_choice", [
+    None, False, 1, [], "", "any", {}, {"type": []}, {"type": "custom"},
+    {"type": "function"}, {"type": "function", "function": []},
+    {"type": "function", "name": "report_result"},
+    {"type": "function", "function": {"name": "report_result"}, "extra": True},
+    *[
+        {"type": "function", "function": function}
+        for function in [
+            {}, {"name": None}, {"name": 1}, {"name": []}, {"name": ""},
+            {"name": "bad name"}, {"name": "x" * 65},
+            {"name": "report_result", "extra": True},
+        ]
+    ],
+])
+def test_codex_acompletion_rejects_invalid_tool_choice_before_io(
+    monkeypatch, stream, tool_choice
+):
+    async def exercise():
+        provider = CodexProvider()
+        original = deepcopy(tool_choice)
+
+        async def unexpected_auth(_credential):
+            pytest.fail("invalid tool choice reached credential I/O")
+
+        def unexpected_request(_request):
+            pytest.fail("invalid tool choice reached upstream")
+
+        monkeypatch.setattr(provider, "get_auth_header", unexpected_auth)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(unexpected_request)) as client:
+            with pytest.raises(ValueError, match="tool_choice"):
+                await provider.acompletion(client, tool_choice=tool_choice, stream=stream)
+        assert tool_choice == original
+
+    asyncio.run(exercise())
 
 
 def test_codex_device_login_uses_cli_flow_and_persists_tokens(monkeypatch, tmp_path):

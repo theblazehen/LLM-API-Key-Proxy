@@ -40,6 +40,7 @@ _CODEX_METADATA_NAMESPACE = uuid.UUID("4707b647-b27b-4d23-9c64-bd099b9a21dd")
 
 import httpx
 import litellm
+from litellm.types.utils import ModelResponseStream
 
 from .provider_interface import ProviderInterface, UsageResetConfigDef, QuotaGroupMap
 from .openai_oauth_base import (
@@ -832,6 +833,73 @@ def _convert_messages_to_responses_input(
     return prepend_items + input_items, system_instruction
 
 
+def _convert_response_format_to_responses(
+    response_format: Any,
+) -> Optional[Dict[str, Any]]:
+    """Translate the Chat format envelope without rewriting its JSON Schema."""
+    if response_format is None:
+        return None
+    if not isinstance(response_format, dict):
+        raise ValueError("response_format must be an object")
+
+    format_type = response_format.get("type")
+    if format_type in ("text", "json_object"):
+        if response_format.keys() - {"type"}:
+            raise ValueError("response_format contains unsupported fields")
+        return {"type": format_type}
+    if format_type != "json_schema":
+        raise ValueError("response_format.type must be text, json_object, or json_schema")
+    if response_format.keys() - {"type", "json_schema"}:
+        raise ValueError("response_format contains unsupported fields")
+
+    specification = response_format.get("json_schema")
+    if not isinstance(specification, dict):
+        raise ValueError("response_format.json_schema must be an object")
+    # The reverse Responses adapter retains the flattened format's type here.
+    if specification.keys() - {"type", "name", "description", "schema", "strict"}:
+        raise ValueError("response_format.json_schema contains unsupported fields")
+    if "type" in specification and specification["type"] != "json_schema":
+        raise ValueError("response_format.json_schema.type must be json_schema")
+    name = specification.get("name")
+    if not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name) is None:
+        raise ValueError("response_format.json_schema.name must be 1-64 letters, digits, underscores, or hyphens")
+    if not isinstance(specification.get("schema"), dict):
+        raise ValueError("response_format.json_schema.schema must be an object")
+    if "description" in specification and not isinstance(specification["description"], str):
+        raise ValueError("response_format.json_schema.description must be a string")
+    if "strict" in specification and specification["strict"] is not None and not isinstance(specification["strict"], bool):
+        raise ValueError("response_format.json_schema.strict must be a boolean or null")
+
+    result = {"type": "json_schema", "name": name, "schema": specification["schema"]}
+    for field in ("description", "strict"):
+        if field in specification:
+            result[field] = specification[field]
+    return result
+
+
+def _convert_tool_choice_to_responses(tool_choice: Any) -> Union[str, Dict[str, Any]]:
+    """Translate Chat tool selection without weakening the caller's constraint."""
+    if isinstance(tool_choice, str):
+        if tool_choice in ("auto", "none", "required"):
+            return tool_choice
+        raise ValueError("tool_choice must be auto, none, required, or a named function")
+    if not isinstance(tool_choice, dict):
+        raise ValueError("tool_choice must be a string or an object")
+    if tool_choice.get("type") != "function":
+        raise ValueError("tool_choice.type must be function")
+    if tool_choice.keys() - {"type", "function"}:
+        raise ValueError("tool_choice contains unsupported fields")
+    function = tool_choice.get("function")
+    if not isinstance(function, dict):
+        raise ValueError("tool_choice.function must be an object")
+    if function.keys() - {"name"}:
+        raise ValueError("tool_choice.function contains unsupported fields")
+    name = function.get("name")
+    if not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name) is None:
+        raise ValueError("tool_choice.function.name must be 1-64 letters, digits, underscores, or hyphens")
+    return {"type": "function", "name": name}
+
+
 def _convert_tools_to_responses_format(
     tools: Optional[List[Dict[str, Any]]],
 ) -> List[Dict[str, Any]]:
@@ -1205,6 +1273,33 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                 ),
             ) from exc
 
+    def _note_quota_denial(
+        self, credential_path: str, status_code: int, body: str
+    ) -> None:
+        """Withdraw authoritative admission once upstream actually denies quota.
+
+        A fresh usage-API admission allows routing into a 100%-reported window,
+        which is only safe while upstream still honours it. The moment a 429
+        ``usage_limit_reached`` is observed, that admission is disproven and must
+        not survive on its own freshness — otherwise the router keeps selecting a
+        credential that is actively refusing, which is precisely the storm the
+        admission exists to prevent.
+        """
+        if status_code != 429 or not credential_path or not body:
+            return
+        try:
+            parsed = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            return
+        error = parsed.get("error") if isinstance(parsed, dict) else None
+        if not isinstance(error, dict) or error.get("type") != "usage_limit_reached":
+            return
+        self.revoke_main_admission(credential_path)
+        lib_logger.info(
+            "Codex upstream denied quota for %s; authoritative admission withdrawn",
+            Path(credential_path).name,
+        )
+
     async def aresponses(
         self, client: httpx.AsyncClient, **kwargs
     ) -> Union[Dict[str, Any], AsyncGenerator[bytes, None]]:
@@ -1272,6 +1367,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                 credential_path, {k.lower(): v for k, v in response.headers.items()}
             )
         if response.status_code >= 400:
+            self._note_quota_denial(
+                credential_path, response.status_code, response.text
+            )
             await self._recover_unauthorized_credential(
                 credential_path, response.status_code
             )
@@ -1318,6 +1416,10 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                 )
             if response.status_code >= 400:
                 body = await response.aread()
+                body_text = body.decode("utf-8", errors="replace")
+                self._note_quota_denial(
+                    credential_path, response.status_code, body_text
+                )
                 await self._recover_unauthorized_credential(
                     credential_path, response.status_code
                 )
@@ -1328,7 +1430,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                 raise httpx.HTTPStatusError(
                     (
                         f"Codex Responses error {response.status_code}: "
-                        f"{body.decode('utf-8', errors='replace')}"
+                        f"{body_text}"
                     ),
                     request=response.request,
                     response=response,
@@ -1341,7 +1443,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
 
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
-    ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
+    ) -> Union[litellm.ModelResponse, AsyncGenerator[ModelResponseStream, None]]:
         """
         Handle chat completion request using Responses API.
         """
@@ -1351,13 +1453,16 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         messages = kwargs.get("messages", [])
         stream = kwargs.get("stream", False)
         tools = kwargs.get("tools")
-        tool_choice = kwargs.get("tool_choice", "auto")
+        tool_choice = _convert_tool_choice_to_responses(kwargs.get("tool_choice", "auto"))
         parallel_tool_calls = kwargs.get("parallel_tool_calls", False)
         credential_path = kwargs.pop(
             "credential_identifier", kwargs.get("credential_path", "")
         )
         reasoning_effort = kwargs.get("reasoning_effort", DEFAULT_REASONING_EFFORT)
         extra_headers = kwargs.get("extra_headers", {})
+        response_format = _convert_response_format_to_responses(
+            kwargs.get("response_format")
+        )
 
         # Normalize model name
         requested_model = model
@@ -1428,6 +1533,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             },  # Match pi's default; controls output structure
         }
 
+        if response_format is not None:
+            payload["text"]["format"] = response_format
+
         prompt_cache_key = kwargs.get("prompt_cache_key")
         if prompt_cache_key is not None:
             payload["prompt_cache_key"] = prompt_cache_key
@@ -1443,10 +1551,10 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
 
         if responses_tools:
             payload["tools"] = responses_tools
-            payload["tool_choice"] = (
-                tool_choice if tool_choice in ("auto", "none") else "auto"
-            )
             payload["parallel_tool_calls"] = bool(parallel_tool_calls)
+
+        if responses_tools or "tool_choice" in kwargs:
+            payload["tool_choice"] = tool_choice
 
         if reasoning_param:
             payload["reasoning"] = reasoning_param
@@ -1498,7 +1606,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         reasoning_compat: str,
         credential_path: str = "",
         trace: Any = None,
-    ) -> AsyncGenerator[litellm.ModelResponse, None]:
+    ) -> AsyncGenerator[ModelResponseStream, None]:
         """
         Pass Responses API chunks through without destroying streaming latency.
 
@@ -1588,6 +1696,23 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
 
             return response
 
+    @staticmethod
+    def _check_response_terminal_event(evt: Dict[str, Any]) -> None:
+        """Keep unsuccessful Responses terminals on the existing error path."""
+        kind = evt.get("type")
+        response = evt.get("response")
+        response = response if isinstance(response, dict) else {}
+        if kind in {"response.failed", "response.incomplete", "error"} or (
+            kind == "response.completed"
+            and response.get("status") not in (None, "completed")
+        ):
+            # Retain the entire event, including provider error codes and
+            # incomplete_details.reason, rather than reducing it to a message.
+            raise StreamedAPIError(
+                f"Codex Responses terminal error ({kind}): {json.dumps(evt)}",
+                data=evt,
+            )
+
     async def _stream_response(
         self,
         client: httpx.AsyncClient,
@@ -1597,7 +1722,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         reasoning_compat: str,
         credential_path: str = "",
         trace: Any = None,
-    ) -> AsyncGenerator[litellm.ModelResponse, None]:
+    ) -> AsyncGenerator[ModelResponseStream, None]:
         """Handle streaming response from Responses API."""
         created = int(time.time())
         response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
@@ -1609,6 +1734,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         sent_reasoning = False
         streaming_reasoning = False  # True once we start streaming reasoning_content
         emitted_output = False
+        completed = False
 
         _trace_headers(trace, "provider_request", headers, metadata={"boundary": "chat_via_responses"})
         async with client.stream(
@@ -1633,6 +1759,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             if response.status_code >= 400:
                 error_body = await response.aread()
                 error_text = error_body.decode("utf-8", errors="ignore")
+                self._note_quota_denial(
+                    credential_path, response.status_code, error_text
+                )
                 lib_logger.error(
                     f"Codex API error {response.status_code}: {error_text[:500]}"
                 )
@@ -1653,7 +1782,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                     continue
 
                 data = line[6:].strip()
-                if not data or data == "[DONE]":
+                if data == "[DONE]":
+                    break
+                if not data:
                     continue
 
                 try:
@@ -1662,6 +1793,8 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                     continue
 
                 kind = evt.get("type")
+
+                self._check_response_terminal_event(evt)
 
                 # Handle response ID
                 if isinstance(evt.get("response"), dict):
@@ -1678,7 +1811,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                             True  # Content has started, reasoning phase is over
                         )
 
-                        chunk = litellm.ModelResponse(
+                        chunk = ModelResponseStream(
                             id=response_id,
                             created=created,
                             model=model,
@@ -1703,7 +1836,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                     if rdelta:
                         emitted_output = True
                         streaming_reasoning = True
-                        chunk = litellm.ModelResponse(
+                        chunk = ModelResponseStream(
                             id=response_id,
                             created=created,
                             model=model,
@@ -1727,7 +1860,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                     if rdelta:
                         emitted_output = True
                         streaming_reasoning = True
-                        chunk = litellm.ModelResponse(
+                        chunk = ModelResponseStream(
                             id=response_id,
                             created=created,
                             model=model,
@@ -1792,7 +1925,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                                 arguments = tc["arguments"]
 
                         emitted_output = True
-                        chunk = litellm.ModelResponse(
+                        chunk = ModelResponseStream(
                             id=response_id,
                             created=created,
                             model=model,
@@ -1821,7 +1954,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
 
                 # Handle completion
                 elif kind == "response.completed":
-                    resp_diag = evt.get("response", {})
+                    completed = True
 
                     # Determine finish reason
                     finish_reason = "stop"
@@ -1840,7 +1973,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                         )
                         if rtxt:
                             emitted_output = True
-                            chunk = litellm.ModelResponse(
+                            chunk = ModelResponseStream(
                                 id=response_id,
                                 created=created,
                                 model=model,
@@ -1902,7 +2035,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                             }
 
                     # Send final chunk
-                    final_chunk = litellm.ModelResponse(
+                    final_chunk = ModelResponseStream(
                         id=response_id,
                         created=created,
                         model=model,
@@ -1920,12 +2053,10 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                     yield final_chunk
                     break
 
-                # Handle errors
-                elif kind == "response.failed":
-                    error = evt.get("response", {}).get("error", {})
-                    error_msg = error.get("message", "Response failed")
-                    lib_logger.error(f"Codex response failed: {error_msg}")
-                    raise StreamedAPIError(f"Codex response failed: {error_msg}")
+        if not completed:
+            raise StreamedAPIError(
+                "Codex Responses stream ended without response.completed"
+            )
 
     async def _non_stream_response(
         self,
@@ -1947,7 +2078,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         reasoning_full_text = ""
         tool_calls: List[Dict[str, Any]] = []
         usage = None
-        error_message = None
+        completed = False
 
         trace_metadata = {"boundary": "chat_via_responses", "attempt": attempt}
         _trace_headers(trace, "provider_request", headers, metadata=trace_metadata)
@@ -1973,6 +2104,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             if response.status_code >= 400:
                 error_body = await response.aread()
                 error_text = error_body.decode("utf-8", errors="ignore")
+                self._note_quota_denial(
+                    credential_path, response.status_code, error_text
+                )
                 lib_logger.error(
                     f"Codex API error {response.status_code}: {error_text[:500]}"
                 )
@@ -1993,8 +2127,10 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                     continue
 
                 data = line[6:].strip()
-                if not data or data == "[DONE]":
+                if data == "[DONE]":
                     break
+                if not data:
+                    continue
 
                 try:
                     evt = json.loads(data)
@@ -2002,6 +2138,8 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                     continue
 
                 kind = evt.get("type")
+
+                self._check_response_terminal_event(evt)
 
                 # Handle response ID
                 if isinstance(evt.get("response"), dict):
@@ -2040,6 +2178,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
 
                 # Extract usage
                 elif kind == "response.completed":
+                    completed = True
                     resp_data = evt.get("response", {})
                     if isinstance(resp_data.get("usage"), dict):
                         u = resp_data["usage"]
@@ -2075,13 +2214,12 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                                 "reasoning_tokens": reasoning
                             }
 
-                # Handle errors
-                elif kind == "response.failed":
-                    error = evt.get("response", {}).get("error", {})
-                    error_message = error.get("message", "Response failed")
+                    break
 
-        if error_message:
-            raise StreamedAPIError(f"Codex response failed: {error_message}")
+        if not completed:
+            raise StreamedAPIError(
+                "Codex Responses stream ended without response.completed"
+            )
 
         if not full_text and not reasoning_summary_text and not reasoning_full_text and not tool_calls:
             raise EmptyResponseError(

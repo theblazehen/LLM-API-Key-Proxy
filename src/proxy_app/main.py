@@ -634,8 +634,11 @@ async def lifespan(app: FastAPI):
     app.state.rotating_client = client
     from proxy_app.codex_live import CodexLiveGateway
     from rotator_library.client.codex_live import CodexLiveBackend
+    from proxy_app.realtime import RealtimeGateway
+    from rotator_library.client.realtime import RealtimeBackend
 
     app.state.codex_live = CodexLiveGateway(CodexLiveBackend(client), PROXY_API_KEYS)
+    app.state.realtime = RealtimeGateway(RealtimeBackend(client), PROXY_API_KEYS)
 
     # Warn if no provider credentials are configured
     if not client.all_credentials:
@@ -669,6 +672,7 @@ async def lifespan(app: FastAPI):
     yield
 
     await app.state.codex_live.close()
+    await app.state.realtime.close()
     await client.background_refresher.stop()  # Stop the background task on shutdown
     if app.state.embedding_batcher:
         await app.state.embedding_batcher.stop()
@@ -687,8 +691,10 @@ async def lifespan(app: FastAPI):
 # --- FastAPI App Setup ---
 app = FastAPI(lifespan=lifespan)
 from proxy_app.codex_live import router as codex_live_router
+from proxy_app.realtime import router as realtime_router
 
 app.include_router(codex_live_router)
+app.include_router(realtime_router)
 
 # Add CORS middleware to allow all origins, methods, and headers
 app.add_middleware(

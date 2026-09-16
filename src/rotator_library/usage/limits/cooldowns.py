@@ -49,6 +49,14 @@ class CooldownChecker(LimitChecker):
             add_scope("weekly-limit")
         add_scope("_global_")
 
+        # Upstream's usage API is the authority on whether ordinary traffic is
+        # still admitted. Header percentages reach 100 before upstream actually
+        # denies, so a fresh admission of `allowed`/`not limit_reached` outranks
+        # exhaustion inferred from `used_percent >= 100`. Without it, credentials
+        # upstream still serves are parked while the router falls through to a
+        # credential that is genuinely failing.
+        admitted = state.has_main_quota_admission()
+
         for scope in scopes:
             cooldown = state.cooldowns.get(scope)
             if not cooldown or cooldown.until <= now:
@@ -56,7 +64,7 @@ class CooldownChecker(LimitChecker):
             if (scope in {"5h-limit", "weekly-limit"}
                     and cooldown.source == "api_quota"
                     and cooldown.reason == "quota_exhausted"
-                    and state.has_usable_luna_reserve(model)):
+                    and (admitted or state.has_usable_luna_reserve(model))):
                 continue
 
             label = "Global cooldown" if scope == "_global_" else f"Cooldown for '{scope}'"
@@ -73,7 +81,8 @@ class CooldownChecker(LimitChecker):
         # Its expiry must not erase the independent authoritative exhaustion.
         quota = state.codex_quota
         if (state.provider == "codex" and quota_group == "codex-global"
-                and quota is not None and not state.has_usable_luna_reserve(model)):
+                and quota is not None and not admitted
+                and not state.has_usable_luna_reserve(model)):
             for window in (quota.primary, quota.secondary):
                 if (window is not None and window.is_exhausted
                         and window.reset_at is not None and window.reset_at > now):

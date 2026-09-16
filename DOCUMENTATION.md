@@ -1668,6 +1668,90 @@ QUOTA_GROUPS_GEMINI_CLI_3_FLASH="gemini-3-flash-preview"
 
 ---
 
+## Standard OpenAI Realtime gateway
+
+The proxy supports the public OpenAI Realtime protocol separately from the Codex
+GPT-Live gateway below. It uses the existing **Codex OAuth credential pool** to
+connect to `api.openai.com`; no separately configured OpenAI API key was needed
+for the verified accounts. Native audio, conversation, function-call and tool-result
+events pass through unchanged. The caller executes tools; the proxy does not run
+an agent or translate the session into Chat Completions/Responses.
+
+### Endpoints and authentication
+
+Use `Authorization: Bearer YOUR_PROXY_KEY`, not an upstream OAuth token.
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| WebSocket | `/v1/realtime?model=gpt-realtime-2.1` | Full native Realtime event/audio connection |
+| POST | `/v1/realtime/calls` | WebRTC offer; raw SDP answer and proxy `Location`/sideband `Link` |
+| WebSocket | `/v1/realtime?call_id=CALL_ID` | Owner-scoped sideband for a proxy-created WebRTC call |
+| POST | `/v1/realtime/calls/CALL_ID/hangup` | End the owned WebRTC call |
+| DELETE | `/v1/realtime/calls/CALL_ID` | Equivalent cleanup, returning `204` on success |
+| POST | `/v1/realtime/client_secrets` | Mint a native ephemeral credential for direct browser/client access to OpenAI |
+
+For server SDKs, configure the proxy's `/v1` base URL and your proxy key. The native
+WebSocket address is, for example,
+`wss://proxy.example.com/v1/realtime?model=gpt-realtime-2.1`.
+Use unprefixed upstream model names on these endpoints. The default is
+`gpt-realtime-2.1`; this does not add voice models to the text-oriented `/v1/models`
+catalog. Model/tier admission still uses the existing Codex credential policy.
+
+WebRTC setup accepts the standard unified multipart request, with `sdp` and
+JSON-encoded `session` text fields:
+
+```sh
+curl https://proxy.example.com/v1/realtime/calls \
+  -H "Authorization: Bearer $PROXY_KEY" \
+  --form 'sdp=<offer.sdp;type=application/sdp' \
+  --form 'session={"type":"realtime","model":"gpt-realtime-2.1","audio":{"output":{"voice":"marin"}}};type=application/json'
+```
+
+It also accepts JSON `{"sdp":"v=0...","session":{"type":"realtime","model":"gpt-realtime-2.1"}}`,
+or raw `application/sdp` with an optional `?model=...` query. Follow the returned
+`Location` and `Link`, including any deployment root path. A successful sideband
+handshake means it is attached; an initial `session.created` event is not promised
+for an existing call.
+
+For browser-direct connections, mint a client secret with a JSON request such as
+`{"session":{"type":"realtime","model":"gpt-realtime-2.1"}}`. Use the returned
+`value` against OpenAI, following its [WebRTC guide](https://developers.openai.com/api/docs/guides/voice-webrtc?api=realtime).
+**This is a direct-client escape from the proxy transport:** the proxy observes
+and accounts for credential minting only, cannot track the subsequent session's
+duration/usage, and does not register that direct call for its sideband/hangup routes.
+Use proxy-created `/calls` when proxy-managed ownership and cleanup are needed.
+
+### Ownership, limits and quota scope
+
+Each proxied connection/call holds one credential lease for its lifetime and never
+rotates accounts mid-session. WebRTC setup, sideband and hangup must reach the
+same proxy process. Foreign owners see `404`; only one sideband may attach at a
+time. Closing the sideband also ends its WebRTC call. Disconnects, expiry and
+shutdown close transports and release the lease; cancellation during setup waits
+for a late successful call creation so it can hang that call up too.
+
+The gateway bounds active/pending sessions to 64, session lifetime to one hour,
+and HTTP bodies/WebSocket messages to 1 MiB. Upstream setup errors and safe
+diagnostic/rate-limit headers are preserved, without silently retrying call setup.
+
+Public Realtime uses its own `openai-realtime` usage group, retaining shared
+credential concurrency, model/tier restrictions and global failure cooldowns.
+**Codex text-window exhaustion is not applied to this separate API.** A native
+smoke observed a Codex-weekly-exhausted account successfully producing Realtime
+function calls and audio. This establishes different admission behavior, **not
+unlimited usage, an included subscription allowance, or a known billing policy**.
+Actual Realtime upstream rejections still apply.
+
+### Verified behavior
+
+On 2026-09-13, the real proxy runtime completed GPT-Realtime-2.1 function-call,
+fresh tool-result and spoken-transcript round trips over all three paths:
+proxied WebSocket, proxy-minted client secret, and WebRTC with proxy sideband.
+The WebRTC path reached completed ICE and received actual RTP audio frames;
+all created sessions were closed. Direct access probes also succeeded for
+`gpt-realtime-2`, `gpt-realtime-1.5`, `gpt-realtime` and `gpt-realtime-mini`.
+Availability remains account/upstream-dependent; this is not an exhaustive catalog.
+
 ## Codex live gateway v1 (experimental)
 
 This is **this proxy's experimental client contract**, based on pinned Codex/OMP source, **not an official public OpenAI Realtime API standard**. It exposes native Codex live WebRTC signaling and a credential-affine sideband WebSocket. It does not translate live requests into Chat Completions or Responses, normalize native events, or execute an agent.

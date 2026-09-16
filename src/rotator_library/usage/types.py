@@ -362,6 +362,17 @@ class CredentialState:
                 return False
         return self.codex_quota.has_usable_luna_reserve
 
+    def has_main_quota_admission(self) -> bool:
+        """True only while upstream's usage API still admits ordinary traffic.
+
+        Applies to every Codex model, unlike the reserve. Header-only state
+        never satisfies this, so a missing or stale admission leaves the
+        conservative ``used_percent >= 100`` parking in force.
+        """
+        if self.provider != "codex" or self.codex_quota is None:
+            return False
+        return self.codex_quota.main_quota_admits
+
     # Metadata
     created_at: Optional[float] = None
     last_updated: Optional[float] = None

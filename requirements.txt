@@ -1,5 +1,6 @@
 # FastAPI framework for building the proxy server
 fastapi
+python-multipart>=0.0.20
 # ASGI server for running the FastAPI application
 uvicorn
 # For loading environment variables from a .env file
