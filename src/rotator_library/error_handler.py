@@ -5,7 +5,7 @@ import re
 import json
 import os
 import logging
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, List, Tuple
 import httpx
 
 from .core.constants import COOLDOWN_RATE_LIMIT_DEFAULT, COOLDOWN_TRANSIENT_ERROR
@@ -762,6 +762,134 @@ def get_retry_after(error: Exception) -> Optional[int]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Streamed provider errors (native Responses ``error`` / ``response.failed``)
+#
+# A native Responses failure arrives as a *parsed event*, not an exception: the
+# streaming transport is already open and committed, so there is no HTTP status
+# on the exception to read. Classifying these by their error type/code is what
+# keeps a transient upstream overload retryable; without it the event falls
+# through to the ``unknown`` fallback, which rotates the credential and parks a
+# healthy key on a long cooldown while dropping the real failure reason.
+# ---------------------------------------------------------------------------
+
+_STREAM_TRANSIENT_ERROR_TOKENS = frozenset(
+    {
+        "server_error",
+        "internal_error",
+        "internal_server_error",
+        "service_unavailable_error",
+        "service_unavailable",
+        "overloaded_error",
+        "server_is_overloaded",
+        "model_error",
+        "timeout_error",
+    }
+)
+
+_STREAM_INVALID_REQUEST_TOKENS = frozenset(
+    {
+        "invalid_request_error",
+        "invalid_request",
+        "bad_request",
+        "unsupported_parameter",
+        "invalid_value",
+    }
+)
+
+
+def _streamed_error_tokens(event: Any) -> List[str]:
+    """Collect lowercased diagnostic type/code tokens from a streamed error event.
+
+    Native Responses nests the diagnostic under ``error`` (``error`` events) or
+    ``response.error`` (``response.failed``), so every carrier is visited. The
+    lifecycle name itself (``error``, ``response.failed``) is included too.
+    """
+    tokens: List[str] = []
+    if not isinstance(event, dict):
+        return tokens
+
+    candidates: List[Any] = [event]
+    inner = event.get("error")
+    if isinstance(inner, dict):
+        candidates.append(inner)
+    response = event.get("response")
+    if isinstance(response, dict):
+        nested = response.get("error")
+        if isinstance(nested, dict):
+            candidates.append(nested)
+
+    for candidate in candidates:
+        for key in ("type", "code"):
+            value = candidate.get(key)
+            if isinstance(value, str) and value.strip():
+                tokens.append(value.strip().lower())
+    return tokens
+
+
+def _serialize_streamed_event(event: Any) -> Optional[str]:
+    """Render a streamed error event as the JSON body provider parsers expect."""
+    if event is None:
+        return None
+    if isinstance(event, str):
+        return event
+    if isinstance(event, Exception):
+        return str(event)
+    try:
+        return json.dumps(event)
+    except (TypeError, ValueError):
+        return str(event)
+
+
+def is_transient_streamed_error(event: Any) -> bool:
+    """Whether a streamed provider error is a transient, retryable overload."""
+    tokens = _streamed_error_tokens(event)
+    return any(token in _STREAM_TRANSIENT_ERROR_TOKENS for token in tokens)
+
+
+def _streamed_event_body(e: Exception) -> Optional[str]:
+    """Serialized event body for a ``StreamedAPIError``, otherwise ``None``.
+
+    Resolved by class name rather than ``isinstance``: ``core.errors`` imports
+    this module, so importing ``StreamedAPIError`` at module scope would be
+    circular.
+    """
+    if type(e).__name__ != "StreamedAPIError":
+        return None
+    return _serialize_streamed_event(getattr(e, "data", None))
+
+
+def classify_streamed_error(e: Exception) -> Optional[ClassifiedError]:
+    """Classify a streamed provider error from its parsed event payload.
+
+    Only a ``StreamedAPIError`` carries an event payload; any other exception
+    reaching the caller's fallback is left alone, so an unrelated exception with
+    an incidental ``data`` attribute cannot be reinterpreted. Returns ``None``
+    when the event carries no diagnostic the streaming layer understands.
+    """
+    event = getattr(e, "data", None)
+    if type(e).__name__ != "StreamedAPIError" or not isinstance(event, dict):
+        return None
+    tokens = _streamed_error_tokens(event)
+
+    # A deterministic request rejection fails identically on replay, so it must
+    # neither consume another credential nor earn a transient cooldown.
+    if any(token in _STREAM_INVALID_REQUEST_TOKENS for token in tokens):
+        return ClassifiedError(
+            error_type="invalid_request", original_exception=e, status_code=400
+        )
+
+    if is_transient_streamed_error(event):
+        return ClassifiedError(
+            error_type="server_error",
+            original_exception=e,
+            status_code=503,
+            retry_after=COOLDOWN_TRANSIENT_ERROR,
+        )
+
+    return None
+
+
 def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedError:
     """
     Classifies an exception into a structured ClassifiedError object.
@@ -797,7 +925,9 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             provider_class = PROVIDER_PLUGINS.get(provider)
 
             if provider_class and hasattr(provider_class, "parse_quota_error"):
-                # Get error body if available
+                # Get error body if available. A streamed provider error carries
+                # its event payload on the exception instead of an HTTP
+                # response, so both carriers are offered to the parser.
                 error_body = None
                 if hasattr(e, "response"):
                     try:
@@ -806,6 +936,8 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                         pass
                 elif hasattr(e, "body"):
                     error_body = str(e.body)
+                else:
+                    error_body = _streamed_event_body(e)
 
                 quota_info = provider_class.parse_quota_error(e, error_body)
 
@@ -1071,6 +1203,15 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             status_code=status_code or 503,
             retry_after=COOLDOWN_TRANSIENT_ERROR,
         )
+
+    # A streamed provider error carries its diagnostic as a parsed event rather
+    # than an HTTP status, so it reaches this point unclassified. Classify it
+    # from the event's type/code before falling back to `unknown`: a transient
+    # overload must stay retryable/short-cooldown instead of being recorded as
+    # an unidentifiable failure.
+    streamed = classify_streamed_error(e)
+    if streamed is not None:
+        return streamed
 
     # Fallback for any other unclassified errors
     return ClassifiedError(

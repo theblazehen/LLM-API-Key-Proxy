@@ -55,11 +55,16 @@ class StreamedAPIError(Exception):
     Attributes:
         message: Human-readable error message
         data: The parsed error data (dict or exception)
+        replay_safe: Whether the failed attempt never reached the client, making a
+            second attempt with the same credential safe. Defaults to ``False``:
+            a failure reported after content has already streamed cannot be
+            replayed without duplicating output.
     """
 
-    def __init__(self, message: str, data=None):
+    def __init__(self, message: str, data=None, *, replay_safe: bool = False):
         super().__init__(message)
         self.data = data
+        self.replay_safe = replay_safe
 
 
 __all__ = [

@@ -18,6 +18,7 @@ on:
       - "tests/test_sequential_quota_routing.py"
       - "tests/test_codex_quota_ingestion.py"
       - "tests/test_codex_luna_reserve.py"
+      - "tests/test_native_responses_executor.py"
       - ".github/workflows/docker-build.yml"
       - "Dockerfile"
       - "requirements.txt"
@@ -56,6 +57,10 @@ jobs:
           .venv/bin/python -m pytest -q tests/test_sequential_quota_routing.py
           .venv/bin/python -m pytest -q tests/test_codex_quota_ingestion.py
           .venv/bin/python -m pytest -q tests/test_codex_luna_reserve.py
+          # Native Responses stream contract: guards the SSE record framing that
+          # the client parses, and the streamed-error classification that decides
+          # whether a transient overload rotates a credential or is retried.
+          .venv/bin/python -m pytest -q tests/test_native_responses_executor.py
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

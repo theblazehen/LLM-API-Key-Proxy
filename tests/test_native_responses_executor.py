@@ -18,8 +18,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from rotator_library.client.executor import RequestExecutor
+from rotator_library.core.errors import StreamedAPIError
 from rotator_library.core.types import RequestContext
-from rotator_library.error_handler import classify_error
+from rotator_library.error_handler import classify_error, should_retry_same_key, should_rotate_on_error
 from rotator_library.providers.codex_provider import CodexProvider
 from rotator_library.providers import codex_provider
 
@@ -453,13 +454,31 @@ class _SSESuccessResponse:
         yield "data: [DONE]"
 
 
+class _SSECompletedResponse(_SSESuccessResponse):
+    """A stream that also announces its terminal `response.completed` event.
+
+    Needed by callers that route through `_stream_response`, which requires the
+    terminal event and rejects a stream that ends without it. Kept separate from
+    the plain passthrough fixture so each test's input reflects its own contract.
+    """
+
+    async def aiter_lines(self):
+        yield 'data: {"type":"response.output_text.delta","delta":"ok"}'
+        yield (
+            'data: {"type":"response.completed","response":'
+            '{"id":"resp_sse","object":"response","status":"completed","output":[]}}'
+        )
+        yield "data: [DONE]"
+
+
 class _SSEClient:
-    def __init__(self):
+    def __init__(self, response_factory=_SSESuccessResponse):
         self.headers = None
+        self._response_factory = response_factory
 
     def stream(self, *_args, headers, **_kwargs):
         self.headers = headers
-        return _SSESuccessResponse()
+        return self._response_factory()
 
 
 def _fragmented_native_stream(chunks):
@@ -549,6 +568,400 @@ def test_native_stream_wrapper_preserves_compaction_events_and_items_byte_identi
     )
 
     assert output == chunks
+
+
+def _sse_frame_bytes(raw: str) -> list[bytes]:
+    """Split an SSE document into the chunks the provider emits, line by line.
+
+    ``CodexProvider._stream_native_responses`` forwards the upstream body one
+    line at a time, emitting a bare ``b"\\n"`` for each blank separator. This
+    reproduces that chunking so the framing contract is exercised the way the
+    real transport delivers it.
+    """
+    chunks: list[bytes] = []
+    for line in raw.split("\n"):
+        chunks.append(b"\n" if line == "" else f"{line}\n".encode("utf-8"))
+    return chunks
+
+
+# Upstream bytes captured from the live deployment for a transient overload
+# (codex/gpt-6-astra): a single `event: error` frame whose diagnostic is
+# `service_unavailable_error` / `server_is_overloaded`.
+_LIVE_UPSTREAM_OVERLOAD_FRAME = (
+    'event: error\n'
+    'data: {"type":"error","error":{"type":"service_unavailable_error",'
+    '"code":"server_is_overloaded","message":"Our servers are currently '
+    'overloaded. Please try again later.","param":null},"sequence_number":2}\n'
+    '\n'
+)
+
+
+def _records(data: bytes) -> list[list[str]]:
+    """Split client-visible SSE bytes into records of their `data:` lines.
+
+    Mirrors the SSE rule that a blank line dispatches a record and that multiple
+    `data:` lines within one record are joined with "\\n" — the join the client
+    parses as a single JSON document.
+    """
+    text = data.decode("utf-8")
+    return [
+        [line for line in record.splitlines() if line.startswith("data:")]
+        for record in text.split("\n\n")
+        if record.strip()
+    ]
+
+
+class _OverloadNativePlugin(_NativeStreamingPlugin):
+    """Streams the captured upstream overload frame, then ends."""
+
+    async def aresponses(self, _client, **kwargs):
+        self.kwargs = kwargs
+
+        async def chunks():
+            for chunk in _sse_frame_bytes(_LIVE_UPSTREAM_OVERLOAD_FRAME):
+                yield chunk
+
+        return chunks()
+
+
+def _run_streaming_case(plugin, *, return_credentials: bool = False):
+    """Drive the streaming executor end-to-end against a native plugin.
+
+    Returns the concatenated client-visible bytes, and optionally the sequence of
+    credentials the executor attempted (to prove rotation did not happen).
+    """
+    executor = RequestExecutor.__new__(RequestExecutor)
+    executor._transforms = SimpleNamespace(apply=lambda *_args, **_kwargs: None)
+
+    attempted: list[str] = []
+
+    async def prepare(_provider, _model, _cred, _context):
+        attempted.append(_cred)
+        return {
+            "model": "codex/gpt-6-astra",
+            "stream": True,
+            "_use_responses": True,
+        }
+
+    executor._prepare_request_kwargs = prepare
+    executor._get_plugin_instance = lambda _provider: plugin
+    executor._run_pre_request_callback = lambda *_args: asyncio.sleep(0)
+    executor._max_retries = 2
+    executor._http_client = object()
+    executor._wait_for_cooldown = lambda *_args: asyncio.sleep(0)
+    executor._log_acquiring_credential = lambda *_args: None
+    executor._log_acquired_credential = lambda *_args: None
+
+    class CredentialContext:
+        credential = "credential.json"
+        stable_id = "stable"
+
+        def mark_failure(self, _classified):
+            return None
+
+        def mark_success(self, **_usage):
+            return None
+
+    class Acquired:
+        async def __aenter__(self):
+            return CredentialContext()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class UsageManager:
+        states = {}
+
+        async def get_availability_stats(self, *_args):
+            return {"available": 1, "total": 1}
+
+        async def acquire_credential(self, **_kwargs):
+            return Acquired()
+
+    async def prepare_execution(_context):
+        return UsageManager(), SimpleNamespace(priorities={}), ["credential.json"], None, {}
+
+    executor._prepare_execution = prepare_execution
+    context = RequestContext(
+        model="codex/gpt-6-astra",
+        provider="codex",
+        kwargs={"stream": True, "_use_responses": True},
+        streaming=True,
+        credentials=["credential.json"],
+        deadline=time.time() + 30,
+        request=SimpleNamespace(headers={}, state=SimpleNamespace(llm_trace=None)),
+    )
+
+    chunks: list[bytes] = []
+    for chunk in asyncio.run(_collect(executor._execute_streaming(context))):
+        chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
+    delivered = b"".join(chunks)
+    if return_credentials:
+        return delivered, attempted
+    return delivered
+
+
+def test_native_overload_attempt_is_withheld_from_the_client():
+    """A replay-safe failure must not leak the abandoned attempt.
+
+    Withholding is what makes a retry possible: if the failed frame reached the
+    client, the retry's output would be unread, and the dangling partial record
+    would merge with the next envelope into invalid JSON. The client must
+    therefore see only well-formed records, and none may carry two `data:` lines.
+    """
+    delivered = _run_streaming_case(_OverloadNativePlugin())
+
+    data_lines_per_record = _records(delivered)
+    # Only the executor's terminal envelope and [DONE]: the upstream overload
+    # frame for the abandoned attempt is never emitted.
+    assert [len(lines) for lines in data_lines_per_record] == [1, 1]
+    assert data_lines_per_record[0][0].strip().startswith(
+        'data: {"error": {"message": "All 1 credential(s) exhausted'
+    )
+    assert data_lines_per_record[1][0].strip() == "data: [DONE]"
+    assert "service_unavailable_error" not in delivered.decode("utf-8")
+
+
+def test_native_overload_frame_error_is_transient_and_retryable():
+    """The streamed overload must classify as a retryable server_error and be
+    marked replay-safe, so the executor retries instead of rotating.
+
+    Previously it classified as `unknown` (no cooldown, no same-key retry) and
+    the client was handed the merged frame it could not parse.
+    """
+    chunks = _sse_frame_bytes(_LIVE_UPSTREAM_OVERLOAD_FRAME)
+    executor = RequestExecutor.__new__(RequestExecutor)
+
+    with pytest.raises(StreamedAPIError) as caught:
+        async def consume():
+            async for _ in executor._native_responses_stream_wrapper(
+                _fragmented_native_stream(chunks),
+                provider="codex",
+                model="gpt-6-astra",
+                cred_context=_CredentialContext(),
+                transaction_logger=None,
+                llm_trace=None,
+            ):
+                pass
+
+        asyncio.run(consume())
+
+    error = caught.value
+    assert error.replay_safe is True
+    classified = classify_error(error, "codex")
+    assert classified.error_type == "server_error"
+    assert should_retry_same_key(classified) is True
+
+
+class _FlakyNativePlugin:
+    """Overloads the first attempt, then completes the second one."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def supports_responses_api(self):
+        return True
+
+    def has_custom_logic(self):
+        return True
+
+    async def aresponses(self, _client, **kwargs):
+        self.calls += 1
+        attempt = self.calls
+
+        async def chunks():
+            if attempt == 1:
+                for chunk in _sse_frame_bytes(_LIVE_UPSTREAM_OVERLOAD_FRAME):
+                    yield chunk
+                return
+            # A healthy attempt: preamble, visible text, terminal completion.
+            for chunk in _sse_frame_bytes(
+                'event: response.created\n'
+                'data: {"type":"response.created","response":{"id":"resp_retry"}}\n'
+                '\n'
+                'event: response.output_text.delta\n'
+                'data: {"type":"response.output_text.delta","delta":"recovered"}\n'
+                '\n'
+                'event: response.completed\n'
+                'data: {"type":"response.completed","response":{"id":"resp_retry","object":"response",'
+                '"status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":1}}}\n'
+                '\n'
+            ):
+                yield chunk
+
+        return chunks()
+
+
+def test_failure_after_streamed_content_is_forwarded_and_not_replayed():
+    """A failure past the replay boundary must reach the client, never be replayed.
+
+    Once visible output has been forwarded, retracting the attempt would abandon
+    output the client already holds, so the failure is passed through fully framed
+    and marked non-replayable: only accounting and rotation remain.
+    """
+    upstream = (
+        'event: response.created\n'
+        'data: {"type":"response.created","response":{"id":"resp_mid"}}\n'
+        '\n'
+        'event: response.output_text.delta\n'
+        'data: {"type":"response.output_text.delta","delta":"partial answer"}\n'
+        '\n'
+        'event: error\n'
+        'data: {"type":"error","error":{"type":"service_unavailable_error",'
+        '"code":"server_is_overloaded","message":"overloaded"}}\n'
+        '\n'
+        'data: [DONE]\n\n'
+    )
+    executor = RequestExecutor.__new__(RequestExecutor)
+
+    delivered: list[bytes] = []
+    with pytest.raises(StreamedAPIError) as caught:
+        async def consume():
+            async for chunk in executor._native_responses_stream_wrapper(
+                _fragmented_native_stream(_sse_frame_bytes(upstream)),
+                provider="codex",
+                model="gpt-6-astra",
+                cred_context=_CredentialContext(),
+                transaction_logger=None,
+                llm_trace=None,
+            ):
+                delivered.append(chunk if isinstance(chunk, bytes) else chunk.encode())
+
+        asyncio.run(consume())
+
+    text = b"".join(delivered).decode("utf-8")
+    records = [[line for line in r.splitlines() if line.startswith("data:")] for r in text.split("\n\n") if r.strip()]
+    # Every record keeps exactly one `data:` line: nothing merged.
+    assert [len(lines) for lines in records] == [1, 1, 1, 1]
+    assert "partial answer" in text
+    assert "service_unavailable_error" in text
+    assert caught.value.replay_safe is False
+
+    classified = classify_error(caught.value, "codex")
+    # Still identified as transient for accounting, but not safe to replay.
+    assert classified.error_type == "server_error"
+    assert should_retry_same_key(classified) is True
+
+
+def test_native_overload_is_retried_on_the_same_credential():
+    """End-to-end: a transient streamed overload is retried, not rotated.
+
+    This is the behaviour the reclassification alone could not deliver — the
+    executor must sleep on the transient cooldown and re-issue the request.
+    """
+    plugin = _FlakyNativePlugin()
+    delivered, credentials = _run_streaming_case(plugin, return_credentials=True)
+
+    assert plugin.calls == 2, "the overload must trigger a second attempt"
+
+    records = _records(delivered)
+    # The healthy attempt's own records, each well-formed: exactly one
+    # response.created (the withdrawn attempt's preamble is gone), the text
+    # delta, and the terminal completion.
+    assert [len(lines) for lines in records] == [1, 1, 1]
+    assert json.loads(records[0][0][5:].strip())["type"] == "response.created"
+    assert json.loads(records[1][0][5:].strip())["type"] == "response.output_text.delta"
+    assert json.loads(records[2][0][5:].strip())["type"] == "response.completed"
+
+    # The failed attempt left no trace: no upstream error, and no response id the
+    # client would see contradicted by the retry.
+    text = delivered.decode("utf-8")
+    assert "service_unavailable_error" not in text
+    assert "resp_retry" in text
+    assert text.count('"response.created"') == 1
+    assert credentials == ["credential.json"], "must not rotate to another credential"
+
+
+@pytest.mark.parametrize(
+    ("event", "expected_error_type"),
+    [
+        (
+            {
+                "type": "error",
+                "error": {
+                    "type": "service_unavailable_error",
+                    "code": "server_is_overloaded",
+                    "message": "Our servers are currently overloaded.",
+                },
+            },
+            "server_error",
+        ),
+        (
+            {"type": "error", "error": {"type": "server_error", "message": "boom"}},
+            "server_error",
+        ),
+        (
+            {"type": "error", "error": {"type": "overloaded_error", "message": "busy"}},
+            "server_error",
+        ),
+        (
+            {
+                "type": "response.failed",
+                "response": {"error": {"code": "server_error", "message": "boom"}},
+            },
+            "server_error",
+        ),
+        (
+            {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "Invalid 'input': expected a list.",
+                },
+            },
+            "invalid_request",
+        ),
+        (
+            {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "unsupported_parameter",
+                    "message": "Unsupported parameter: max_output_tokens",
+                },
+            },
+            "invalid_request",
+        ),
+    ],
+)
+def test_streamed_provider_events_classify_from_their_type_and_code(
+    event, expected_error_type
+):
+    classified = classify_error(StreamedAPIError("stream failed", data=event), "codex")
+
+    assert classified.error_type == expected_error_type
+    if expected_error_type == "invalid_request":
+        # A deterministic rejection must not consume a credential or park a
+        # healthy key on a transient cooldown.
+        assert should_rotate_on_error(classified) is False
+        assert should_retry_same_key(classified) is False
+    else:
+        assert classified.retry_after == 5
+
+
+def test_streamed_event_without_a_diagnostic_keeps_the_unknown_fallback():
+    """No type/code must not be silently reinterpreted as transient."""
+    classified = classify_error(StreamedAPIError("stream failed", data={"type": "error"}), "codex")
+
+    assert classified.error_type == "unknown"
+
+
+def test_non_streamed_exception_with_incidental_data_is_not_reinterpreted():
+    """Only `StreamedAPIError` carries an event payload.
+
+    A plain exception that happens to expose `data`, and a streamed error whose
+    payload is not a mapping, must keep their existing classification rather
+    than being reinterpreted from contents the streaming layer never produced.
+    """
+
+    class PlainError(Exception):
+        def __init__(self, message, data):
+            super().__init__(message)
+            self.data = data
+
+    transient_event = {"type": "error", "error": {"type": "server_error"}}
+    assert classify_error(PlainError("boom", transient_event), "codex").error_type == "unknown"
+    assert classify_error(StreamedAPIError("boom", data="not-a-mapping"), "codex").error_type == "unknown"
 
 
 @pytest.mark.parametrize(
@@ -923,7 +1336,9 @@ def test_native_stream_headers_preserve_auth_and_duplicate_response_pairs():
 def test_chat_via_responses_headers_preserve_ordered_raw_pairs(monkeypatch, stream):
     provider = CodexProvider()
     trace = _HeaderTrace()
-    client = _SSEClient()
+    # `_stream_response` requires the terminal `response.completed`, so this test
+    # needs the completing fixture rather than the plain passthrough one.
+    client = _SSEClient(_SSECompletedResponse)
 
     async def auth_header(_credential):
         return {"Authorization": "Bearer test-token"}

@@ -70,6 +70,77 @@ if TYPE_CHECKING:
 
 lib_logger = logging.getLogger("rotator_library")
 
+# Native Responses terminal failures: the provider reports a failed turn as a
+# lifecycle event, not an HTTP status.
+_NATIVE_TERMINAL_FAILURE_EVENT_TYPES = frozenset({"error", "response.failed"})
+
+# Native Responses events that forbid replaying the prompt once forwarded,
+# mirroring the client's own replay-safety contract: any payload the client has
+# already observed would be duplicated by a second attempt. Deltas only count
+# when they carry content, so an empty delta does not close the retry window.
+_NATIVE_REPLAY_UNSAFE_DELTA_EVENT_TYPES = frozenset(
+    {
+        "response.output_text.delta",
+        "response.refusal.delta",
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_text.delta",
+        "response.function_call_arguments.delta",
+        "response.custom_tool_call_input.delta",
+    }
+)
+_NATIVE_REPLAY_UNSAFE_EVENT_TYPES = _NATIVE_REPLAY_UNSAFE_DELTA_EVENT_TYPES | {
+    "response.reasoning_summary_part.done",
+    "response.output_item.done",
+}
+
+
+def _is_replay_unsafe_native_event(event: Dict[str, Any], event_type: Any) -> bool:
+    """Whether a forwarded native event would make a second attempt duplicate output."""
+    if event_type in _NATIVE_REPLAY_UNSAFE_DELTA_EVENT_TYPES:
+        delta = event.get("delta")
+        return isinstance(delta, str) and bool(delta)
+    return event_type in _NATIVE_REPLAY_UNSAFE_EVENT_TYPES
+
+
+def _parse_native_sse_record(
+    record: str,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Parse one SSE record into its event name and decoded JSON payload.
+
+    Multiple ``data:`` lines belong to the same record and are joined with "\\n"
+    per the SSE specification. Returns ``(event_name, None)`` when the record
+    carries no JSON payload the streaming layer understands (comments,
+    ``[DONE]``, malformed or non-object bodies).
+    """
+    event_name: Optional[str] = None
+    data_lines: List[str] = []
+    for line in record.splitlines():
+        if line.startswith("event:"):
+            event_name = line[6:].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+    if not data_lines:
+        return event_name, None
+    raw = "\n".join(data_lines).strip()
+    if not raw or raw == "[DONE]":
+        return event_name, None
+    try:
+        event = json.loads(raw)
+    except json.JSONDecodeError:
+        return event_name, None
+    return event_name, event if isinstance(event, dict) else None
+
+
+def _native_failure_message(event: Dict[str, Any]) -> str:
+    """Human-readable message for a terminal native Responses failure event."""
+    error = event.get("error")
+    if not isinstance(error, dict):
+        response = event.get("response")
+        error = response.get("error") if isinstance(response, dict) else None
+    if isinstance(error, dict):
+        return str(error.get("message", "Native Responses stream failed"))
+    return "Native Responses stream failed"
+
 
 class RequestExecutor:
     """
@@ -994,6 +1065,30 @@ class RequestExecutor:
                                         cred_context.mark_failure(classified)
                                         raise
 
+                                    # A transient failure that never reached the
+                                    # client can be retried on the same credential:
+                                    # replaying cannot duplicate output, and the
+                                    # short transient cooldown is what the provider
+                                    # overload is actually asking for. Without this
+                                    # the credential would rotate and, once every
+                                    # credential is parked, the request would fail
+                                    # outright despite being safely retryable.
+                                    if (
+                                        getattr(e, "replay_safe", False)
+                                        and should_retry_same_key(classified)
+                                    ):
+                                        wait_time = classified.retry_after or (
+                                            2**attempt
+                                        ) + random.uniform(0, 1)
+                                        remaining = deadline - time.time()
+                                        if attempt < self._max_retries - 1 and wait_time <= remaining:
+                                            lib_logger.info(
+                                                f"Retrying {mask_credential(cred)} in {wait_time:.1f}s after "
+                                                f"transient streamed {classified.error_type}"
+                                            )
+                                            await asyncio.sleep(wait_time)
+                                            continue  # Retry same credential
+
                                     cred_context.mark_failure(classified)
                                     break  # Rotate
 
@@ -1620,51 +1715,53 @@ class RequestExecutor:
         final Chat Completions chunk.  Do not mark the credential successful until
         that terminal event has been assembled; otherwise a broken stream records a
         false success and loses cache-read/cache-write accounting.
+
+        Records are forwarded only once they can no longer be retracted. A
+        terminal failure that arrives before any replay-unsafe output is
+        *withheld* and raised instead: the client never observes the failed frame,
+        so the executor can replay the prompt safely and the client's stream stays
+        a single coherent response. A failure after visible output has already
+        crossed the replay boundary is forwarded (the client must learn the
+        outcome) and raised only after its terminating blank line, so the record
+        is never left open for the next envelope to merge into.
         """
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         pending = ""
         terminal_response: Optional[Dict[str, Any]] = None
+        terminal_error: Optional[StreamedAPIError] = None
+        saw_replay_unsafe_event = False
+        # Chunks not yet committed to the client. They are forwarded as the
+        # original objects, so a successful turn stays byte- and
+        # boundary-identical to the upstream stream.
+        held: List[Any] = []
 
-        def consume_records() -> None:
-            nonlocal pending, terminal_response
+        def scan_records() -> None:
+            nonlocal pending, terminal_response, terminal_error
+            nonlocal saw_replay_unsafe_event
             while "\n\n" in pending:
                 record, pending = pending.split("\n\n", 1)
-                event_name: Optional[str] = None
-                data_lines: List[str] = []
-                for line in record.splitlines():
-                    if line.startswith("event:"):
-                        event_name = line[6:].strip()
-                    elif line.startswith("data:"):
-                        data_lines.append(line[5:].lstrip())
-                if not data_lines:
-                    continue
-                raw = "\n".join(data_lines).strip()
-                if not raw or raw == "[DONE]":
-                    continue
-                try:
-                    event = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(event, dict):
+                event_name, event = _parse_native_sse_record(record)
+                if event is None:
                     continue
                 event_type = event.get("type") or event_name
+                if _is_replay_unsafe_native_event(event, event_type):
+                    saw_replay_unsafe_event = True
                 if event_type == "response.completed":
                     response = event.get("response")
                     if not isinstance(response, dict) and event.get("object") == "response":
                         response = event
                     if isinstance(response, dict):
                         terminal_response = response
-                elif event_type in {"response.failed", "error"}:
-                    error = event.get("error")
-                    if not isinstance(error, dict):
-                        response = event.get("response")
-                        error = response.get("error") if isinstance(response, dict) else None
-                    message = (
-                        error.get("message", "Native Responses stream failed")
-                        if isinstance(error, dict)
-                        else "Native Responses stream failed"
+                elif event_type in _NATIVE_TERMINAL_FAILURE_EVENT_TYPES:
+                    terminal_error = StreamedAPIError(
+                        _native_failure_message(event), data=event
                     )
-                    raise StreamedAPIError(message, data=event)
+
+        def release() -> List[Any]:
+            """Commit held chunks to the client, in order."""
+            committed = list(held)
+            held.clear()
+            return committed
 
         async for chunk in stream:
             if isinstance(chunk, (bytes, bytearray)):
@@ -1672,15 +1769,52 @@ class RequestExecutor:
             else:
                 text = str(chunk)
             pending += text.replace("\r\n", "\n")
-            consume_records()
-            yield chunk
+            # Hold tentatively: this attempt may still be retracted.
+            held.append(chunk)
+            saw_before = saw_replay_unsafe_event
+            scan_records()
+
+            if terminal_error is not None and not saw_before:
+                # Nothing the client can observe had been emitted, so the whole
+                # attempt is abandoned. Drop the withheld chunks — including the
+                # lifecycle preamble, whose response id a retry will replace —
+                # and surface the failure so the executor can replay the prompt.
+                # Because the client never receives the failed attempt, replaying
+                # cannot duplicate output and the retry is safe.
+                held.clear()
+                terminal_error.replay_safe = True
+                raise terminal_error
+
+            if saw_replay_unsafe_event:
+                # Committed: release the held preamble in order, then stream
+                # through. On a successful turn this is byte- and
+                # boundary-identical to the upstream chunks.
+                for forwarded in release():
+                    yield forwarded
 
         pending += decoder.decode(b"", final=True).replace("\r\n", "\n")
-        consume_records()
+        scan_records()
+
+        if terminal_error is not None:
+            # A failure observed only here never crossed the replay boundary —
+            # nothing is released until a replay-unsafe event is seen, so either
+            # the client already holds forwarded content or it received nothing.
+            terminal_error.replay_safe = not saw_replay_unsafe_event
+            if terminal_error.replay_safe:
+                held.clear()
+            raise terminal_error
         if terminal_response is None:
+            # Truncated stream: with nothing replay-unsafe emitted the prompt can
+            # be replayed; otherwise the client keeps the content it received.
             raise StreamedAPIError(
-                "Native Responses stream ended without response.completed"
+                "Native Responses stream ended without response.completed",
+                replay_safe=not saw_replay_unsafe_event,
             )
+
+        # The turn completed, so the withheld records are its permanent record and
+        # must reach the client.
+        for forwarded in release():
+            yield forwarded
 
         (
             prompt_tokens,
