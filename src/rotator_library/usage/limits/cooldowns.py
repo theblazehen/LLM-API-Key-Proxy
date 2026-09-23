@@ -66,6 +66,18 @@ class CooldownChecker(LimitChecker):
                     and cooldown.reason == "quota_exhausted"
                     and (admitted or state.has_usable_luna_reserve(model))):
                 continue
+            # ``codex-global`` aggregates the same main-quota exhaustion as the
+            # window cooldowns, but an observed 429 applies it with
+            # ``source == "error"`` and the full multi-day reset. Unlike the
+            # authoritative ``api_quota`` windows, that observed denial is a
+            # prediction, not a verdict: once fresh evidence says the account is
+            # servable again (an admitting usage-API snapshot or a usable Luna
+            # reserve), it must not keep parking every Codex model for days.
+            if (scope == "codex-global"
+                    and cooldown.source != "api_quota"
+                    and cooldown.reason in {"quota_exceeded", "quota_exhausted"}
+                    and (admitted or state.has_usable_luna_reserve(model))):
+                continue
 
             label = "Global cooldown" if scope == "_global_" else f"Cooldown for '{scope}'"
             return LimitCheckResult.blocked(

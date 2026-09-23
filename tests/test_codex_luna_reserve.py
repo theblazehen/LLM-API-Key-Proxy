@@ -48,6 +48,15 @@ async def test_reserve_only_activates_after_regular_exhaustion(http_queue):
     assert not state.has_usable_luna_reserve("codex/gpt-6-astra")
     assert not state.has_usable_luna_reserve("other/gpt-5.6-luna")
     assert not state.has_usable_luna_reserve("codex/gpt-5.6-luna:unknown")
+    # The reserve is shared across Luna generations and the reserve-only model
+    # the Codex CLI sends; keying routing to the stale `gpt-5.6-luna` slug alone
+    # left gpt-6-luna and gpt-reserve unserved while the pool sat unused.
+    assert state.has_usable_luna_reserve("codex/gpt-6-luna")
+    assert state.has_usable_luna_reserve("codex/gpt-6-luna:max")
+    assert state.has_usable_luna_reserve("codex/gpt-reserve")
+    assert state.has_usable_luna_reserve("gpt-6-luna")
+    assert not state.has_usable_luna_reserve("codex/gpt-6-luna:unknown")
+    assert not state.has_usable_luna_reserve("other/gpt-6-luna")
     tracker.update_quota_from_headers("a", headers(1, NEW_RESET))
     await asyncio.gather(*tuple(tracker._quota_push_tasks))
     assert not state.has_usable_luna_reserve("gpt-5.6-luna")
@@ -322,6 +331,56 @@ async def test_observed_denial_preserves_luna_reserve(http_queue):
 
     assert not state.has_main_quota_admission()
     assert state.has_usable_luna_reserve("gpt-5.6-luna")
+
+
+@pytest.mark.asyncio
+async def test_admission_releases_observed_codex_global_parking(http_queue):
+    """An observed 429 must not outlive fresh evidence that the account is servable.
+
+    ``codex-global`` carries the full multi-day reset when applied from a
+    denied request (``source == "error"``, reason ``quota_exceeded``). Parking
+    on that alone stranded an account the usage API still admits, so every
+    Codex model failed with "all credentials exhausted" while a healthy
+    account sat at 0% used.
+    """
+    tracker = Tracker()
+    state = tracked_state(tracker)
+    checker = CooldownChecker()
+    observed = CooldownInfo("quota_exceeded", NEW_RESET, NOW, "error", "codex-global")
+    state.cooldowns["codex-global"] = observed
+
+    # No fresh evidence: stay conservative and keep parking.
+    assert not checker.check(state, "codex/gpt-6-sol", "codex-global").allowed
+
+    http_queue.append((main_admission_payload(100, True, False), None, None))
+    await tracker.fetch_quota_from_api("a")
+
+    assert state.has_main_quota_admission()
+    # Admission applies to every Codex model, not just the Luna family.
+    assert checker.check(state, "codex/gpt-6-sol", "codex-global").allowed
+    assert checker.check(state, "codex/gpt-6-astra", "codex-global").allowed
+
+
+@pytest.mark.asyncio
+async def test_reserve_releases_observed_codex_global_parking(http_queue):
+    """A usable Luna reserve also releases observed ``codex-global`` parking."""
+    tracker = Tracker()
+    state = tracked_state(tracker)
+    checker = CooldownChecker()
+    state.cooldowns["codex-global"] = CooldownInfo(
+        "quota_exceeded", NEW_RESET, NOW, "error", "codex-global",
+    )
+
+    http_queue.append((reserve_payload(), None, None))
+    await tracker.fetch_quota_from_api("a")
+    tracker.update_quota_from_headers("a", headers(100, NEW_RESET))
+    await asyncio.gather(*tuple(tracker._quota_push_tasks))
+    assert state.has_usable_luna_reserve("gpt-6-luna")
+
+    assert checker.check(state, "codex/gpt-6-luna", "codex-global").allowed
+    assert checker.check(state, "codex/gpt-reserve", "codex-global").allowed
+    # Reserve never substitutes for a non-Luna model.
+    assert not checker.check(state, "codex/gpt-6-sol", "codex-global").allowed
 
 
 @pytest.mark.asyncio

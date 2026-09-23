@@ -25,6 +25,15 @@ if TYPE_CHECKING:
 
 FAIR_CYCLE_GLOBAL_KEY = "_credential_"
 
+# Upstream meters the Luna reserve under a slug that changes with model
+# generation: the usage API's `normal_model_slug` still reads `gpt-5.6-luna`,
+# while current clients request `gpt-6-luna`. Separately, `gpt-reserve` is the
+# reserve-only model the Codex CLI itself sends, and the only slug that actually
+# draws the pool (ordinary Luna slugs still 429 while main quota is exhausted).
+# All three refer to the same reserve, so accept any of them rather than keying
+# routing to a single slug.
+LUNA_RESERVE_MODELS = frozenset({"gpt-5.6-luna", "gpt-6-luna", "gpt-reserve"})
+
 
 class ResetMode(str, Enum):
     """How a usage window resets."""
@@ -351,10 +360,10 @@ class CredentialState:
         if self.provider != "codex" or self.codex_quota is None:
             return False
         name = model.removeprefix("codex/")
-        if name != "gpt-5.6-luna":
+        if name not in LUNA_RESERVE_MODELS:
             for separator in (":", "-", "_"):
                 base, _, effort = name.rpartition(separator)
-                if base == "gpt-5.6-luna" and effort in {
+                if base in LUNA_RESERVE_MODELS and effort in {
                     "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
                 }:
                     break

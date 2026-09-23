@@ -27,6 +27,7 @@ from .types import (
     RotationMode,
     LimitResult,
     FAIR_CYCLE_GLOBAL_KEY,
+    LUNA_RESERVE_MODELS,
     TrackingMode,
     ResetMode,
 )
@@ -937,8 +938,11 @@ class UsageManager:
                 quota = state.codex_quota
                 reserve = quota.luna_reserve if quota is not None else None
                 cred_stats["luna_reserve"] = {
-                    "model": "gpt-5.6-luna",
-                    "available": state.has_usable_luna_reserve("gpt-5.6-luna"),
+                    "models": sorted(LUNA_RESERVE_MODELS),
+                    "available": any(
+                        state.has_usable_luna_reserve(name)
+                        for name in LUNA_RESERVE_MODELS
+                    ),
                     "allowed": reserve.allowed if reserve else None,
                     "limit_reached": reserve.limit_reached if reserve else None,
                     "fetched_at": reserve.fetched_at if reserve else None,
