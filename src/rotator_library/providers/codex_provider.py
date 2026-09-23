@@ -1300,6 +1300,15 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             Path(credential_path).name,
         )
 
+    def _upstream_reserve_model(self, model: str, credential_path: str) -> str:
+        """Use the reserve-only wire slug only for a verified reserve-backed Luna request."""
+        if model not in {"gpt-5.6-luna", "gpt-6-luna"}:
+            return model
+        snapshot = self._cached_account_quota(credential_path)
+        if snapshot is not None and snapshot.has_usable_luna_reserve:
+            return "gpt-reserve"
+        return model
+
     async def aresponses(
         self, client: httpx.AsyncClient, **kwargs
     ) -> Union[Dict[str, Any], AsyncGenerator[bytes, None]]:
@@ -1316,7 +1325,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         model = requested_model.split("/", 1)[1] if "/" in requested_model else requested_model
         normalized_model = _normalize_model_name(model)
         payload = dict(kwargs)
-        payload["model"] = normalized_model
+        payload["model"] = self._upstream_reserve_model(normalized_model, credential_path)
         if compact:
             payload.pop("stream", None)
         else:
@@ -1524,7 +1533,7 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
         include = ["reasoning.encrypted_content"] if reasoning_param else []
 
         payload = {
-            "model": normalized_model,
+            "model": self._upstream_reserve_model(normalized_model, credential_path),
             "input": input_items,
             "stream": True,  # Always use streaming internally
             "store": False,

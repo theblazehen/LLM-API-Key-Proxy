@@ -9,6 +9,7 @@ from rotator_library.providers.utilities import codex_quota_tracker as quota
 from rotator_library.usage.types import CredentialState, CooldownInfo
 from rotator_library.usage.limits.cooldowns import CooldownChecker
 from test_codex_quota_ingestion import Tracker, http_queue, headers, NOW, NEW_RESET
+from rotator_library.providers.codex_provider import CodexProvider
 
 
 def reserve_payload(main_used=100):
@@ -33,6 +34,55 @@ def tracked_state(tracker):
     state = CredentialState(stable_id="account", provider="codex", accessor="a")
     tracker.manager._states["account"] = state
     return state
+
+
+@pytest.mark.asyncio
+async def test_luna_reserve_uses_reserve_only_wire_model(http_queue, monkeypatch):
+    tracker = Tracker()
+    http_queue.append((reserve_payload(), None, None))
+    await tracker.fetch_quota_from_api("a")
+    provider = CodexProvider()
+    monkeypatch.setattr(provider, "_cached_account_quota", tracker._cached_account_quota)
+
+    async def auth(_path):
+        return {}
+
+    async def account(_path):
+        return None
+
+    sent = []
+
+    async def capture_responses(_client, _headers, payload, *_args):
+        sent.append(payload["model"])
+        if False:
+            yield b""
+
+    async def capture_chat(_client, _headers, payload, *_args):
+        sent.append(payload["model"])
+        return {"id": "resp_test", "output": []}
+
+    monkeypatch.setattr(provider, "get_auth_header", auth)
+    monkeypatch.setattr(provider, "get_account_id", account)
+    monkeypatch.setattr(provider, "_stream_native_responses", capture_responses)
+    monkeypatch.setattr(provider, "_non_stream_with_retry", capture_chat)
+    for requested in ("codex/gpt-6-luna:max", "codex/gpt-5.6-luna"):
+        stream = await provider.aresponses(object(), model=requested, stream=True,
+                                           credential_identifier="a", input=[])
+        async for _ in stream:
+            pass
+        await provider.acompletion(object(), model=requested,
+                                   messages=[{"role": "user", "content": "hi"}],
+                                   credential_identifier="a")
+    assert sent == ["gpt-reserve"] * 4
+
+    # The same request must retain its actual model when main quota is admitted.
+    http_queue.append((reserve_payload(87), None, None))
+    await tracker.fetch_quota_from_api("a")
+    stream = await provider.aresponses(object(), model="codex/gpt-6-luna:max",
+                                       stream=True, credential_identifier="a", input=[])
+    async for _ in stream:
+        pass
+    assert sent[-1] == "gpt-6-luna"
 
 
 @pytest.mark.asyncio
