@@ -57,6 +57,12 @@ def observation(at, remaining, *, pool="a", sequence=1, **extra):
     }
 
 
+def crossover_observation(at, remaining, reset, *, pool="a", sequence=1, **extra):
+    """A stored counter sample carrying the natural anchor of its generation."""
+    return observation(at, remaining, pool=pool, sequence=sequence,
+                       reset_at=reset.timestamp(), **extra)
+
+
 def test_local_six_am_boundary_starts_and_labels_quota_day():
     accounts = [account("a", 50, instant(9, 18))]
     before = forecast(accounts, now=instant(8, 5, 59))
@@ -384,3 +390,151 @@ def test_naive_now_is_rejected():
 def test_invalid_freshness_threshold_is_rejected(threshold):
     with pytest.raises(ValueError, match="finite non-negative"):
         build_codex_quota_forecast(accounts=[], now=instant(8), stale_after_seconds=threshold)
+
+
+def day_drop(now, consumed_percent, *, reset=None):
+    """A cross-over sample at the boundary plus a live balance after some use."""
+    boundary = instant(8, 6)
+    reset = instant(15, 6) if reset is None else reset
+    accounts = [account("a", 100.0 - consumed_percent, reset)]
+    samples = [crossover_observation(boundary, 100.0, reset)]
+    return build_codex_quota_forecast(
+        accounts=accounts, observations=samples, now=now,
+        source_timestamp=now.timestamp(),
+    )
+
+
+def test_intraday_usage_consumes_the_day_budget_without_shrinking_later_days():
+    # The reported defect: using quota during the day re-planned every later day
+    # downward, so no day ever held a stable allocation.
+    boundary = instant(8, 6)
+    plans = {}
+    for hours in (0, 3, 12, 23):
+        now = boundary + timedelta(hours=hours)
+        result = day_drop(now, 100 / 7 * hours / 24)
+        plans[hours] = result
+        assert result["plan_basis"] == "crossover_frozen"
+        # The day's own budget is the full-day allocation at every hour.
+        assert result["today"]["target"] == pytest.approx(result["days"][1]["target"])
+        assert [day["target"] for day in result["days"][1:]] == pytest.approx(
+            [plans[0]["days"][1]["target"]] * 6
+        )
+    # Only the day's used/remaining comparison moves, never a future target.
+    assert plans[0]["today"]["usage_percent"] == pytest.approx(0)
+    assert plans[23]["today"]["usage_percent"] == pytest.approx(100 / 7 * 23 / 24)
+    assert plans[12]["today"]["remaining_percent"] == pytest.approx(
+        plans[12]["today"]["allocated_percent"] - plans[12]["today"]["usage_percent"]
+    )
+
+
+def test_today_reports_used_against_fixed_allocation_and_withholds_others():
+    result = day_drop(instant(8, 12), 20.0)
+    today = result["today"]
+    assert today["allocated_percent"] == pytest.approx(14.285714285714286, abs=1e-9)
+    assert today["remaining_percent"] == pytest.approx(today["allocated_percent"] - 20.0)
+    assert today["remaining_fraction"] == 0.0  # overspent, clamped for a bar
+    assert today["usage_basis"] == "sampled_counter_drop_since_crossover"
+    assert today["plan_basis"] == "crossover_frozen"
+    # A future day's budget is stated; its used comparison is not.
+    assert result["days"][1]["allocated_percent"] == pytest.approx(result["days"][1]["target"])
+    assert "usage_percent" not in result["days"][1]
+
+
+def test_without_crossover_samples_the_plan_keeps_live_balances_and_withholds_usage():
+    now = instant(8, 12)
+    result = forecast([account("a", 92.85714285714286, instant(15, 6))], now=now)
+    assert result["plan_basis"] == "live_snapshot"
+    assert result["today"]["usage_percent"] is None
+    assert result["today"]["usage_basis"] == "no_crossover_snapshot"
+    assert result["today"]["remaining_percent"] is None
+    assert result["usage"]["covered_pools"] == 0
+    json.dumps(result, allow_nan=False)
+
+
+def test_counter_rise_and_moved_anchor_withhold_usage_instead_of_guessing():
+    boundary = instant(8, 6)
+    now = instant(8, 12)
+    reset = instant(15, 6)
+    # A credit redemption raises the counter mid-day: the drop is no longer this
+    # generation's consumption.
+    risen = build_codex_quota_forecast(
+        accounts=[account("a", 100.0, reset)],
+        observations=[crossover_observation(boundary, 40.0, reset)],
+        now=now, source_timestamp=now.timestamp(),
+    )
+    assert risen["usage"]["pools"][0]["reason"] == "counter_rise_since_crossover"
+    assert risen["today"]["usage_percent"] is None
+    assert risen["plan_basis"] == "live_snapshot"
+    # A reset during the day moves the anchor by a day, so the old sample cannot
+    # measure this generation; it must not be read as a 1pp drop.
+    moved = build_codex_quota_forecast(
+        accounts=[account("a", 99.0, instant(13, 6))],
+        observations=[crossover_observation(boundary, 100.0, instant(12, 6))],
+        now=now, source_timestamp=now.timestamp(),
+    )
+    assert moved["usage"]["pools"][0]["reason"] == "pool_reset_after_crossover"
+    assert moved["today"]["usage_percent"] is None
+
+
+def test_partial_pool_coverage_is_withheld_rather_than_summed_as_the_day():
+    boundary = instant(8, 6)
+    now = instant(8, 12)
+    reset = instant(15, 6)
+    accounts = [account("a", 90.0, reset), account("b", 50.0, instant(14, 6))]
+    result = build_codex_quota_forecast(
+        accounts=accounts, observations=[crossover_observation(boundary, 100.0, reset)],
+        now=now, source_timestamp=now.timestamp(),
+    )
+    assert result["usage"]["covered_pools"] == 1
+    assert result["usage"]["pool_count"] == 2
+    assert result["usage"]["basis"] == "partial_pool_usage"
+    # One pool's 10pp must not be presented as the day's total.
+    assert result["today"]["usage_percent"] is None
+    assert result["plan_basis"] == "live_snapshot"
+
+
+def test_crossover_day_progress_is_civil_time_not_planned_consumption():
+    boundary = instant(8, 6)
+    result = day_drop(boundary + timedelta(hours=6), 0.0)
+    today = result["today"]
+    assert today["day_fraction_elapsed"] == pytest.approx(0.25)
+    assert today["day_fraction_remaining"] == pytest.approx(0.75)
+    # The boundary is immutable and identifies the next cross-over.
+    assert today["end_at"] == instant(9).timestamp()
+    assert result["days"][1]["start_at"] == today["end_at"]
+    assert result["crossover"]["at"] == today["start_at"]
+    assert result["crossover"]["anchored_pools"] == result["crossover"]["pool_count"] == 1
+
+
+def test_production_observation_chain_measures_usage_from_the_baseline():
+    # The client sends the boundary baseline plus every later change up to now, so
+    # the last change already equals the live balance. Usage must come from the
+    # baseline, or it would silently publish zero.
+    boundary = instant(8, 6)
+    now = instant(8, 18)
+    reset = instant(15, 6)
+    rows = [
+        crossover_observation(instant(8), 100.0, reset, sequence=1),
+        crossover_observation(instant(8, 9), 95.0, reset, sequence=2),
+        crossover_observation(instant(8, 13), 90.0, reset, sequence=3),
+        crossover_observation(now, 85.0, reset, sequence=4),
+    ]
+    result = build_codex_quota_forecast(
+        accounts=[account("a", 85.0, reset)], observations=rows,
+        now=now, source_timestamp=now.timestamp(),
+    )
+    assert result["plan_basis"] == "crossover_frozen"
+    assert result["usage"]["pools"][0]["anchor_percent"] == 100.0
+    assert result["today"]["usage_percent"] == pytest.approx(15.0)
+    assert result["today"]["allocated_percent"] == pytest.approx(result["today"]["target"])
+    assert result["days"][1]["allocated_percent"] == pytest.approx(result["days"][1]["target"])
+
+
+def test_allocated_percent_stays_null_when_the_day_budget_is_unknown():
+    # In fallback mode today's number is a partial-day remainder, not a budget.
+    result = forecast([account("a", 92.85714285714286, instant(15, 6))], now=instant(8, 12))
+    assert result["plan_basis"] == "live_snapshot"
+    assert result["today"]["allocated_percent"] is None
+    assert result["today"]["remaining_fraction"] is None
+    # A future day's budget is still stated, since it has not started.
+    assert result["days"][1]["allocated_percent"] == pytest.approx(result["days"][1]["target"])

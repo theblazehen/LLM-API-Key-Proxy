@@ -321,3 +321,34 @@ def test_composition_failure_retains_stats_and_returns_no_fabricated_plan(tmp_pa
     assert forecast["actual"]["upper_bound"] is None
     assert forecast["risk"] == {"aggregate_exhaustion": None, "basis": "weekly_natural_resets"}
     assert forecast["accounts"] == forecast["credit_scenarios"] == []
+
+
+def test_ingestion_chain_freezes_the_day_budget_end_to_end(tmp_path):
+    """The whole production path: observed snapshots -> stored history -> forecast.
+
+    Same-day consumption must be reported against a day budget that later days
+    do not lose, which is the reported defect.
+    """
+    client = make_client(tmp_path)
+    # A cross-over baseline before 06:00 and a later change inside the same day.
+    client._observe_codex_quota(replace(make_snapshot(remaining=88.0),
+                                        fetched_at=QUOTA_DAY_START.timestamp() - 60))
+    client._observe_codex_quota(replace(make_snapshot(remaining=76.0),
+                                        fetched_at=NOW.timestamp() - 60))
+
+    stats = make_stats()
+    client._attach_codex_quota_forecast(stats, FakeCodexPlugin(replace(
+        make_snapshot(remaining=76.0), fetched_at=NOW.timestamp() - 60)))
+
+    forecast = stats["forecast"]
+    assert forecast["plan_basis"] == "crossover_frozen"
+    assert forecast["crossover"]["anchored_pools"] == forecast["crossover"]["pool_count"] == 1
+    today = forecast["today"]
+    assert today["usage_percent"] == pytest.approx(12.0)
+    assert today["usage_basis"] == "sampled_counter_drop_since_crossover"
+    assert today["allocated_percent"] == pytest.approx(today["target"])
+    assert today["remaining_percent"] == pytest.approx(today["target"] - 12.0)
+    # A future day states its whole-day budget, which no later observation moves.
+    assert [day["allocated_percent"] for day in forecast["days"][1:]] == pytest.approx(
+        [day["target"] for day in forecast["days"][1:]]
+    )

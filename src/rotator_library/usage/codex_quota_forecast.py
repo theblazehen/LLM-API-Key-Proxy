@@ -1,6 +1,9 @@
 """Pure, forward-only weekly quota plans in normalized account percentage points.
 
 Natural resets are projected full overwrites with a common 168-hour cadence.
+The plan is anchored at the current civil day's cross-over, so every civil day
+keeps one budget for its whole length: consumption inside a day is measured
+against that budget instead of re-planning the remaining week downward.
 Credit options and retrospective measurement are separate from this baseline.
 """
 from __future__ import annotations
@@ -19,6 +22,14 @@ WEEK_SECONDS = 7 * 24 * 60 * 60
 STALE_AFTER_SECONDS = 15 * 60
 _EPSILON = 1e-9
 _DAY_SECONDS = 24 * 60 * 60
+_USAGE_BASIS = "sampled_counter_drop_since_crossover"
+_PARTIAL_USAGE_BASIS = "partial_pool_usage"
+_NO_CROSSOVER_BASIS = "no_crossover_snapshot"
+_GENERATION_CHANGED_BASIS = "pool_reset_after_crossover"
+_RISE_USAGE_BASIS = "counter_rise_since_crossover"
+# Upstream weekly anchors jitter by about a second; a real generation change
+# moves the anchor by days. Anything in between is treated as not comparable.
+_ANCHOR_TOLERANCE_SECONDS = 60.0
 _ASSUMPTIONS = [
     "Current balances and reset anchors describe coherent, distinct weekly quota pools.",
     "Advertised natural resets are projected full overwrites repeating every 168 hours.",
@@ -26,6 +37,8 @@ _ASSUMPTIONS = [
     "Short-window, model-family and routing constraints are not covered by this weekly plan.",
     "Optional surplus must be used before its account generation expires; it is never carried forward.",
     "Credit expiry does not establish an automatic refill; credit scenarios require successful redemption.",
+    "Each civil day's budget is fixed at its cross-over snapshot and is not replanned until the next cross-over.",
+    "Reported day usage is a sampled weekly-counter drop from that cross-over; it is not precision-corrected.",
 ]
 
 
@@ -53,13 +66,15 @@ def build_codex_quota_forecast(
     source_timestamp: float | None = None,
     stale_after_seconds: float = STALE_AFTER_SECONDS,
 ) -> dict[str, Any]:
-    """Build seven civil quota days of newly feasible forward allocation.
+    """Build seven civil quota days of forward allocation anchored at cross-over.
 
-    The first day covers only now through the next configured 06:00 boundary.
-    Past consumption never subtracts from this plan. A constant rate feasible
-    over the next week, capped by periodic replenishment, is repeatable under
-    the declared common-period natural-reset assumptions. Expiring inventory
-    may additionally be consumed before its own overwrite, never afterward.
+    Each civil day owns one budget for its whole length. When every pool has a
+    cross-over sample for the current day, the plan is computed from those
+    samples, so consumption earlier today consumes today's budget instead of
+    shrinking every later day. Without cross-over samples the plan falls back to
+    the live snapshot and reports no day usage. Past consumption is never
+    subtracted from the plan, and expiring inventory may only be consumed before
+    its own overwrite.
     """
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
@@ -69,6 +84,7 @@ def build_codex_quota_forecast(
     boundary = _quota_day_start(now)
     boundaries = [_civil_boundary(boundary, offset).timestamp() for offset in range(15)]
     normalized, unknown = _normalize_accounts(accounts, now_ts)
+    samples = _crossover_samples(observations, boundaries[0])
     timestamps = [_source_time(account) for account in normalized]
     source = _timestamp(source_timestamp)
     if timestamps and all(value is not None for value in timestamps):
@@ -106,17 +122,31 @@ def build_codex_quota_forecast(
         "blocked_until": None,
         "credit_scenarios": [],
         "credit_scenarios_reason": None,
+        "plan_basis": None,
+        "crossover": {
+            "at": boundaries[0], "anchored_pools": 0, "pool_count": len(normalized),
+        },
+        "usage": _day_usage(normalized, samples),
     }
     if not normalized:
         result["reason"] = "no_usable_weekly_accounts"
         result["credit_scenarios_reason"] = "no_usable_weekly_accounts"
         return result
 
-    state = _State(
-        {account["stable_id"]: account["remaining_percent"] for account in normalized},
-        _forecast_events(normalized, boundaries[-1] + WEEK_SECONDS), now_ts,
-    )
-    empty = sum(state.balances.values()) <= _EPSILON
+    frozen = _frozen_balances(normalized, samples)
+    if frozen is not None:
+        state = _State(frozen, _forecast_events(normalized, boundaries[-1] + WEEK_SECONDS), boundaries[0])
+        result["plan_basis"] = "crossover_frozen"
+        result["crossover"]["anchored_pools"] = len(frozen)
+    else:
+        state = _State(
+            {account["stable_id"]: account["remaining_percent"] for account in normalized},
+            _forecast_events(normalized, boundaries[-1] + WEEK_SECONDS), now_ts,
+        )
+        result["plan_basis"] = "live_snapshot"
+    # Exhaustion describes the live counter, not the frozen plan that continues
+    # to show the day's full budget.
+    empty = sum(account["remaining_percent"] for account in normalized) <= _EPSILON
     result["status"] = "partial" if unknown else "blocked" if empty else "ready"
     result["reason"] = "unknown_weekly_accounts" if unknown else "awaiting_natural_reset" if empty else None
     result["risk"]["aggregate_exhaustion"] = None if unknown else empty
@@ -125,14 +155,24 @@ def build_codex_quota_forecast(
     for index in range(14):
         start = max(state.cursor, boundaries[index])
         plan = _consume_day(state, start, boundaries[index + 1])
+        span = boundaries[index + 1] - boundaries[index]
+        elapsed = now_ts - boundaries[index]
         days.append({
             "index": index, "start_at": boundaries[index], "end_at": boundaries[index + 1],
             "local_date": _civil_boundary(boundary, index).date().isoformat(),
+            # A future day always owns one budget for its whole length. Today's
+            # is only known from a frozen plan, so `_attach_today_budget` sets it.
+            "allocated_percent": plan["target"] if index > 0 else None,
+            # Day progress is civil time, not planned consumption, so a chart can
+            # show how much of the day is left independently of the budget.
+            "day_fraction_elapsed": _clamp_fraction(elapsed, span),
+            "day_fraction_remaining": _clamp_fraction(span - elapsed, span),
             **plan,
         })
     result["today"] = days[0]
     result["days"] = days[:7]
     result["planning_days"] = days
+    _attach_today_budget(result["today"], result["usage"], result["plan_basis"])
     after = max(account["reset_at"] for account in normalized)
     post_day = next((day for day in days[1:] if day["start_at"] >= after), None)
     result["post_reset"] = {
@@ -165,6 +205,10 @@ def _civil_boundary(start: datetime, offset_days: int) -> datetime:
 
 def _finite_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def _bounded_percent(value: Any) -> float | None:
+    return float(value) if _finite_number(value) and 0 <= value <= 100 else None
 
 
 def _timestamp(value: Any) -> float | None:
@@ -245,11 +289,183 @@ def _credit_options(account: Mapping[str, Any]) -> list[dict[str, Any]]:
     return sorted(options.values(), key=lambda item: (item["expires_at"] or math.inf, item["id"]))
 
 
+def _attach_today_budget(today: dict[str, Any], usage: Mapping[str, Any], plan_basis: str | None) -> None:
+    """Publish today's fixed allocation against measured day usage.
+
+    The allocation is the whole civil day's budget and does not shrink as the
+    day is consumed. A used-versus-allocated comparison is only published when
+    the allocation is frozen and every known pool's day usage was measured;
+    otherwise it is withheld rather than shown as a number it is not.
+    """
+    allocated = _bounded_number(today.get("target"))
+    used = _bounded_number(usage.get("used_percent"))
+    covered = usage.get("covered_pools")
+    comparable = (
+        plan_basis == "crossover_frozen"
+        and covered == usage.get("pool_count")
+        and used is not None
+    )
+    today["allocated_percent"] = allocated if comparable else None
+    today["usage_percent"] = used if comparable else None
+    # The basis is always reported so a consumer can explain a withheld number
+    # instead of showing a silent blank.
+    today["usage_basis"] = usage.get("basis")
+    today["usage_covered_pools"] = covered
+    today["usage_pool_count"] = usage.get("pool_count")
+    today["remaining_percent"] = (
+        allocated - used if comparable and allocated is not None else None
+    )
+    today["remaining_fraction"] = (
+        _budget_fraction(allocated, used) if comparable else None
+    )
+    today["plan_basis"] = plan_basis
+
+
+def _bounded_number(value: Any) -> float | None:
+    return float(value) if _finite_number(value) else None
+
+
+def _clamp_fraction(part: float, whole: float) -> float | None:
+    return min(1.0, max(0.0, part / whole)) if whole > 0 else None
+
+
+def _budget_fraction(allocated: float | None, used: float | None) -> float | None:
+    if allocated is None or used is None or allocated <= _EPSILON:
+        return None
+    # Clamped for a bar: overspending is visible in remaining_percent turning
+    # negative, not in a fraction above one.
+    return min(1.0, max(0.0, (allocated - used) / allocated))
+
+
 def _account_result(account: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "account_id": account["stable_id"], "email": account.get("email"),
         "remaining_percent": account["remaining_percent"], "natural_reset_at": account["reset_at"],
         "source_timestamp": _source_time(account), "credit_options": account["reset_credits"],
+    }
+
+
+def _crossover_samples(observations: Sequence[Mapping[str, Any]], boundary: float) -> dict[str, dict[str, Any]]:
+    """Select each pool's cross-over sample and the day's later counter changes.
+
+    The store records changed states, so the latest change at or before the
+    boundary is the counter value at the boundary: a later change would have
+    produced a row and been selected instead. Rows after the boundary are the
+    day's evidence, not cross-over anchors. Input order is not relied on.
+    """
+    ordered: dict[str, list[tuple[tuple[float, int], float, float, float]]] = {}
+    for row in observations:
+        identity = row.get("stable_id", row.get("account_id"))
+        if not isinstance(identity, str) or not identity:
+            continue
+        remaining = _bounded_percent(row.get("remaining_percent"))
+        observed = _timestamp(row.get("observed_at"))
+        reset_at = _timestamp(row.get("reset_at"))
+        if remaining is None or observed is None or reset_at is None:
+            continue
+        sequence = row.get("id", 0)
+        order = (observed, sequence if isinstance(sequence, int) and not isinstance(sequence, bool) else 0)
+        ordered.setdefault(identity, []).append((order, observed, remaining, reset_at))
+    samples: dict[str, dict[str, Any]] = {}
+    for identity, rows in ordered.items():
+        rows.sort()
+        anchors = [row for row in rows if row[1] <= boundary + _EPSILON]
+        if not anchors:
+            continue
+        _, observed, remaining, reset_at = anchors[-1]
+        samples[identity] = {
+            "remaining_percent": remaining, "observed_at": observed, "reset_at": reset_at,
+            "changes": [(row[0], row[2]) for row in rows if row[1] > boundary + _EPSILON],
+        }
+    return samples
+
+
+def _pool_day_usage(
+    account: Mapping[str, Any], samples: Mapping[str, Mapping[str, Any]]
+) -> tuple[dict[str, Any] | None, str]:
+    """Return one pool's measured day usage, or why its counter cannot measure it.
+
+    A usable measurement needs a cross-over sample from the pool's current
+    natural-reset generation, and a counter that only fell since. A rise is a
+    refill, correction or replacement capacity: the counter then describes new
+    capacity rather than one generation's consumption, so nothing is reported.
+
+    Usage is measured from the cross-over baseline, never from the last
+    intermediate change, which in production already is the live balance.
+    """
+    identity = account["stable_id"]
+    sample = samples.get(identity)
+    if sample is None:
+        return None, _NO_CROSSOVER_BASIS
+    baseline = sample["remaining_percent"]
+    # A moved natural anchor means the sample was taken in an already-overwritten
+    # generation. Upstream anchors jitter by about a second, far below one civil
+    # day of reset drift; an intra-day reset moves them by whole days.
+    if abs(sample["reset_at"] - account["reset_at"]) > _ANCHOR_TOLERANCE_SECONDS:
+        return None, _GENERATION_CHANGED_BASIS
+    live = float(account["remaining_percent"])
+    previous = baseline
+    for _, value in sorted(sample["changes"]):
+        if value > previous + _EPSILON:
+            return None, _RISE_USAGE_BASIS
+        previous = value
+    if live > previous + _EPSILON:
+        return None, _RISE_USAGE_BASIS
+    return {
+        "used_percent": baseline - live, "anchor_percent": baseline,
+        "remaining_percent": live, "anchor_at": sample["observed_at"],
+    }, _USAGE_BASIS
+
+
+def _frozen_balances(
+    accounts: Sequence[Mapping[str, Any]], samples: Mapping[str, Mapping[str, Any]]
+) -> dict[str, float] | None:
+    """Return cross-over balances for every pool, or None if any pool is unanchored.
+
+    Freezing a subset would mix a fixed budget with a balance that already
+    reflects unmeasured consumption, so the whole plan stays on live balances
+    until every pool can be anchored at the same cross-over.
+    """
+    balances: dict[str, float] = {}
+    for account in accounts:
+        usage, _ = _pool_day_usage(account, samples)
+        if usage is None:
+            return None
+        balances[account["stable_id"]] = usage["anchor_percent"]
+    return balances
+
+
+def _day_usage(
+    accounts: Sequence[Mapping[str, Any]], samples: Mapping[str, Mapping[str, Any]]
+) -> dict[str, Any]:
+    """Measure this civil day's counter drop per anchored pool, pooled honestly.
+
+    Unusable counters are withheld instead of contributing a guessed number, so
+    partial coverage is never a smaller total presented as the whole day.
+    """
+    pools: list[dict[str, Any]] = []
+    total = 0.0
+    covered = 0
+    failure: str | None = None
+    for account in accounts:
+        entry: dict[str, Any] = {"account_id": account["stable_id"]}
+        usage, reason = _pool_day_usage(account, samples)
+        if usage is None:
+            pools.append(dict(entry, status="unavailable", reason=reason))
+            failure = failure or reason
+            continue
+        covered += 1
+        total += usage["used_percent"]
+        pools.append(dict(entry, status="measured", **usage))
+    if covered == 0:
+        basis = failure or _NO_CROSSOVER_BASIS
+    elif covered == len(accounts):
+        basis = _USAGE_BASIS
+    else:
+        basis = _PARTIAL_USAGE_BASIS
+    return {
+        "used_percent": total if covered else None, "basis": basis,
+        "covered_pools": covered, "pool_count": len(accounts), "pools": pools,
     }
 
 
