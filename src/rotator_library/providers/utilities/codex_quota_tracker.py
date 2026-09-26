@@ -813,6 +813,7 @@ class CodexQuotaTracker:
         self._quota_push_locks: Dict[str, asyncio.Lock] = {}
         self._quota_push_tasks: set[asyncio.Task] = set()
         self._reset_credits_cache: Dict[str, ResetCreditsSnapshot] = {}
+        self._weekly_probe_attempts: Dict[str, Tuple[float, int]] = {}
         self._reset_locks: Dict[str, asyncio.Lock] = {}
 
     def set_usage_manager(self, usage_manager: "UsageManager") -> None:
@@ -1547,6 +1548,70 @@ class CodexQuotaTracker:
             "timestamp": time.time(),
         }
 
+    async def _prime_reset_accounts(
+        self, credentials: List[str], usage_manager: "UsageManager",
+    ) -> None:
+        """Give idle accounts one real request in their new weekly window.
+
+        The usage endpoint can roll the weekly deadline forward without starting
+        the model's window. A tiny completion starts it; persisted last_used_at
+        prevents repeating the probe after a restart.
+        """
+        states = {state.accessor: state for state in usage_manager._states.values()}
+        for path in credentials:
+            snapshot = self._quota_cache.get(path)
+            state = states.get(path)
+            if snapshot is None or snapshot.status != "success" or state is None:
+                continue
+            windows = _classify_quota_windows(snapshot.primary, snapshot.secondary)
+            weekly = windows.get("weekly-limit")
+            short = windows.get("5h-limit")
+            if (
+                weekly is None or weekly.window_minutes != 7 * 24 * 60
+                or weekly.reset_at is None or weekly.reset_at <= time.time()
+                or weekly.is_exhausted
+                or short is not None and short.is_exhausted
+                or any(c.is_active for c in state.cooldowns.values())
+            ):
+                continue
+            window_start = weekly.reset_at - weekly.window_minutes * 60
+            if window_start > time.time() or snapshot.main_allowed is False:
+                continue
+            last_used = state.totals.last_used_at
+            if snapshot.account_id:
+                last_used = max(
+                    (other.totals.last_used_at or 0)
+                    for other in states.values()
+                    if (cached := self._quota_cache.get(other.accessor)) is not None
+                    and cached.account_id == snapshot.account_id
+                )
+            if last_used is not None and last_used >= window_start - 60:
+                continue
+            pool = snapshot.account_id or path
+            generation, attempts = self._weekly_probe_attempts.get(pool, (None, 0))
+            if generation != window_start:
+                attempts = 0
+            if attempts >= 3:
+                continue
+            self._weekly_probe_attempts[pool] = (window_start, attempts + 1)
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await self.acompletion(
+                        client, model="gpt-5.3-codex",
+                        messages=[{"role": "user", "content": "Reply OK."}],
+                        stream=False, credential_identifier=path,
+                    )
+                usage = getattr(response, "usage", None)
+                await usage_manager.record_usage(
+                    accessor=path, model="codex/gpt-5.3-codex", success=True,
+                    quota_group="codex-global",
+                    prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+                    completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+                )
+                lib_logger.info("Primed Codex weekly window for %s", _get_credential_identifier(path))
+            except Exception as exc:
+                lib_logger.warning("Codex weekly window probe failed for %s: %s", _get_credential_identifier(path), exc)
+
     # =========================================================================
     # BACKGROUND JOB SUPPORT
     # =========================================================================
@@ -1620,27 +1685,17 @@ class CodexQuotaTracker:
                     )
                 await self._refresh_and_evaluate_resets(credentials)
                 self._publish_reset_routing_hints(usage_manager)
+                await self._prime_reset_accounts(
+                    [path for path, data in quota_results.items() if data.get("status") == "success"],
+                    usage_manager,
+                )
             except Exception as e:
                 lib_logger.error(f"Codex startup baseline fetch failed: {e}")
             return
 
-        # Subsequent runs: only refresh credentials that have been used recently
-        now = time.time()
-        active_credentials = []
-
-        for cred_path in credentials:
-            cached = self._quota_cache.get(cred_path)
-            # Refresh if cached and was fetched within the last hour
-            if cached and (now - cached.fetched_at) < 3600:
-                active_credentials.append(cred_path)
-
-        if not active_credentials:
-            lib_logger.debug("No active Codex credentials to refresh quota for")
-            return
-
-        lib_logger.debug(
-            f"Refreshing Codex quota for {len(active_credentials)} active credentials"
-        )
+        # Idle accounts must also be refreshed: their weekly boundary can pass
+        # without ordinary traffic ever reaching them.
+        lib_logger.debug("Refreshing Codex quota for %s credentials", len(credentials))
 
         # Fetch quotas with limited concurrency
         semaphore = asyncio.Semaphore(3)
@@ -1650,7 +1705,7 @@ class CodexQuotaTracker:
                 snapshot = await self.fetch_quota_from_api(cred_path)
                 return cred_path, snapshot
 
-        tasks = [fetch_with_semaphore(cred) for cred in active_credentials]
+        tasks = [fetch_with_semaphore(cred) for cred in credentials]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         quota_results: Dict[str, Dict[str, Any]] = {}
@@ -1681,11 +1736,12 @@ class CodexQuotaTracker:
             force=True,
         )
         success_count = len(quota_results)
-        await self._refresh_and_evaluate_resets(active_credentials)
+        await self._refresh_and_evaluate_resets(credentials)
         self._publish_reset_routing_hints(usage_manager)
+        await self._prime_reset_accounts(list(quota_results), usage_manager)
 
         lib_logger.debug(
-            f"Codex quota refresh complete: {success_count}/{len(active_credentials)} "
+            f"Codex quota refresh complete: {success_count}/{len(credentials)} "
             f"successful, {stored} baselines stored"
         )
 

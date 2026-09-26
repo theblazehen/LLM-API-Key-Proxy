@@ -1179,6 +1179,8 @@ Reserve routing never substitutes Luna for another requested model. It bypasses 
 
 `GET /v1/quota-stats?provider=codex` exposes separate per-credential `luna_reserve` eligibility and window metadata. Reserve does not inflate the regular weekly allowance or forecast.
 
+The background Codex quota job refreshes **every** account, including idle ones. When an account has no recorded request in its current weekly window and has available regular quota, it makes one small real Codex completion to start the new window and update the advertised reset time. Successful probes are recorded as usage, so they are not repeated within the same window or after a restart. Existing cooldowns and exhausted 5-hour/weekly windows prevent a probe. Failed probes are retried at most three times per account and weekly window per process; a restart resets that failure budget. This spends one ordinary request per idle account per weekly window on success, independently of conversation affinity and Luna reserve routing.
+
 #### Per-Model Quota Tracking
 
 Instead of tracking usage at the credential level, the system now supports granular per-model tracking:

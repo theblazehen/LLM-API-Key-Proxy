@@ -78,6 +78,161 @@ def headers(used, reset):
     }
 
 
+@pytest.mark.asyncio
+async def test_idle_weekly_account_is_primed_once_after_reset(monkeypatch):
+    from types import SimpleNamespace
+
+    tracker = Tracker()
+    now = [NOW]
+    monkeypatch.setattr(tracker_module.time, "time", lambda: now[0])
+    path = "a"
+    state = SimpleNamespace(
+        accessor=path, totals=SimpleNamespace(last_used_at=now[0] - 8 * 86400),
+        cooldowns={},
+    )
+    tracker.manager._states[path] = state
+    tracker._quota_cache[path] = tracker_module.CodexQuotaSnapshot(
+        credential_path=path, identifier=path, plan_type="pro",
+        primary=tracker_module.RateLimitWindow(0, 100, 300, now[0] + 18000),
+        secondary=tracker_module.RateLimitWindow(0, 100, 10080, now[0] + 604800),
+        credits=None, fetched_at=now[0], status="success", error=None,
+        account_id="shared-account",
+    )
+    tracker.manager._states["b"] = SimpleNamespace(
+        accessor="b", totals=SimpleNamespace(last_used_at=now[0] - 8 * 86400),
+        cooldowns={},
+    )
+    tracker._quota_cache["b"] = tracker_module.replace(
+        tracker._quota_cache[path], credential_path="b", account_id="shared-account",
+    )
+    calls = []
+
+    class HTTP:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+    async def completion(_client, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=5, completion_tokens=1))
+
+    async def record_usage(**kwargs):
+        assert kwargs["success"] and kwargs["prompt_tokens"] == 5
+        state.totals.last_used_at = now[0]
+
+    monkeypatch.setattr(tracker_module.httpx, "AsyncClient", HTTP)
+    monkeypatch.setattr(tracker, "acompletion", completion, raising=False)
+    monkeypatch.setattr(tracker.manager, "record_usage", record_usage, raising=False)
+    await tracker._prime_reset_accounts([path, "b"], tracker.manager)
+    await tracker._prime_reset_accounts([path, "b"], tracker.manager)
+    assert len(calls) == 1
+    assert calls[0]["credential_identifier"] == path
+    assert calls[0]["stream"] is False
+    now[0] += 604800
+    for credential_path in ("a", "b"):
+        tracker._quota_cache[credential_path] = tracker_module.replace(
+            tracker._quota_cache[credential_path],
+            secondary=tracker_module.RateLimitWindow(0, 100, 10080, now[0] + 604800),
+        )
+    await tracker._prime_reset_accounts(["a", "b"], tracker.manager)
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_weekly_probe_respects_exhaustion_and_recent_use(monkeypatch):
+    from types import SimpleNamespace
+
+    tracker = Tracker()
+    monkeypatch.setattr(tracker_module.time, "time", lambda: NOW)
+    state = SimpleNamespace(
+        accessor="a", totals=SimpleNamespace(last_used_at=NOW - 8 * 86400),
+        cooldowns={},
+    )
+    tracker.manager._states["a"] = state
+    weekly = tracker_module.RateLimitWindow(100, 0, 10080, NOW + 604800)
+    tracker._quota_cache["a"] = tracker_module.CodexQuotaSnapshot(
+        credential_path="a", identifier="a", plan_type="pro",
+        primary=None, secondary=weekly, credits=None, fetched_at=NOW,
+        status="success", error=None,
+    )
+
+    async def unexpected(*_args, **_kwargs):
+        pytest.fail("No probe is allowed")
+
+    monkeypatch.setattr(tracker, "acompletion", unexpected, raising=False)
+    await tracker._prime_reset_accounts(["a"], tracker.manager)
+    tracker._quota_cache["a"] = tracker_module.replace(
+        tracker._quota_cache["a"],
+        secondary=tracker_module.RateLimitWindow(0, 100, 10080, NOW + 604800),
+    )
+    state.totals.last_used_at = NOW
+    await tracker._prime_reset_accounts(["a"], tracker.manager)
+
+@pytest.mark.asyncio
+async def test_background_refresh_bounds_failed_probes_per_week(monkeypatch):
+    from types import SimpleNamespace
+
+    tracker = Tracker()
+    tracker._initial_baselines_fetched = True
+    now = [NOW]
+    monkeypatch.setattr(tracker_module.time, "time", lambda: now[0])
+    tracker.manager._states["a"] = SimpleNamespace(
+        accessor="a", totals=SimpleNamespace(last_used_at=NOW - 8 * 86400),
+        cooldowns={},
+    )
+    weekly = tracker_module.RateLimitWindow(0, 100, 10080, NOW + 604800)
+    tracker._quota_cache["a"] = tracker_module.CodexQuotaSnapshot(
+        credential_path="a", identifier="a", plan_type="pro",
+        primary=None, secondary=weekly, credits=None, fetched_at=NOW,
+        status="success", error=None, account_id="upstream-pool",
+    )
+    fetches = []
+    probes = []
+
+    async def fetch(path):
+        fetches.append(path)
+        return tracker._quota_cache[path]
+
+    async def store(*_args, **_kwargs):
+        return 1
+
+    async def refresh(_credentials):
+        pass
+
+    async def completion(_client, **kwargs):
+        probes.append(kwargs["credential_identifier"])
+        raise RuntimeError("model unavailable")
+
+    class HTTP:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(tracker, "fetch_quota_from_api", fetch)
+    monkeypatch.setattr(tracker, "_store_baselines_to_usage_manager", store)
+    monkeypatch.setattr(tracker, "_refresh_and_evaluate_resets", refresh)
+    monkeypatch.setattr(tracker, "_publish_reset_routing_hints", lambda _manager: None)
+    monkeypatch.setattr(tracker, "acompletion", completion, raising=False)
+    monkeypatch.setattr(tracker_module.httpx, "AsyncClient", HTTP)
+
+    for _ in range(5):
+        await tracker.run_background_job(tracker.manager, ["a"])
+    assert fetches == ["a"] * 5
+    assert probes == ["a"] * 3
+
+    now[0] += 604800
+    tracker._quota_cache["a"] = tracker_module.replace(
+        tracker._quota_cache["a"],
+        secondary=tracker_module.RateLimitWindow(0, 100, 10080, now[0] + 604800),
+    )
+    await tracker.run_background_job(tracker.manager, ["a"])
+    assert probes == ["a"] * 4
+
+
 @pytest.fixture
 def http_queue(monkeypatch):
     """Each response may pause after acquisition until explicitly released."""
