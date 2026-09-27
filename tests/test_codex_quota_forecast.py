@@ -156,6 +156,28 @@ def test_each_day_conserves_inventory_and_contributions():
     assert result["today"]["contributions"] == [{"account_id": "early", "amount": result["today"]["target"]}]
 
 
+def test_contributions_follow_reset_priority_and_keep_repeated_generations():
+    now = instant(8, 12)
+    result = forecast([
+        account("a-far", 100, now + timedelta(hours=15)),
+        account("z-near", 5, now + timedelta(hours=12)),
+    ], now=now)
+    today = result["today"]
+    tranches = today["contributions"]
+    daily_rate = today["sustainable_daily_rate"]
+
+    # The later-resetting alphabetically earlier account must not jump ahead
+    # of the nearer reset. Account IDs can recur after another reset segment.
+    assert [tranche["account_id"] for tranche in tranches] == [
+        "z-near", "a-far", "a-far", "a-far", "z-near",
+    ]
+    assert [tranche["amount"] for tranche in tranches] == pytest.approx([
+        5, daily_rate / 2 - 5, daily_rate / 8,
+        100 - (daily_rate / 2 - 5) - daily_rate / 8, daily_rate / 8,
+    ])
+    assert sum(tranche["amount"] for tranche in tranches) == pytest.approx(today["target"])
+
+
 def test_expiry_bonus_belongs_only_to_old_generation_and_exact_deadline():
     now = instant(8, 12)
     reset = now + timedelta(seconds=1234.56789)

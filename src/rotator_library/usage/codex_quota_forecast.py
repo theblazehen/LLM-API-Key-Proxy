@@ -499,13 +499,13 @@ def _next_event_for_account(state: _State, account_id: str, at: float) -> float:
     return min((event.at for event in state.events if event.account_id == account_id and event.at > at), default=math.inf)
 
 
-def _consume_amount(state: _State, at: float, amount: float, contributions: dict[str, float]) -> float:
+def _consume_amount(state: _State, at: float, amount: float, contributions: list[dict[str, Any]]) -> float:
     remaining = amount
     for account_id in sorted(state.balances, key=lambda key: (_next_event_for_account(state, key, at), key)):
         taken = min(state.balances[account_id], remaining)
         if taken > 0:
             state.balances[account_id] -= taken
-            contributions[account_id] = contributions.get(account_id, 0.0) + taken
+            contributions.append({"account_id": account_id, "amount": taken})
             remaining -= taken
         if remaining <= 0:
             break
@@ -538,7 +538,7 @@ def _feasible_rate(state: _State, start: float, end: float, rate: float) -> bool
         # Do not make up a pre-reset deficit with quota arriving afterward.
         if wanted > sum(probe.balances.values()):
             return False
-        _consume_amount(probe, cursor, wanted, {})
+        _consume_amount(probe, cursor, wanted, [])
         cursor = stop
     return True
 
@@ -560,7 +560,9 @@ def _maximum_sustainable_rate(state: _State, start: float, end: float) -> float:
 
 
 def _consume_day(state: _State, start: float, end: float) -> dict[str, Any]:
-    contributions: dict[str, float] = {}
+    # Preserve chronological tranches: _consume_amount orders within a segment,
+    # and expiry surplus follows it before reset. IDs can recur later.
+    contributions: list[dict[str, Any]] = []
     reset_events = _apply_events_at(state, start)
     rate = _maximum_sustainable_rate(state, start, start + WEEK_SECONDS)
     initial_rate = rate
@@ -582,7 +584,7 @@ def _consume_day(state: _State, start: float, end: float) -> dict[str, Any]:
             extra = state.balances[account_id]
             if extra > 0:
                 state.balances[account_id] = 0.0
-                contributions[account_id] = contributions.get(account_id, 0.0) + extra
+                contributions.append({"account_id": account_id, "amount": extra})
                 segment_bonus += extra
                 deadlines.append({"account_id": account_id, "at": stop, "amount": extra})
         bonus += segment_bonus
@@ -597,6 +599,6 @@ def _consume_day(state: _State, start: float, end: float) -> dict[str, Any]:
     return {
         "target": baseline + bonus, "baseline_allocation": baseline, "expiry_bonus": bonus,
         "sustainable_daily_rate": initial_rate * _DAY_SECONDS,
-        "contributions": [{"account_id": key, "amount": value} for key, value in sorted(contributions.items()) if value > 0],
+        "contributions": contributions,
         "reset_events": reset_events, "expiry_deadlines": deadlines, "segments": segments,
     }
