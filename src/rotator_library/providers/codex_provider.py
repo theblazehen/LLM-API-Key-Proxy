@@ -97,6 +97,7 @@ def env_int(key: str, default: int) -> int:
 # Default: ChatGPT Backend API (works with OAuth credentials)
 # Alternative: OpenAI API (requires API key, set CODEX_USE_OPENAI_API=true)
 USE_OPENAI_API = env_bool("CODEX_USE_OPENAI_API", False)
+CODEX_CLIENT_VERSION = os.getenv("CODEX_CLIENT_VERSION", "0.159.2")
 
 if USE_OPENAI_API:
     CODEX_API_BASE = os.getenv("CODEX_API_BASE", "https://api.openai.com/v1")
@@ -1357,9 +1358,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             "Content-Type": "application/json",
             "Accept": "text/event-stream" if payload.get("stream") else "application/json",
             "OpenAI-Beta": "responses=experimental",
-            "User-Agent": "codex-cli",
+            "User-Agent": f"codex_cli_rs/{CODEX_CLIENT_VERSION}",
             "originator": "codex-tui",
-            "version": os.getenv("CODEX_CLIENT_VERSION", "0.0.0"),
+            "version": CODEX_CLIENT_VERSION,
         }
         if account_id:
             headers["ChatGPT-Account-Id"] = account_id
@@ -1534,9 +1535,9 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
             "Content-Type": "application/json",
             "Accept": "text/event-stream" if stream else "application/json",
             "OpenAI-Beta": "responses=experimental",
-            "User-Agent": "codex-cli",
+            "User-Agent": f"codex_cli_rs/{CODEX_CLIENT_VERSION}",
             "originator": "codex-tui",
-            "version": os.getenv("CODEX_CLIENT_VERSION", "0.0.0"),
+            "version": CODEX_CLIENT_VERSION,
         }
 
         if account_id:
