@@ -138,7 +138,13 @@ _FALLBACK_BASE_MODELS = [
     "gpt-5",
     "gpt-5.1",
     "gpt-5.2",
+    "gpt-6-astra",
+    "gpt-6.1-sol",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
     "gpt-5.5",
     "gpt-5-codex",
     "gpt-5-codex-mini",
@@ -153,7 +159,13 @@ _FALLBACK_REASONING_EFFORTS = {
     "gpt-5": {"minimal", "low", "medium", "high"},
     "gpt-5.1": {"low", "medium", "high"},
     "gpt-5.2": {"low", "medium", "high", "xhigh"},
+    "gpt-6-astra": {"low", "medium", "high", "xhigh", "max", "ultra"},
+    "gpt-6.1-sol": {"low", "medium", "high", "xhigh", "max", "ultra"},
+    "gpt-6-sol": {"low", "medium", "high", "xhigh", "max", "ultra"},
+    "gpt-6-luna": {"low", "medium", "high", "xhigh", "max"},
     "gpt-5.6-sol": {"low", "medium", "high", "xhigh", "max", "ultra"},
+    "gpt-5.6-terra": {"low", "medium", "high", "xhigh", "max", "ultra"},
+    "gpt-5.6-luna": {"low", "medium", "high", "xhigh", "max"},
     "gpt-5.5": {"low", "medium", "high", "xhigh"},
     "gpt-5.4": {"low", "medium", "high", "xhigh"},
     "gpt-5-codex": {"low", "medium", "high"},
@@ -164,7 +176,11 @@ _FALLBACK_REASONING_EFFORTS = {
     "gpt-5.2-codex": {"low", "medium", "high", "xhigh"},
     "gpt-5.3-codex": {"low", "medium", "high", "xhigh"},
 }
-_FALLBACK_FAST_MODELS = {"gpt-5.6-sol", "gpt-5.5", "gpt-5.4"}
+_FALLBACK_FAST_MODELS = {
+    "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna",
+    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    "gpt-5.5", "gpt-5.4",
+}
 
 # Module-level cache for dynamic model data
 _models_cache: Optional[Dict[str, Any]] = None

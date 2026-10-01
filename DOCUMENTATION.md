@@ -1167,6 +1167,10 @@ ROTATION_MODE_OPENAI=balanced
 ROTATION_MODE_ANTIGRAVITY=balanced  # Override default
 ```
 
+#### Codex Model Catalog
+
+Codex models are discovered from [OpenAI Codex's `models.json`](https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json) and refreshed hourly. The proxy exposes API-supported slugs with their advertised reasoning and fast-tier variants, such as `codex/gpt-6.1-sol:ultra` and `codex/gpt-6.1-sol-fast`. If GitHub is unavailable at startup, the built-in fallback includes the GPT-6 Astra, Sol, and Luna families plus GPT-5.6 Sol, Terra, and Luna. Model visibility does not override an account's upstream access or quota.
+
 #### Codex Sequential Routing
 
 With `ROTATION_MODE_CODEX=sequential`, eligible credentials are selected in this order:
